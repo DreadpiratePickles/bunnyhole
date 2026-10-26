@@ -110,10 +110,26 @@ ARSENAL_TOOLS_CATALOG: List[Dict[str, Any]] = [
     {"name": "ignorant", "type": "cli", "binary": "ignorant", "pipx": "ignorant", "desc": "Phone number account registration check (Snapchat, Instagram, Amazon)"},
     {"name": "h8mail", "type": "cli", "binary": "h8mail", "pipx": "h8mail", "desc": "Email breach hunting & credential correlation"},
     {"name": "ghunt", "type": "cli", "binary": "ghunt", "pipx": "ghunt", "desc": "Google account OSINTrecon"},
+    {"name": "phoneinfoga", "type": "cli", "binary": "phoneinfoga", "pipx": "phoneinfoga", "desc": "Phone number OSINT: carrier, line type, footprint & reputation scanners"},
+    {"name": "tookie-osint", "type": "cli", "binary": "tookie-osint", "pipx": "tookie-osint", "desc": "Username enumeration across social platforms (Sherlock-class)"},
+    # OSINT Automation Frameworks
+    {"name": "spiderfoot", "type": "cli", "binary": "sf", "pipx": "spiderfoot", "desc": "Automated OSINT framework correlating domains, IPs, emails & breaches"},
     # Domain, DNS & Network Recon Tools
     {"name": "theHarvester", "type": "cli", "binary": "theHarvester", "pipx": "theHarvester", "apt": "theharvester", "brew": "theharvester", "desc": "Email, subdomain, and employee name harvester"},
     {"name": "dnstwist", "type": "cli", "binary": "dnstwist", "pipx": "dnstwist", "apt": "dnstwist", "brew": "dnstwist", "desc": "Domain lookalike & typosquatting permutation scanner"},
     {"name": "subfinder", "type": "go_cli", "binary": "subfinder", "go_pkg": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest", "apt": "subfinder", "brew": "subfinder", "desc": "Fast passive subdomain discovery (ProjectDiscovery)"},
+    {"name": "assetfinder", "type": "go_cli", "binary": "assetfinder", "go_pkg": "github.com/tomnomnom/assetfinder@latest", "desc": "Find domains & subdomains via CT, VirusTotal & other passive sources"},
+    {"name": "findomain", "type": "sys_cli", "binary": "findomain", "apt": "findomain", "brew": "findomain", "desc": "Fast passive subdomain enumeration via Certificate Transparency logs"},
+    {"name": "dnsx", "type": "go_cli", "binary": "dnsx", "go_pkg": "github.com/projectdiscovery/dnsx/cmd/dnsx@latest", "desc": "Fast multipurpose DNS toolkit: resolve, bruteforce & probe records"},
+    {"name": "dnsrecon", "type": "cli", "binary": "dnsrecon", "pipx": "dnsrecon", "apt": "dnsrecon", "desc": "DNS enumeration: records, zone transfers, SRV, brute & zone walks"},
+    {"name": "tlsx", "type": "go_cli", "binary": "tlsx", "go_pkg": "github.com/projectdiscovery/tlsx/cmd/tlsx@latest", "brew": "tlsx", "desc": "TLS/SSL cert grabber: SANs, CN, JARM & certificate metadata recon"},
+    {"name": "katana", "type": "go_cli", "binary": "katana", "go_pkg": "github.com/projectdiscovery/katana/cmd/katana@latest", "brew": "katana", "desc": "Fast web crawler mapping endpoints, JS & assets (ProjectDiscovery)"},
+    {"name": "mosint", "type": "go_cli", "binary": "mosint", "go_pkg": "github.com/alpkeskin/mosint/v3/cmd/mosint@latest", "desc": "Automated email OSINT: breaches, related domains, pastes & social"},
+    {"name": "bbot", "type": "cli", "binary": "bbot", "pipx": "bbot", "desc": "Recursive OSINT framework: subdomains, ports, certs & web recon"},
+    {"name": "shodan", "type": "cli_or_py", "binary": "shodan", "module": "shodan", "pipx": "shodan", "desc": "Shodan CLI: search exposed hosts, services, ports & banners"},
+    {"name": "censys", "type": "cli_or_py", "binary": "censys", "module": "censys", "pipx": "censys", "desc": "Censys CLI: search internet hosts & certificates by attribute"},
+    {"name": "metagoofil", "type": "sys_cli", "binary": "metagoofil", "apt": "metagoofil", "desc": "Harvest public documents & surface author/metadata leaks for a domain"},
+    {"name": "onionsearch", "type": "cli", "binary": "onionsearch", "pipx": "onionsearch", "desc": "Scrape .onion URLs across multiple Tor search engines (via Tor)"},
     {"name": "amass", "type": "go_cli", "binary": "amass", "go_pkg": "github.com/owasp-amass/amass/v4/...@master", "apt": "amass", "brew": "amass", "desc": "In-depth attack surface mapping & ASN discovery"},
     {"name": "httpx-pd", "type": "go_cli", "binary": "httpx", "go_pkg": "github.com/projectdiscovery/httpx/cmd/httpx@latest", "apt": "httpx-toolkit", "brew": "httpx", "desc": "Fast HTTP probing, tech stack & TLS fingerprinter"},
     {"name": "nuclei", "type": "go_cli", "binary": "nuclei", "go_pkg": "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest", "apt": "nuclei", "brew": "nuclei", "desc": "Template-based vulnerability & misconfiguration scanner"},
@@ -125,6 +141,7 @@ ARSENAL_TOOLS_CATALOG: List[Dict[str, Any]] = [
     {"name": "nmap", "type": "sys_cli", "binary": "nmap", "apt": "nmap", "brew": "nmap", "desc": "Network exploration and service/port scanner"},
     {"name": "exiftool", "type": "sys_cli", "binary": "exiftool", "apt": "libimage-exiftool-perl", "brew": "exiftool", "desc": "Read/write meta information in PDF, image, and media files"},
     {"name": "tor", "type": "sys_cli", "binary": "tor", "apt": "tor", "brew": "tor", "desc": "Anonymity onion routing daemon for dark-web OSINT"},
+    {"name": "anonsurf", "type": "sys_cli", "binary": "anonsurf", "apt": "anonsurf", "desc": "Parrot/Kali system-wide Tor transparent proxy (Linux-only, needs root)"},
 ]
 
 
@@ -372,3 +389,124 @@ class ArsenalManager:
                 last_err = str(exc)
 
         return {"success": False, "tool": tool_name, "error": last_err}
+
+
+class AnonsurfController:
+    """Install and control anonsurf — Parrot/Kali's system-wide Tor transparent proxy.
+
+    anonsurf routes *all* of the host's traffic through Tor by rewriting iptables, which anonymizes
+    the operator's clearnet OSINT traffic (not a target's). It is therefore deliberately explicit and
+    opt-in: nothing here is ever called automatically. It is Linux-only (Parrot/Kali/Debian) and every
+    state change needs root, so start/stop/install run under sudo and inherit the terminal so sudo can
+    prompt. On macOS/Windows these refuse with a pointer to the portable `--tor` SOCKS route instead.
+    """
+
+    REPO_URL = "https://github.com/ParrotSec/anonsurf"
+
+    def __init__(self) -> None:
+        self.is_linux = platform.system().lower() == "linux"
+
+    def is_available(self) -> bool:
+        """True if the anonsurf binary is on PATH."""
+        return shutil.which("anonsurf") is not None
+
+    def _is_root(self) -> bool:
+        geteuid = getattr(os, "geteuid", None)  # absent on Windows
+        return callable(geteuid) and geteuid() == 0
+
+    def _sudo_prefix(self) -> List[str]:
+        return [] if self._is_root() else (["sudo"] if shutil.which("sudo") else [])
+
+    def _not_linux_result(self, action: str) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "action": action,
+            "error": (
+                "anonsurf is Linux-only (Parrot/Kali/Debian). On this platform, route Bunnyhole "
+                "through Tor with the portable SOCKS proxy instead: start `tor`, then run any command "
+                "with `--tor` (or `--proxy socks5h://127.0.0.1:9050`)."
+            ),
+        }
+
+    def status(self) -> Dict[str, Any]:
+        """Return anonsurf's current state (`anonsurf status`), without changing anything."""
+        if not self.is_linux:
+            return self._not_linux_result("status")
+        if not self.is_available():
+            return {"success": False, "action": "status", "error": "anonsurf is not installed (try `bunnyhole anonsurf --install`)."}
+        try:
+            res = subprocess.run(["anonsurf", "status"], capture_output=True, text=True, timeout=30)
+            return {"success": res.returncode == 0, "action": "status", "output": (res.stdout or res.stderr).strip()[-600:]}
+        except Exception as exc:
+            return {"success": False, "action": "status", "error": str(exc)}
+
+    def _run_state_change(self, action: str) -> Dict[str, Any]:
+        """Run `anonsurf start|stop|restart|change` under sudo, inheriting the terminal for the prompt."""
+        if not self.is_linux:
+            return self._not_linux_result(action)
+        if not self.is_available():
+            return {"success": False, "action": action, "error": "anonsurf is not installed (try `bunnyhole anonsurf --install`)."}
+        cmd = self._sudo_prefix() + ["anonsurf", action]
+        if not self._is_root() and not self._sudo_prefix():
+            return {"success": False, "action": action, "error": f"'{action}' needs root and sudo was not found on PATH."}
+        try:
+            # No capture: anonsurf needs to write iptables and sudo must be able to prompt on the tty.
+            res = subprocess.run(cmd, timeout=120)
+            return {"success": res.returncode == 0, "action": action, "command": " ".join(cmd)}
+        except Exception as exc:
+            return {"success": False, "action": action, "error": str(exc)}
+
+    def start(self) -> Dict[str, Any]:
+        """Route all host traffic through Tor (`sudo anonsurf start`). Explicit, operator-initiated only."""
+        return self._run_state_change("start")
+
+    def stop(self) -> Dict[str, Any]:
+        """Restore the host's normal (clearnet) networking (`sudo anonsurf stop`)."""
+        return self._run_state_change("stop")
+
+    def restart(self) -> Dict[str, Any]:
+        """Restart the anonsurf Tor transparent proxy."""
+        return self._run_state_change("restart")
+
+    def change_identity(self) -> Dict[str, Any]:
+        """Request a fresh Tor circuit / exit IP (`sudo anonsurf change`)."""
+        return self._run_state_change("change")
+
+    def install(self) -> Dict[str, Any]:
+        """Install anonsurf: apt first, else clone and build from the official ParrotSec repo.
+
+        Linux + root (via sudo) only. Operator-initiated; never called automatically.
+        """
+        if not self.is_linux:
+            return self._not_linux_result("install")
+        if self.is_available():
+            return {"success": True, "action": "install", "note": "anonsurf already installed."}
+        sudo = self._sudo_prefix()
+        if not self._is_root() and not sudo:
+            return {"success": False, "action": "install", "error": "Installing anonsurf needs root and sudo was not found on PATH."}
+
+        # 1. Preferred: distro package (Parrot ships it; Kali via its repos).
+        try:
+            res = subprocess.run(sudo + ["apt-get", "install", "-y", "anonsurf"], timeout=300)
+            if res.returncode == 0 and shutil.which("anonsurf"):
+                return {"success": True, "action": "install", "method": "apt", "command": "apt-get install -y anonsurf"}
+        except Exception:
+            pass
+
+        # 2. Fallback: build from the official ParrotSec/anonsurf source.
+        if not shutil.which("git"):
+            return {"success": False, "action": "install", "error": "apt install failed and git is unavailable for the source fallback."}
+        clone_dir = tempfile.mkdtemp(prefix="anonsurf_src_")
+        try:
+            clone = subprocess.run(["git", "clone", "--depth", "1", self.REPO_URL, clone_dir], capture_output=True, text=True, timeout=180)
+            if clone.returncode != 0:
+                return {"success": False, "action": "install", "error": f"git clone failed: {(clone.stderr or '')[-200:]}"}
+            # ParrotSec/anonsurf installs via `make install`.
+            build = subprocess.run(sudo + ["make", "install"], cwd=clone_dir, timeout=300)
+            if build.returncode == 0 and shutil.which("anonsurf"):
+                return {"success": True, "action": "install", "method": "source", "command": f"git clone {self.REPO_URL} && sudo make install"}
+            return {"success": False, "action": "install", "error": "Source build completed but the anonsurf binary is not on PATH."}
+        except Exception as exc:
+            return {"success": False, "action": "install", "error": str(exc)}
+        finally:
+            shutil.rmtree(clone_dir, ignore_errors=True)

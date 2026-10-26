@@ -110,6 +110,7 @@ class EntityType(str, Enum):
     AIRCRAFT = "Aircraft"          # Corporate jet (N-Number / ICAO 24-bit hex)
     VESSEL = "Vessel"              # Maritime vessel (IMO / MMSI)
     BREACH_RECORD = "BreachRecord" # Infostealer compromise or Ransomware leak record
+    ONION_SERVICE = "OnionService" # Tor .onion hidden service surfaced via dark-web search (Ahmia)
 
 
 class RelationType(str, Enum):

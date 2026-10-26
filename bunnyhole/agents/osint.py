@@ -29,7 +29,13 @@ from bunnyhole.engine.models import (
     RelationType,
     SelectorStrength,
 )
-from bunnyhole.engine.netutil import host_is_public, is_safe_selector
+from bunnyhole.engine.netutil import (
+    fetch_onion,
+    get_tor_proxy,
+    host_is_public,
+    is_safe_selector,
+    new_async_client,
+)
 
 
 async def _communicate(proc: "asyncio.subprocess.Process", timeout: float) -> bytes:
@@ -217,10 +223,22 @@ class OSINTAgent:
         # 7. HudsonRock Cavalier Infostealer Domain Check
         await self.investigate_hudsonrock_infostealer(clean_domain, "domain", origin_node_id, hop_depth)
 
+        # 8. SecurityTrails historical DNS & subdomain history (keyed; skipped without a key)
+        await self._scan_securitytrails(clean_domain, origin_node_id, hop_depth)
+
+        # 9. Hunter.io company web/email footprint (keyed; org name, email pattern, department emails)
+        await self._scan_hunter_footprint(clean_domain, origin_node_id, hop_depth)
+
+        # 10. LeakCheck domain breach feed (keyed v2, else keyless public email path elsewhere)
+        await self._scan_leakcheck(clean_domain, "domain", origin_node_id, hop_depth)
+
+        # 11. Ahmia dark-web search for public mentions of this domain (keyless, clearnet-indexed)
+        await self.search_darkweb_ahmia(clean_domain, origin_node_id, hop_depth)
+
     async def _scan_crt_sh(self, clean_domain: str, origin_node_id: str, hop_depth: int) -> None:
         crt_url = f"https://crt.sh/?q=%25.{clean_domain}&output=json"
         try:
-            async with httpx.AsyncClient(timeout=10.0, headers=self.headers) as client:
+            async with new_async_client(timeout=10.0, headers=self.headers) as client:
                 resp = await client.get(crt_url)
                 if resp.status_code != 200:
                     return
@@ -340,7 +358,7 @@ class OSINTAgent:
         """Query Mnemonic Passive DNS v3 API (free, keyless) to uncover historical origin IPs before Cloudflare."""
         url = f"https://api.mnemonic.no/pdns/v3/{quote_plus(query)}?limit=10"
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
@@ -405,7 +423,7 @@ class OSINTAgent:
         shodan_url = f"https://internetdb.shodan.io/{ip_str}"
         ripe_url = f"https://stat.ripe.net/data/prefix-overview/data.json?resource={ip_str}"
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 s_resp = await client.get(shodan_url)
                 if s_resp.status_code == 200:
                     s_data = s_resp.json()
@@ -468,6 +486,9 @@ class OSINTAgent:
         except Exception:
             pass
 
+        # Censys Search v2 host enrichment (keyed) — complements the keyless Shodan InternetDB above.
+        await self._scan_censys_host(ip_str, origin_node_id, hop_depth)
+
     async def _scrape_and_fingerprint_site(self, clean_domain: str, origin_node_id: str, hop_depth: int) -> None:
         """
         Use Scrapling to fetch the target site, extract:
@@ -504,7 +525,7 @@ class OSINTAgent:
 
                 html_text = await asyncio.to_thread(_fetch)
             except Exception:
-                async with httpx.AsyncClient(timeout=8.0, follow_redirects=False, headers=self.headers) as client:
+                async with new_async_client(timeout=8.0, follow_redirects=False, headers=self.headers) as client:
                     r = await client.get(target_url)
                     html_text = r.text if r.status_code == 200 else ""
         except Exception:
@@ -597,7 +618,7 @@ class OSINTAgent:
 
         # Compute Shodan-compatible Favicon MurmurHash3 (mmh3)
         try:
-            async with httpx.AsyncClient(timeout=6.0, follow_redirects=True, headers=self.headers) as client:
+            async with new_async_client(timeout=6.0, follow_redirects=True, headers=self.headers) as client:
                 fav_resp = await client.get(f"https://{clean_domain}/favicon.ico")
                 if fav_resp.status_code == 200 and len(fav_resp.content) > 64:
                     b64_fav = codecs.encode(fav_resp.content, "base64")
@@ -674,7 +695,7 @@ class OSINTAgent:
         """Query Keybase API for cryptographically signed cross-platform identity proofs."""
         url = f"https://keybase.io/_/api/1.0/user/lookup.json?usernames={quote_plus(handle)}"
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
@@ -776,7 +797,7 @@ class OSINTAgent:
         if gh_token:
             gh_headers["Authorization"] = f"Bearer {gh_token}"
         try:
-            async with httpx.AsyncClient(timeout=10.0, headers=gh_headers) as client:
+            async with new_async_client(timeout=10.0, headers=gh_headers) as client:
                 u_resp = await client.get(user_url)
                 if u_resp.status_code != 200:
                     return
@@ -901,7 +922,7 @@ class OSINTAgent:
         md5_hash = hashlib.md5(clean_email.encode("utf-8")).hexdigest()
         grav_url = f"https://en.gravatar.com/{md5_hash}.json"
         try:
-            async with httpx.AsyncClient(timeout=6.0, headers=self.headers) as client:
+            async with new_async_client(timeout=6.0, headers=self.headers) as client:
                 resp = await client.get(grav_url)
                 if resp.status_code == 200:
                     entry = (resp.json().get("entry") or [{}])[0]
@@ -949,6 +970,7 @@ class OSINTAgent:
         await self._lookup_emailrep(clean_email, origin_node_id, hop_depth)
         await self._run_local_arsenal_holehe(clean_email, origin_node_id, hop_depth)
         await self.investigate_hudsonrock_infostealer(clean_email, "email", origin_node_id, hop_depth)
+        await self._scan_leakcheck(clean_email, "email", origin_node_id, hop_depth)
 
     async def _run_local_arsenal_domain_tools(self, clean_domain: str, origin_node_id: str, hop_depth: int) -> None:
         """
@@ -1112,7 +1134,7 @@ class OSINTAgent:
         try:
             # Keep per-provider secrets out of the client default headers: httpx merges defaults into
             # every request, which would otherwise send the URLScan API-Key to AlienVault OTX too.
-            async with httpx.AsyncClient(timeout=8.0, headers=dict(self.headers)) as client:
+            async with new_async_client(timeout=8.0, headers=dict(self.headers)) as client:
                 u_resp = await client.get(urlscan_api, headers=u_headers)
                 if u_resp.status_code == 200:
                     results = u_resp.json().get("results", [])
@@ -1189,7 +1211,7 @@ class OSINTAgent:
         if os.environ.get("EMAILREP_API_KEY", "").strip():
             er_headers["Key"] = os.environ["EMAILREP_API_KEY"].strip()
         try:
-            async with httpx.AsyncClient(timeout=6.0, headers=er_headers) as client:
+            async with new_async_client(timeout=6.0, headers=er_headers) as client:
                 resp = await client.get(url)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -1225,7 +1247,7 @@ class OSINTAgent:
         if not url:
             return
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
@@ -1273,6 +1295,385 @@ class OSINTAgent:
                 )
         except Exception:
             pass
+
+    async def _scan_censys_host(self, ip_str: str, origin_node_id: str, hop_depth: int) -> None:
+        """Enrich an IP via the Censys Search v2 Hosts API (keyed) — services, ASN, and geolocation.
+
+        Complements the keyless Shodan InternetDB sweep with Censys' independent scan data. Skipped
+        silently unless both CENSYS_API_ID and CENSYS_API_SECRET are configured in the vault.
+        """
+        api_id = os.environ.get("CENSYS_API_ID", "").strip()
+        api_secret = os.environ.get("CENSYS_API_SECRET", "").strip()
+        if not (api_id and api_secret) or not is_safe_selector(ip_str):
+            return
+        url = f"https://search.censys.io/api/v2/hosts/{quote_plus(ip_str)}"
+        try:
+            async with new_async_client(
+                timeout=10.0,
+                headers={**self.headers, "Accept": "application/json"},
+                auth=(api_id, api_secret),
+            ) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    return
+                data = resp.json().get("result", {}) or {}
+                services = data.get("services", []) or []
+                ports = sorted({s.get("port") for s in services if s.get("port")})
+                service_names = sorted({s.get("service_name", "") for s in services if s.get("service_name")})
+                asys = data.get("autonomous_system", {}) or {}
+                asn_name = asys.get("name", "")
+                asn_num = asys.get("asn", "")
+                country = (data.get("location", {}) or {}).get("country", "")
+                if not ports and not service_names:
+                    return
+                rcpt = EvidenceReceipt(
+                    tool="censys_search_v2_hosts",
+                    domain=DomainCategory.OSINT,
+                    admiralty_code="A1",
+                    selector_strength=SelectorStrength.STRONG,
+                    source_url=f"https://search.censys.io/hosts/{ip_str}",
+                    extracted_fact=(
+                        f"Censys host {ip_str}: Ports={ports[:12]}, Services={service_names[:8]}, "
+                        f"ASN=AS{asn_num} ({asn_name}), Country={country}"
+                    ),
+                    raw_snippet=str({"ports": ports, "services": service_names, "asn": asn_num})[:320],
+                )
+                if origin_node_id in self.graph.nodes:
+                    node = self.graph.nodes[origin_node_id]
+                    node.receipts.append(rcpt)
+                    node.attributes["censys_ports"] = ports[:20]
+                    node.attributes["censys_services"] = service_names[:12]
+                    node.attributes["censys_asn"] = f"AS{asn_num} ({asn_name})" if asn_num else asn_name
+                    if "SENSITIVE_MANAGEMENT_PORTS_OPEN" not in node.risk_flags and any(
+                        p in ports for p in (22, 3389, 6379, 27017, 9200, 5432, 8080, 3000)
+                    ):
+                        node.risk_flags.append("SENSITIVE_MANAGEMENT_PORTS_OPEN")
+        except Exception:
+            pass
+
+    async def _scan_securitytrails(self, clean_domain: str, origin_node_id: str, hop_depth: int) -> None:
+        """Query SecurityTrails (keyed) for subdomain inventory and historical A records.
+
+        Historical A records are a dead-end breaker like Mnemonic Passive DNS: they can reveal the
+        pre-CDN origin IP of a domain now hidden behind Cloudflare. Skipped without SECURITYTRAILS_API_KEY.
+        """
+        api_key = os.environ.get("SECURITYTRAILS_API_KEY", "").strip()
+        if not api_key or not is_safe_selector(clean_domain):
+            return
+        st_headers = {**self.headers, "APIKEY": api_key, "Accept": "application/json"}
+        subs_url = f"https://api.securitytrails.com/v1/domain/{quote_plus(clean_domain)}/subdomains"
+        hist_url = f"https://api.securitytrails.com/v1/history/{quote_plus(clean_domain)}/dns/a"
+        try:
+            async with new_async_client(timeout=10.0, headers=st_headers) as client:
+                s_resp = await client.get(subs_url)
+                if s_resp.status_code == 200:
+                    subs = s_resp.json().get("subdomains", []) or []
+                    fqdns = sorted(f"{s}.{clean_domain}" for s in subs if s)
+                    if fqdns:
+                        rcpt = EvidenceReceipt(
+                            tool="securitytrails_subdomains",
+                            domain=DomainCategory.OSINT,
+                            admiralty_code="A2",
+                            selector_strength=SelectorStrength.STRONG,
+                            source_url=f"https://securitytrails.com/domain/{clean_domain}/dns",
+                            extracted_fact=f"SecurityTrails lists {len(fqdns)} subdomains for {clean_domain}: {fqdns[:8]}",
+                            raw_snippet=", ".join(fqdns[:20]),
+                        )
+                        if origin_node_id in self.graph.nodes:
+                            self.graph.nodes[origin_node_id].receipts.append(rcpt)
+                            self.graph.nodes[origin_node_id].attributes["securitytrails_subdomains"] = fqdns[:25]
+
+                h_resp = await client.get(hist_url)
+                if h_resp.status_code == 200:
+                    records = h_resp.json().get("records", []) or []
+                    seen_ips: Set[str] = set()
+                    for rec in records:
+                        for val in rec.get("values", []) or []:
+                            ip_addr = val.get("ip", "")
+                            if ip_addr and ip_addr not in seen_ips and not self.graph.is_shared_cdn_ip(ip_addr):
+                                seen_ips.add(ip_addr)
+                    for ip_addr in list(seen_ips)[:3]:
+                        ip_id = f"ip:{ip_addr}"
+                        rcpt = EvidenceReceipt(
+                            tool="securitytrails_dns_history",
+                            domain=DomainCategory.OSINT,
+                            admiralty_code="A2",
+                            selector_strength=SelectorStrength.STRONG,
+                            source_url=f"https://securitytrails.com/domain/{clean_domain}/history/a",
+                            extracted_fact=f"SecurityTrails DNS history shows {clean_domain} resolved to non-CDN IP {ip_addr}",
+                            raw_snippet=f"historical A record: {clean_domain} -> {ip_addr}",
+                        )
+                        self.graph.upsert_node(
+                            GraphNode(
+                                id=ip_id,
+                                label=f"🕰️ Historical IP (SecurityTrails): {ip_addr}",
+                                entity_type=EntityType.IP_HOST,
+                                domain=DomainCategory.OSINT,
+                                selector_strength=SelectorStrength.STRONG,
+                                smoke_score=66.0,
+                                risk_flags=["HISTORICAL_DNS_PRE_CDN_ORIGIN_IP"],
+                                attributes={"ip": ip_addr, "source_domain": clean_domain},
+                                receipts=[rcpt],
+                                hop_depth=hop_depth,
+                            )
+                        )
+                        self.graph.upsert_edge(
+                            GraphEdge(
+                                source_id=origin_node_id,
+                                target_id=ip_id,
+                                relation=RelationType.RESOLVES_TO,
+                                domain=DomainCategory.OSINT,
+                                admiralty_code="A2",
+                                confidence=0.88,
+                                summary="SecurityTrails Historical A",
+                                receipts=[rcpt],
+                            )
+                        )
+        except Exception:
+            pass
+
+    async def _scan_hunter_footprint(self, clean_domain: str, origin_node_id: str, hop_depth: int) -> None:
+        """Map a company's public email footprint via Hunter.io domain-search (keyed).
+
+        Surfaces the organization name and corporate email *pattern* (e.g. {first}.{last}@) as a
+        company footprint signal. Only generic/role mailboxes (info@, sales@, support@) are pivoted
+        as leads; personal addresses are counted but not auto-expanded, keeping this entity-focused.
+        Skipped without HUNTER_API_KEY.
+        """
+        api_key = os.environ.get("HUNTER_API_KEY", "").strip()
+        if not api_key or not is_safe_selector(clean_domain):
+            return
+        url = f"https://api.hunter.io/v2/domain-search?domain={quote_plus(clean_domain)}&api_key={quote_plus(api_key)}&limit=25"
+        try:
+            async with new_async_client(timeout=10.0, headers=self.headers) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    return
+                data = resp.json().get("data", {}) or {}
+                organization = data.get("organization") or ""
+                pattern = data.get("pattern") or ""
+                emails = data.get("emails", []) or []
+                generic_emails = [e.get("value", "") for e in emails if e.get("type") == "generic" and e.get("value")]
+                if not (organization or pattern or emails):
+                    return
+                rcpt = EvidenceReceipt(
+                    tool="hunter_io_domain_search",
+                    domain=DomainCategory.OSINT,
+                    admiralty_code="B1",
+                    selector_strength=SelectorStrength.STRONG,
+                    source_url=f"https://hunter.io/search/{clean_domain}",
+                    extracted_fact=(
+                        f"Hunter.io footprint for {clean_domain}: Organization='{organization}', "
+                        f"Email pattern='{pattern}', {len(emails)} public emails ({len(generic_emails)} role mailboxes)"
+                    ),
+                    raw_snippet=str({"organization": organization, "pattern": pattern, "generic": generic_emails[:5]})[:320],
+                )
+                if origin_node_id in self.graph.nodes:
+                    node = self.graph.nodes[origin_node_id]
+                    node.receipts.append(rcpt)
+                    if organization:
+                        node.attributes["hunter_organization"] = organization
+                    if pattern:
+                        node.attributes["hunter_email_pattern"] = pattern
+                    node.attributes["hunter_email_count"] = len(emails)
+                for em in generic_emails[:3]:
+                    self.graph.add_lead(
+                        Lead(
+                            seed_value=em,
+                            lead_type="email",
+                            selector_strength=SelectorStrength.STRONG,
+                            target_agent=DomainCategory.OSINT,
+                            priority_score=58.0,
+                            reason=f"Role mailbox '{em}' published for {clean_domain} (Hunter.io domain footprint)",
+                            origin_node_id=origin_node_id,
+                            hop_depth=hop_depth + 1,
+                        )
+                    )
+        except Exception:
+            pass
+
+    async def _scan_leakcheck(self, value: str, kind: str, origin_node_id: str, hop_depth: int) -> None:
+        """Breach-exposure feed for a domain or email via LeakCheck.
+
+        Uses the keyed LeakCheck v2 API (`type=domain|email`) when LEAKCHECK_API_KEY is set; otherwise
+        falls back to the keyless public endpoint, which works for emails only and returns breach
+        source names and dates without any plaintext secrets. Entity/selector-keyed by design.
+        """
+        if kind not in ("domain", "email") or not is_safe_selector(value):
+            return
+        api_key = os.environ.get("LEAKCHECK_API_KEY", "").strip()
+        breach_sources: List[str] = []
+        found = 0
+        source_url = ""
+        try:
+            async with new_async_client(timeout=9.0, headers={**self.headers, "Accept": "application/json"}) as client:
+                if api_key:
+                    source_url = "https://leakcheck.io/api/v2/query"
+                    resp = await client.get(
+                        f"{source_url}/{quote_plus(value)}?type={kind}",
+                        headers={"X-API-Key": api_key},
+                    )
+                    if resp.status_code != 200:
+                        return
+                    payload = resp.json()
+                    found = int(payload.get("found", 0) or 0)
+                    for row in payload.get("result", []) or []:
+                        src = row.get("source", {})
+                        name = src.get("name") if isinstance(src, dict) else str(src)
+                        if name and name not in breach_sources:
+                            breach_sources.append(name)
+                elif kind == "email":
+                    source_url = "https://leakcheck.io/api/public"
+                    resp = await client.get(f"{source_url}?check={quote_plus(value)}")
+                    if resp.status_code != 200:
+                        return
+                    payload = resp.json()
+                    found = int(payload.get("found", 0) or 0)
+                    for row in payload.get("sources", []) or []:
+                        name = row.get("name", "")
+                        if name and name not in breach_sources:
+                            breach_sources.append(name)
+                else:
+                    return
+        except Exception:
+            return
+
+        if not found and not breach_sources:
+            return
+        rcpt = EvidenceReceipt(
+            tool="leakcheck_breach_feed",
+            domain=DomainCategory.OSINT,
+            admiralty_code="B1",
+            selector_strength=SelectorStrength.STRONG,
+            source_url=source_url or "https://leakcheck.io/",
+            extracted_fact=(
+                f"LeakCheck breach feed for {kind}='{value}': {found} exposed record(s) across "
+                f"{len(breach_sources)} breach source(s): {breach_sources[:8]}"
+            ),
+            raw_snippet=str({"found": found, "sources": breach_sources[:15]})[:320],
+        )
+        breach_id = f"breach:leakcheck:{kind}:{value.lower()[:40]}"
+        self.graph.upsert_node(
+            GraphNode(
+                id=breach_id,
+                label=f"🩸 LeakCheck: {value} ({found} records)",
+                entity_type=EntityType.BREACH_RECORD,
+                domain=DomainCategory.OSINT,
+                selector_strength=SelectorStrength.STRONG,
+                smoke_score=74.0,
+                risk_flags=["LEAKCHECK_BREACH_EXPOSURE"],
+                attributes={"query": value, "kind": kind, "found": found, "breach_sources": breach_sources[:15]},
+                receipts=[rcpt],
+                hop_depth=hop_depth,
+            )
+        )
+        self.graph.upsert_edge(
+            GraphEdge(
+                source_id=origin_node_id,
+                target_id=breach_id,
+                relation=RelationType.COMPROMISED_IN,
+                domain=DomainCategory.OSINT,
+                admiralty_code="B1",
+                confidence=0.90,
+                summary=f"LeakCheck ({found} records)",
+                receipts=[rcpt],
+            )
+        )
+
+    async def search_darkweb_ahmia(
+        self,
+        query: str,
+        origin_node_id: str,
+        hop_depth: int,
+        fetch_pages: bool = False,
+    ) -> List[str]:
+        """Search the Tor dark-web for public mentions of a selector via Ahmia (keyless, clearnet).
+
+        Ahmia (ahmia.fi) indexes Tor hidden services over the clearnet and filters known abuse
+        material, so this needs no Tor daemon and no key. Each distinct .onion result becomes an
+        OnionService node linked to the origin with MENTIONED_IN. When fetch_pages=True and a Tor
+        SOCKS proxy is reachable, each hit is additionally fetched through Tor to capture its title.
+
+        Returns the list of discovered .onion URLs (also usable by the `darkweb` CLI command).
+        """
+        clean_query = (query or "").strip()
+        if not clean_query:
+            return []
+        self.graph.log(
+            DomainCategory.OSINT,
+            "DARKWEB_AHMIA_SEARCH",
+            clean_query,
+            f"Searching Ahmia clearnet Tor index for public .onion mentions of '{clean_query}'"
+            + (" (fetching pages via Tor)" if fetch_pages else ""),
+        )
+        search_url = f"https://ahmia.fi/search/?q={quote_plus(clean_query)}"
+        onion_urls: List[str] = []
+        try:
+            async with new_async_client(timeout=12.0, headers=self.headers, follow_redirects=True) as client:
+                resp = await client.get(search_url)
+                if resp.status_code != 200:
+                    return []
+                # v3 onion addresses are 56-char base32; also tolerate legacy 16-char v2 addresses.
+                raw_hits = re.findall(r"https?://[a-z2-7]{16,56}\.onion(?:/[^\s\"'<>]*)?", resp.text)
+                for u in raw_hits:
+                    if u not in onion_urls:
+                        onion_urls.append(u)
+        except Exception:
+            return []
+
+        if not onion_urls:
+            return []
+
+        tor_proxy = get_tor_proxy()
+        for onion_url in onion_urls[:5]:
+            onion_host = onion_url.split("://", 1)[-1].split("/")[0]
+            title = ""
+            if fetch_pages:
+                page = await fetch_onion(onion_url, tor_proxy=tor_proxy, headers=self.headers)
+                if page:
+                    m = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+                    if m:
+                        title = re.sub(r"\s+", " ", m.group(1)).strip()[:120]
+            rcpt = EvidenceReceipt(
+                tool="ahmia_darkweb_search",
+                domain=DomainCategory.OSINT,
+                admiralty_code="C3",
+                selector_strength=SelectorStrength.SOFT,
+                source_url=search_url,
+                extracted_fact=(
+                    f"Ahmia dark-web index returned Tor hidden service '{onion_host}' for query '{clean_query}'"
+                    + (f" (page title: '{title}')" if title else "")
+                ),
+                raw_snippet=f"ahmia hit: {onion_url}" + (f" | title={title}" if title else ""),
+            )
+            onion_id = f"onion:{onion_host.lower()}"
+            self.graph.upsert_node(
+                GraphNode(
+                    id=onion_id,
+                    label=f"🧅 {title or onion_host}",
+                    entity_type=EntityType.ONION_SERVICE,
+                    domain=DomainCategory.OSINT,
+                    selector_strength=SelectorStrength.SOFT,
+                    smoke_score=60.0,
+                    risk_flags=["DARKWEB_ONION_MENTION"],
+                    attributes={"onion_url": onion_url, "onion_host": onion_host, "title": title, "matched_query": clean_query},
+                    receipts=[rcpt],
+                    hop_depth=hop_depth,
+                )
+            )
+            self.graph.upsert_edge(
+                GraphEdge(
+                    source_id=origin_node_id,
+                    target_id=onion_id,
+                    relation=RelationType.MENTIONED_IN,
+                    domain=DomainCategory.OSINT,
+                    admiralty_code="C3",
+                    confidence=0.45,
+                    summary="Ahmia Dark-Web Mention",
+                    receipts=[rcpt],
+                )
+            )
+        return onion_urls
 
     async def investigate_phone_number(self, phone: str, origin_node_id: str, hop_depth: int) -> None:
         """
@@ -1325,7 +1726,7 @@ class OSINTAgent:
         num_key = os.environ.get("NUMVERIFY_API_KEY", "").strip()
         if num_key:
             try:
-                async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+                async with new_async_client(timeout=8.0, headers=self.headers) as client:
                     n_resp = await client.get(
                         f"https://apilayer.net/api/validate?access_key={num_key}&number={digits}"
                     )
@@ -1419,7 +1820,7 @@ class OSINTAgent:
         pwned_count = 0
         lookup_ok = False
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 resp = await client.get(f"https://api.pwnedpasswords.com/range/{prefix5}")
                 if resp.status_code == 200:
                     lookup_ok = True

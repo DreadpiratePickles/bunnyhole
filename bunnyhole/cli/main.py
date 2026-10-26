@@ -17,6 +17,7 @@ from rich.table import Table
 
 from bunnyhole.agents.accountant import AccountantAgent, n_number_to_icao_hex
 from bunnyhole.agents.journalist import JournalistAgent
+from bunnyhole.agents.osint import OSINTAgent
 from bunnyhole.engine.graph import InvestigationGraph
 from bunnyhole.engine.intake import AnchorMode, CaseIntakePacket, SmartIntakeParser
 from bunnyhole.engine.models import GearMode
@@ -28,6 +29,38 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+
+@app.callback()
+def _global_options(
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="Route all outbound HTTP through this proxy (e.g. http://host:8080 or socks5h://127.0.0.1:9050)."
+    ),
+    tor: bool = typer.Option(
+        False, "--tor", help="Shortcut for --proxy socks5h://127.0.0.1:9050 (route everything via a local Tor SOCKS listener)."
+    ),
+) -> None:
+    """🐇🕳️ Bunnyhole global options (apply to every command)."""
+    from bunnyhole.engine import netutil
+
+    # An operator can also set BUNNYHOLE_TOR_PROXY to point --tor / onion fetches at a non-default
+    # Tor SOCKS listener, and BUNNYHOLE_PROXY as a standing default proxy when no flag is given.
+    tor_override = os.environ.get("BUNNYHOLE_TOR_PROXY", "").strip()
+    if tor_override:
+        try:
+            netutil.set_tor_proxy(tor_override)
+        except netutil.InvalidProxyError as exc:
+            console.print(f"[bold yellow]⚠ Ignoring invalid BUNNYHOLE_TOR_PROXY:[/bold yellow] {exc}")
+
+    chosen = proxy or (netutil.get_tor_proxy() if tor else None) or os.environ.get("BUNNYHOLE_PROXY", "").strip() or None
+    if not chosen:
+        return
+    try:
+        netutil.set_default_proxy(chosen)
+    except netutil.InvalidProxyError as exc:
+        console.print(f"[bold red]Invalid --proxy:[/bold red] {exc}")
+        raise typer.Exit(2) from exc
+    console.print(f"[dim]🧅 Routing outbound traffic through proxy:[/dim] [cyan]{chosen}[/cyan]")
 
 
 def _render_investigation_results(result: dict) -> None:
@@ -363,6 +396,86 @@ def jet_command(
     acct = AccountantAgent(g)
     info = asyncio.run(acct.investigate_aircraft_adsb(tail_or_hex, "seed:jet", hop_depth=1))
     console.print(Panel(json.dumps(info, indent=2), title=f"✈️ ADS-B Forensics: {tail_or_hex} (ICAO Hex: {n_number_to_icao_hex(tail_or_hex)})"))
+
+
+@app.command("darkweb")
+def darkweb_command(
+    query: str = typer.Argument(..., help="Selector to search the Tor dark-web index for (domain, company, email, @handle)"),
+    fetch_onion: bool = typer.Option(
+        False, "--fetch-onion", help="Also fetch each .onion hit through Tor to capture its page title (requires a running Tor SOCKS proxy; pair with --tor)."
+    ),
+) -> None:
+    """Search the Tor dark-web via Ahmia (keyless, clearnet-indexed) for public mentions of a selector."""
+    g = InvestigationGraph("darkweb_search", query)
+    agent = OSINTAgent(g)
+    urls = asyncio.run(agent.search_darkweb_ahmia(query, "seed:darkweb", hop_depth=1, fetch_pages=fetch_onion))
+
+    if not urls:
+        console.print(f"[yellow]No dark-web (.onion) results indexed by Ahmia for[/yellow] [bold]{_rich_escape(query)}[/bold].")
+        return
+
+    d_table = Table(title=f"🧅 Ahmia Dark-Web Results for '{query}'", show_lines=False)
+    d_table.add_column("Onion Service", style="bold white")
+    d_table.add_column("Title", style="cyan")
+    d_table.add_column("Flags", style="dim")
+    for node in g.nodes.values():
+        if node.entity_type.value == "OnionService":
+            d_table.add_row(
+                node.attributes.get("onion_host", node.label)[:48],
+                (node.attributes.get("title") or "—")[:40],
+                ", ".join(node.risk_flags[:2]) or "—",
+            )
+    console.print(d_table)
+    console.print(
+        "[dim]Dark-web hits are SOFT, low-confidence leads (Admiralty C3): an indexed mention is not "
+        "proof of a link. Corroborate before acting.[/dim]"
+    )
+
+
+@app.command("anonsurf")
+def anonsurf_command(
+    action: str = typer.Argument(
+        "status", help="status | start | stop | restart | change (new Tor identity) | install"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt for start/stop (system-wide network change)."),
+) -> None:
+    """Install and control anonsurf — Parrot/Kali's system-wide Tor transparent proxy (Linux, root).
+
+    anonsurf reroutes ALL of this host's traffic through Tor via iptables to anonymize your own
+    OSINT traffic. It is Linux-only and needs root (sudo will prompt). On macOS/Windows, use the
+    portable `--tor` flag instead. Nothing here runs automatically — every action is explicit.
+    """
+    from bunnyhole.arsenal.manager import AnonsurfController
+
+    ctl = AnonsurfController()
+    act = action.strip().lower()
+    valid = {"status", "start", "stop", "restart", "change", "install"}
+    if act not in valid:
+        console.print(f"[bold red]Unknown action '{action}'.[/bold red] Use one of: {', '.join(sorted(valid))}.")
+        raise typer.Exit(2)
+
+    if act in ("start", "stop") and not yes:
+        verb = "route ALL of this machine's traffic through Tor" if act == "start" else "restore normal (clearnet) networking"
+        if not typer.confirm(f"anonsurf {act} will {verb} (needs root). Continue?"):
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit(0)
+
+    dispatch = {
+        "status": ctl.status,
+        "start": ctl.start,
+        "stop": ctl.stop,
+        "restart": ctl.restart,
+        "change": ctl.change_identity,
+        "install": ctl.install,
+    }
+    console.print(f"[bold cyan]🧅 anonsurf {act}...[/bold cyan]")
+    res = dispatch[act]()
+    if res.get("success"):
+        detail = res.get("output") or res.get("note") or res.get("command") or res.get("method") or "done"
+        console.print(f"[bold green]✔ anonsurf {act}:[/bold green] {detail}")
+    else:
+        console.print(f"[bold yellow]⚠ anonsurf {act} failed:[/bold yellow] {res.get('error', 'unknown error')}")
+        raise typer.Exit(1)
 
 
 @app.command("doc-forensics")

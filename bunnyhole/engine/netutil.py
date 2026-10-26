@@ -11,12 +11,104 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from typing import List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+
+import httpx
 
 # A selector that is safe to pass as a single argv token to a subprocess (no leading dash, no shell
 # metacharacters). Used to validate domains/handles/emails before they reach whois/sherlock/etc.
 SAFE_SELECTOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,253}$")
+
+# The default Tor SOCKS listener. socks5h:// keeps DNS resolution on the Tor side, which is the
+# only way a .onion name (which has no clearnet DNS) can be reached. Used for onion fetches and by
+# the `--tor` convenience flag. Overridable via set_tor_proxy() / BUNNYHOLE_TOR_PROXY.
+DEFAULT_TOR_PROXY = "socks5h://127.0.0.1:9050"
+
+# Proxy URL schemes we accept from configuration. http(s) covers a plain forward proxy; socks5/5h
+# covers Tor and other SOCKS proxies (requires the httpx[socks] extra to actually connect).
+_ALLOWED_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h", "socks4")
+
+# Module-level proxy defaults. The CLI sets these once at startup so every outbound httpx client
+# built via new_async_client() inherits them without threading a proxy argument through every agent
+# constructor and call site. None means "direct connection".
+_DEFAULT_PROXY: Optional[str] = None
+_TOR_PROXY: str = DEFAULT_TOR_PROXY
+
+
+class InvalidProxyError(ValueError):
+    """Raised when a configured proxy URL is missing a host or uses an unsupported scheme."""
+
+
+def validate_proxy_url(proxy: str) -> str:
+    """Return the proxy URL unchanged if it is a supported scheme with a host; raise otherwise."""
+    parts = urlsplit((proxy or "").strip())
+    if parts.scheme not in _ALLOWED_PROXY_SCHEMES:
+        raise InvalidProxyError(
+            f"Unsupported proxy scheme {parts.scheme!r}; use one of {', '.join(_ALLOWED_PROXY_SCHEMES)}"
+        )
+    if not parts.hostname:
+        raise InvalidProxyError(f"Proxy URL is missing a host: {proxy!r}")
+    return proxy.strip()
+
+
+def set_default_proxy(proxy: Optional[str]) -> None:
+    """Set (or clear, with None/empty) the global proxy every new_async_client() call inherits."""
+    global _DEFAULT_PROXY
+    _DEFAULT_PROXY = validate_proxy_url(proxy) if proxy else None
+
+
+def get_default_proxy() -> Optional[str]:
+    """Return the global default proxy, or None for a direct connection."""
+    return _DEFAULT_PROXY
+
+
+def set_tor_proxy(proxy: str) -> None:
+    """Override the Tor SOCKS proxy used for .onion fetches (default socks5h://127.0.0.1:9050)."""
+    global _TOR_PROXY
+    _TOR_PROXY = validate_proxy_url(proxy)
+
+
+def get_tor_proxy() -> str:
+    """Return the Tor SOCKS proxy URL used for .onion fetches."""
+    return _TOR_PROXY
+
+
+def new_async_client(
+    *,
+    timeout: float = 10.0,
+    headers: Optional[Dict[str, str]] = None,
+    follow_redirects: bool = False,
+    proxy: Optional[str] = None,
+    **kwargs: Any,
+) -> httpx.AsyncClient:
+    """Build an httpx.AsyncClient that honours the globally configured proxy.
+
+    Every outbound call in Bunnyhole should go through this factory instead of instantiating
+    httpx.AsyncClient directly, so a single --proxy / --tor setting routes the whole engine
+    (including through Tor via anonsurf or a SOCKS listener) with no per-call-site plumbing.
+
+    A `proxy` passed explicitly wins; otherwise the module default (set_default_proxy) is used.
+    Pass proxy="" to force a direct connection for one client even when a global proxy is set.
+    """
+    chosen = proxy if proxy is not None else _DEFAULT_PROXY
+    if chosen:
+        kwargs["proxy"] = chosen
+    return httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=follow_redirects,
+        **kwargs,
+    )
+
+
+def is_onion_host(host_or_url: str) -> bool:
+    """True if the host (or the host of a URL) is a Tor .onion hidden service address."""
+    raw = (host_or_url or "").strip()
+    if "://" in raw:
+        raw = urlsplit(raw).hostname or ""
+    host = raw.strip().strip("[]").lower().split("/")[0].split(":")[0]
+    return host.endswith(".onion")
 
 
 class UnsafeHostError(ValueError):
@@ -92,3 +184,39 @@ def public_host_or_none(host: str) -> str | None:
 def safe_argv_selectors(values: List[str]) -> List[str]:
     """Filter a list of selectors down to the ones safe to pass as subprocess arguments."""
     return [v for v in values if is_safe_selector(v)]
+
+
+async def fetch_onion(
+    url: str,
+    *,
+    tor_proxy: Optional[str] = None,
+    timeout: float = 25.0,
+    headers: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Fetch a Tor .onion page through the Tor SOCKS proxy, or return None.
+
+    This is the ONE sanctioned way to reach a non-clearnet host. It deliberately bypasses the
+    host_is_public() SSRF guard (a .onion name has no resolvable clearnet IP), so it is locked down
+    hard: the host must end in .onion (never a clearnet or internal name), the scheme must be
+    http(s), and the request is forced through the Tor SOCKS proxy with remote DNS (socks5h). That
+    combination means this path can only ever egress via Tor and can never be turned into an SSRF
+    primitive against the local network. Returns the response text, or None on any failure
+    (Tor not running, httpx[socks] missing, timeout, non-200).
+    """
+    parts = urlsplit((url or "").strip())
+    if parts.scheme not in ("http", "https"):
+        return None
+    if not is_onion_host(url):
+        return None
+    proxy = validate_proxy_url(tor_proxy) if tor_proxy else _TOR_PROXY
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, headers=headers, follow_redirects=False, proxy=proxy
+        ) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                return resp.text
+    except Exception:
+        # Tor down, httpx[socks] not installed, DNS/circuit failure, timeout — all degrade to None.
+        return None
+    return None
