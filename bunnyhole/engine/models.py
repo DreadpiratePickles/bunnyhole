@@ -96,6 +96,7 @@ class EntityType(str, Enum):
     IP_HOST = "IPHost"
     ACCOUNT = "Account"
     EMAIL = "Email"
+    PHONE = "Phone"
     CRYPTO_WALLET = "CryptoWallet"
     SMART_CONTRACT = "SmartContract"
     TOKEN = "Token"
