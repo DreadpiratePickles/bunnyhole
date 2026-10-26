@@ -40,6 +40,7 @@ class InvestigativeSynthesizer:
                     "tool": r.tool,
                     "domain": r.domain.value,
                     "admiralty_code": r.admiralty_code,
+                    "source_class": (r.source_class.value if r.source_class else "PAI"),
                     "extracted_fact": r.extracted_fact,
                     "source_url": r.source_url,
                     "sha256_short": r.sha256_proof[:12],
@@ -64,6 +65,10 @@ class InvestigativeSynthesizer:
         receipts = self._collect_indexed_receipts()
         ach = self.graph.run_skeptic_network_analytics()
 
+        pai_count = sum(1 for r in receipts if r["source_class"] == "PAI")
+        cai_count = sum(1 for r in receipts if r["source_class"] == "CAI")
+        cai_tools = sorted({r["tool"] for r in receipts if r["source_class"] == "CAI"})
+
         high_smoke_nodes = sorted(
             self.graph.nodes.values(),
             key=lambda x: (x.is_cutout_broker, x.smoke_score),
@@ -83,7 +88,8 @@ class InvestigativeSynthesizer:
             f"**{len(self.graph.nodes)} entities**, **{len(self.graph.edges)} edges**, and "
             f"**{len(receipts)} cryptographic SHA-256 receipts** across "
             f"**{len({n.domain.value for n in self.graph.nodes.values()})} intelligence domains**.\n\n"
-            f"- **CIA ACH Verdict:** `{ach.winning_hypothesis}` — {ach.narrative_verdict}"
+            f"- **CIA ACH Verdict:** `{ach.winning_hypothesis}` — {ach.narrative_verdict}\n"
+            f"- **Source Provenance (ODNI):** {pai_count} PAI (publicly available) · {cai_count} CAI (commercially acquired)."
         )
 
         # 2. High-Smoke Entities & Keystone Cut-Out Brokers
@@ -134,6 +140,37 @@ class InvestigativeSynthesizer:
                 f"{r['extracted_fact']} ([Source]({r['source_url']}))"
             )
         sections.append("### 5. Primary Cryptographic Evidence Receipts\n" + ("\n".join(cite_lines) or "- No receipts collected."))
+
+        # 6. Source Provenance — ODNI IC OSINT Strategy PAI/CAI catalog
+        total_cls = pai_count + cai_count
+        pai_pct = (pai_count / total_cls * 100) if total_cls else 0.0
+        prov_lines = [
+            f"- **Publicly Available Information (PAI):** `{pai_count}` receipts ({pai_pct:.0f}% of graded evidence) — free/public endpoints, keyless by default.",
+            f"- **Commercially Available Information (CAI):** `{cai_count}` receipts"
+            + (f" via `{', '.join(cai_tools)}`." if cai_tools else " — none; this investigation stands entirely on public data."),
+        ]
+        sections.append(
+            "### 6. Source Provenance — PAI vs CAI (ODNI IC OSINT Strategy)\n" + "\n".join(prov_lines)
+        )
+
+        # 7. Key Assumptions Check — CIA Structured Analytic Technique
+        if ach.key_assumptions:
+            _frag_icon = {"FRAGILE": "🔴", "SUPPORTED": "🟡", "SOLID": "🟢"}
+            ka_lines = []
+            for ka in ach.key_assumptions:
+                icon = _frag_icon.get(ka.fragility.value, "🟡")
+                ka_lines.append(
+                    f"- {icon} **[{ka.fragility.value}]** {ka.assumption}\n"
+                    f"  - *If wrong:* {ka.if_wrong}\n"
+                    f"  - *Signal:* {ka.supporting_signal}"
+                )
+            fragile_n = sum(1 for ka in ach.key_assumptions if ka.fragility.value == "FRAGILE")
+            header = (
+                f"### 7. Key Assumptions Check (CIA SAT)\n"
+                f"These assumptions underpin the verdict above — **findings are leads, not verdicts**. "
+                f"{fragile_n} flagged 🔴 FRAGILE.\n"
+            )
+            sections.append(header + "\n".join(ka_lines))
 
         markdown_brief = "\n\n".join(sections)
         return {

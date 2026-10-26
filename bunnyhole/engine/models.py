@@ -52,6 +52,41 @@ class AdmiraltyInfoCredibility(str, Enum):
     SIX = "6"    # Truth cannot be judged
 
 
+class SourceClass(str, Enum):
+    """ODNI IC OSINT Strategy (2024-2026) provenance taxonomy.
+
+    The IC strategy distinguishes two legally and ethically distinct feedstocks of
+    open-source intelligence, and directs that both be tracked in a catalog for
+    transparency. Bunnyhole mirrors that split so every receipt declares whether it
+    rests on free public data or on a commercial data product behind a paid key.
+    """
+    PAI = "PAI"  # Publicly Available Information: free/public endpoints (DNS, CT logs, EDGAR, GLEIF, blockchains, Wayback, ADS-B)
+    CAI = "CAI"  # Commercially Available Information: commercial data brokers / paid intel products (Shodan, Censys, IntelX, HudsonRock, OpenCorporates)
+
+
+# Tool/source name fragments whose data is a commercial product acquired under a paid
+# key (CAI). Everything else defaults to PAI. Matched case-insensitively as substrings
+# against EvidenceReceipt.tool. Heuristic by design — override source_class explicitly
+# when a caller knows better. Note: public registries/explorers whose key only raises
+# a rate limit (GitHub, FEC, Etherscan, Helius) stay PAI — the underlying data is public.
+_CAI_TOOL_SIGNATURES: tuple[str, ...] = (
+    "shodan", "censys", "securitytrails", "virustotal", "urlscan", "abuseipdb",
+    "alienvault", "otx", "hunter", "emailrep", "ipinfo", "numverify", "intelx",
+    "intelligencex", "leakcheck", "breachdirectory", "hudsonrock", "cavalier",
+    "haveibeenpwned", "hibp", "dehashed", "snusbase", "opencorporates",
+)
+
+
+def classify_source_class(tool: str) -> SourceClass:
+    """Classify a receipt's feedstock as PAI or CAI from the tool/source name.
+
+    Returns CAI when the tool name matches a known commercial data broker or paid
+    intelligence product; otherwise PAI (the keyless-by-default public web/record).
+    """
+    t = (tool or "").lower()
+    return SourceClass.CAI if any(sig in t for sig in _CAI_TOOL_SIGNATURES) else SourceClass.PAI
+
+
 class EntityType(str, Enum):
     """Universal entity types aligned with OCCRP FollowTheMoney."""
     PERSON = "Person"
@@ -130,6 +165,9 @@ class EvidenceReceipt(BaseModel):
     domain: DomainCategory
     admiralty_code: str = Field("B2", description="NATO STANAG 2511 code, e.g. A1, B2, C3")
     selector_strength: SelectorStrength = SelectorStrength.STRONG
+    source_class: Optional[SourceClass] = Field(
+        None, description="ODNI PAI/CAI feedstock; auto-derived from `tool` when left unset"
+    )
     source_url: str = Field(..., description="Verifiable URL, API endpoint, or block explorer link")
     archive_url: Optional[str] = Field(None, description="Wayback Machine snapshot URL if archived")
     extracted_fact: str = Field(..., description="Human-readable statement of what this receipt proves")
@@ -143,6 +181,8 @@ class EvidenceReceipt(BaseModel):
             self.sha256_proof = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         if not self.receipt_id:
             self.receipt_id = f"rcpt_{self.sha256_proof[:10]}"
+        if self.source_class is None:
+            self.source_class = classify_source_class(self.tool)
 
 
 class GraphNode(BaseModel):
@@ -193,6 +233,28 @@ class GraphEdge(BaseModel):
             self.tier = ConfidenceTier.HYPOTHESIS
 
 
+class AssumptionFragility(str, Enum):
+    """How exposed a working assumption is to being wrong (CIA Key Assumptions Check)."""
+    SOLID = "SOLID"          # Well-supported; unlikely to be the point of failure
+    SUPPORTED = "SUPPORTED"  # Reasonable, but rests on limited corroboration
+    FRAGILE = "FRAGILE"      # Weak or unexamined; if wrong, the verdict likely collapses
+
+
+class KeyAssumption(BaseModel):
+    """A single working assumption surfaced by the CIA Key Assumptions Check SAT.
+
+    The Key Assumptions Check is a diagnostic Structured Analytic Technique (CIA
+    Tradecraft Primer, 2009): it makes explicit the assumptions a judgment rests on,
+    so a reader can see which ones, if invalidated, would overturn the lead. It is the
+    tradecraft embodiment of Bunnyhole's 'findings are leads, not verdicts' principle.
+    """
+    assumption: str = Field(..., description="The working assumption stated plainly")
+    rationale: str = Field(..., description="Why the engine is (implicitly) relying on it")
+    fragility: AssumptionFragility = AssumptionFragility.SUPPORTED
+    if_wrong: str = Field(..., description="What happens to the verdict if this assumption fails")
+    supporting_signal: str = Field("", description="Short metric/signal that set the fragility level")
+
+
 class ACHHypothesisRow(BaseModel):
     """CIA Analysis of Competing Hypotheses (ACH) evaluation row."""
     evidence_id: str
@@ -216,6 +278,10 @@ class ACHAssessment(BaseModel):
     inconsistency_count_h3: int = 0
     matrix_rows: List[ACHHypothesisRow] = Field(default_factory=list)
     narrative_verdict: str = ""
+    key_assumptions: List[KeyAssumption] = Field(
+        default_factory=list,
+        description="CIA Key Assumptions Check: the assumptions the winning hypothesis rests on",
+    )
 
 
 class Lead(BaseModel):
