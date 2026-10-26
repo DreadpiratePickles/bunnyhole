@@ -94,6 +94,7 @@ ignore = ["E501", "B008", "E741", "SIM105", "SIM102", "B007", "B905"]
 
 [tool.mypy]
 python_version = "3.11"
+plugins = ["pydantic.mypy"]
 warn_unused_ignores = true
 warn_redundant_casts = true
 ignore_missing_imports = true

@@ -12,11 +12,13 @@ from bunnyhole.engine.models import (
     ACHAssessment,
     ACHHypothesisRow,
     AgentLogEvent,
+    AssumptionFragility,
     ConfidenceTier,
     DomainCategory,
     EntityType,
     GraphEdge,
     GraphNode,
+    KeyAssumption,
     Lead,
     RelationType,
     SelectorStrength,
@@ -463,7 +465,108 @@ class InvestigationGraph:
             inconsistency_count_h3=inconsist_h3,
             matrix_rows=rows[:20],
             narrative_verdict=verdict,
+            key_assumptions=self.run_key_assumptions_check(
+                winning, h1_score, h2_score, h3_score
+            ),
         )
+
+    def run_key_assumptions_check(
+        self,
+        winning_hypothesis: str,
+        h1_score: float,
+        h2_score: float,
+        h3_score: float,
+    ) -> List[KeyAssumption]:
+        """CIA Key Assumptions Check (Structured Analytic Technique).
+
+        Surfaces the working assumptions the winning hypothesis rests on and rates how
+        fragile each one is, deterministically, from the graph's own evidence profile.
+        This operationalizes 'findings are leads, not verdicts': the reader sees exactly
+        which assumptions, if wrong, would overturn the lead.
+        """
+        edges = list(self.edges.values())
+        nodes = list(self.nodes.values())
+        all_receipts = [r for n in nodes for r in n.receipts] + [
+            r for e in edges for r in e.receipts
+        ]
+
+        pivot_nodes = [n for n in nodes if n.hop_depth > 0] or nodes
+        soft_pivots = sum(1 for n in pivot_nodes if n.selector_strength == SelectorStrength.SOFT)
+        soft_frac = soft_pivots / len(pivot_nodes) if pivot_nodes else 0.0
+
+        low_grade = sum(1 for r in all_receipts if r.admiralty_code[:1] in ("D", "E", "F"))
+        low_grade_frac = low_grade / len(all_receipts) if all_receipts else 0.0
+
+        verified_edges = sum(1 for e in edges if e.tier == ConfidenceTier.VERIFIED)
+        hypothesis_edges = sum(1 for e in edges if e.tier == ConfidenceTier.HYPOTHESIS)
+        cutouts = sum(1 for n in nodes if n.is_cutout_broker)
+        ach_margin = abs(h1_score - h2_score)
+        attribution_claim = winning_hypothesis.startswith("H1")
+
+        def level(fragile: bool, supported: bool) -> AssumptionFragility:
+            if fragile:
+                return AssumptionFragility.FRAGILE
+            return AssumptionFragility.SUPPORTED if supported else AssumptionFragility.SOLID
+
+        assumptions: List[KeyAssumption] = []
+
+        # 1. Selector uniqueness — the backbone of all attribution.
+        assumptions.append(
+            KeyAssumption(
+                assumption="STRONG selectors (wallet, LEI, CIK, RSID, ICAO hex, email) each resolve to a single real-world operator.",
+                rationale="Contact-chaining treats STRONG selectors as near-zero-collision identities when fusing nodes across domains.",
+                fragility=level(soft_frac >= 0.5, soft_frac >= 0.25),
+                if_wrong="If SOFT selectors are carrying the attribution, fused identities may collapse into distinct people/entities and the chain breaks.",
+                supporting_signal=f"{soft_pivots}/{len(pivot_nodes)} pivot nodes rely on SOFT selectors ({soft_frac:.0%}).",
+            )
+        )
+
+        # 2. Source reliability grading reflects reality.
+        assumptions.append(
+            KeyAssumption(
+                assumption="Assigned NATO Admiralty reliability grades accurately reflect each source's trustworthiness.",
+                rationale="Confidence tiers and the ACH weighting inherit directly from per-receipt Admiralty codes.",
+                fragility=level(low_grade_frac >= 0.33, low_grade_frac >= 0.1),
+                if_wrong="If low-grade (D/E/F) sources are over-trusted, corroboration is illusory and the verdict is overstated.",
+                supporting_signal=f"{low_grade}/{len(all_receipts)} receipts are graded D/E/F ({low_grade_frac:.0%}).",
+            )
+        )
+
+        # 3. Shared infrastructure is not mistaken for coordination.
+        assumptions.append(
+            KeyAssumption(
+                assumption="Shared-infrastructure links (CDN IPs, registered agents, mass hosts) were correctly down-weighted, not read as attribution.",
+                rationale="Red-Cell guards flag known false-positive traps so coincidental co-location does not inflate smoke scores.",
+                fragility=level(False, cutouts == 0 and attribution_claim),
+                if_wrong="If a flagged hub is in fact a benign shared service, any attribution routed through it is a false positive.",
+                supporting_signal=f"{cutouts} cross-domain cut-out broker(s) flagged by betweenness analysis.",
+            )
+        )
+
+        # 4. Temporal authenticity — dates are genuine.
+        assumptions.append(
+            KeyAssumption(
+                assumption="Timestamps, filing dates, and on-chain/transponder times are authentic and not backdated or spoofed.",
+                rationale="Timeline contradiction detection and event ordering assume the recorded times are truthful.",
+                fragility=AssumptionFragility.SUPPORTED,
+                if_wrong="Backdated filings or spoofed memos/transponder times would invert cause-and-effect in the narrative.",
+                supporting_signal="Not independently verifiable from open sources; assumed absent contrary evidence.",
+            )
+        )
+
+        # 5. Completeness — the unexplored frontier hides no disconfirming fact.
+        thin_attribution = attribution_claim and (verified_edges < 2 or ach_margin < 2.0)
+        assumptions.append(
+            KeyAssumption(
+                assumption="No disconfirming evidence is hiding in unexplored leads; what was collected is representative.",
+                rationale="The verdict is drawn from the traversed subgraph, not an exhaustive census of the open-source space.",
+                fragility=level(thin_attribution, hypothesis_edges > verified_edges),
+                if_wrong="A single strong disconfirming source left unexplored could flip the ACH winner.",
+                supporting_signal=f"{verified_edges} VERIFIED vs {hypothesis_edges} HYPOTHESIS-tier edges; ACH margin |H1-H2|={ach_margin:.1f}.",
+            )
+        )
+
+        return assumptions
 
     def to_dict(self) -> Dict[str, Any]:
         ach = self.run_skeptic_network_analytics()
@@ -511,6 +614,45 @@ class InvestigationGraph:
             lines.append(
                 f"| `{row['evidence_id']}` | **{row['admiralty_code']}** | `{row['diagnosticity']}` | {row['evidence_summary']} | `{row['h1_coordinated_control']}` | `{row['h2_coincidence_shared_vendor']}` | `{row['h3_false_flag_spoofing']}` |"
             )
+
+        # CIA Key Assumptions Check — the assumptions the verdict rests on (leads, not verdicts)
+        key_assumptions = ach.get("key_assumptions") or []
+        if key_assumptions:
+            _frag_icon = {"FRAGILE": "🔴", "SUPPORTED": "🟡", "SOLID": "🟢"}
+
+            def _frag(ka: Dict[str, Any]) -> str:
+                return getattr(ka["fragility"], "value", ka["fragility"])
+
+            fragile_n = sum(1 for ka in key_assumptions if _frag(ka) == "FRAGILE")
+            lines.extend([
+                "",
+                "### CIA Key Assumptions Check",
+                f"_The verdict above holds only while these assumptions hold. **{fragile_n}** rated 🔴 FRAGILE — findings are leads, not verdicts._",
+                "",
+                "| | Fragility | Working Assumption | If Wrong | Signal |",
+                "| :---: | :---: | :--- | :--- | :--- |",
+            ])
+            for ka in key_assumptions:
+                frag = _frag(ka)
+                icon = _frag_icon.get(frag, "🟡")
+                lines.append(
+                    f"| {icon} | `{frag}` | {ka['assumption']} | {ka['if_wrong']} | {ka['supporting_signal']} |"
+                )
+
+        # ODNI PAI/CAI source-provenance catalog
+        all_rcpts = [r for n in self.nodes.values() for r in n.receipts] + [
+            r for e in self.edges.values() for r in e.receipts
+        ]
+        pai_n = sum(1 for r in all_rcpts if (r.source_class.value if r.source_class else "PAI") == "PAI")
+        cai_n = len(all_rcpts) - pai_n
+        cai_srcs = sorted({r.tool for r in all_rcpts if r.source_class and r.source_class.value == "CAI"})
+        lines.extend([
+            "",
+            "### Source Provenance — PAI vs CAI (ODNI IC OSINT Strategy)",
+            f"- **PAI (Publicly Available Information):** `{pai_n}` receipts — keyless public web, registries, blockchains, transponders.",
+            f"- **CAI (Commercially Available Information):** `{cai_n}` receipts"
+            + (f" via `{', '.join(cai_srcs)}`." if cai_srcs else " — none; this dossier rests entirely on public data."),
+        ])
 
         lines.extend([
             "",

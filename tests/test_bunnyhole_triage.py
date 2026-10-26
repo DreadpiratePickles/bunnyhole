@@ -322,6 +322,109 @@ class TestBunnyholeTriageAndCouncil(unittest.TestCase):
         self.assertGreaterEqual(len(pwd_neighbors), 2)
 
 
+class TestOdniCiaTradecraft(unittest.TestCase):
+    """PAI/CAI provenance tagging (ODNI IC OSINT Strategy) and CIA Key Assumptions Check SAT."""
+
+    def test_source_class_auto_classification(self) -> None:
+        """Receipts auto-tag PAI vs CAI from the tool name, and honor explicit overrides."""
+        from bunnyhole.engine.models import SourceClass, classify_source_class
+
+        # Public endpoints -> PAI
+        for tool in ("crt.sh", "blockscout", "gleif", "adsb.lol", "edgar", "github.patch"):
+            self.assertEqual(classify_source_class(tool), SourceClass.PAI, tool)
+        # Commercial data brokers / paid intel -> CAI
+        for tool in ("shodan", "Censys", "HudsonRock Cavalier", "intelx", "opencorporates"):
+            self.assertEqual(classify_source_class(tool), SourceClass.CAI, tool)
+
+        pai_receipt = EvidenceReceipt(
+            tool="crt.sh",
+            domain=DomainCategory.OSINT,
+            source_url="https://crt.sh/?q=acme.io",
+            extracted_fact="CT log entry for acme.io",
+        )
+        self.assertEqual(pai_receipt.source_class, SourceClass.PAI)
+
+        cai_receipt = EvidenceReceipt(
+            tool="shodan",
+            domain=DomainCategory.OSINT,
+            source_url="https://api.shodan.io/host/1.2.3.4",
+            extracted_fact="Open port 22 on host",
+        )
+        self.assertEqual(cai_receipt.source_class, SourceClass.CAI)
+
+        # Explicit override is respected (not clobbered by the heuristic)
+        override = EvidenceReceipt(
+            tool="shodan",
+            domain=DomainCategory.OSINT,
+            source_url="https://example.com",
+            extracted_fact="manually reclassified",
+            source_class=SourceClass.PAI,
+        )
+        self.assertEqual(override.source_class, SourceClass.PAI)
+
+    def test_key_assumptions_check_present_and_shaped(self) -> None:
+        """run_skeptic_network_analytics attaches a non-empty, well-formed Key Assumptions Check."""
+        from bunnyhole.engine.models import AssumptionFragility
+
+        g = InvestigationGraph("kac_case", "acme.io")
+        a = g.upsert_node(GraphNode(id="dom:acme.io", label="acme.io", entity_type=EntityType.DOMAIN, domain=DomainCategory.OSINT))
+        b = g.upsert_node(GraphNode(id="wallet:eth:0xabc", label="0xabc", entity_type=EntityType.CRYPTO_WALLET, domain=DomainCategory.ONCHAIN))
+        g.upsert_edge(
+            GraphEdge(
+                source_id=a.id,
+                target_id=b.id,
+                relation=RelationType.FIRST_FUNDED_BY,
+                domain=DomainCategory.ONCHAIN,
+                admiralty_code="A1",
+                confidence=0.95,
+                receipts=[EvidenceReceipt(tool="blockscout", domain=DomainCategory.ONCHAIN, source_url="https://x", extracted_fact="first funded")],
+            )
+        )
+        ach = g.run_skeptic_network_analytics()
+        self.assertTrue(ach.key_assumptions, "KAC must surface assumptions")
+        valid = {f.value for f in AssumptionFragility}
+        for ka in ach.key_assumptions:
+            self.assertTrue(ka.assumption and ka.if_wrong)
+            self.assertIn(ka.fragility.value, valid)
+
+    def test_key_assumptions_flag_soft_selectors_as_fragile(self) -> None:
+        """A graph whose pivots rest on SOFT selectors flags the selector-uniqueness assumption FRAGILE."""
+        from bunnyhole.engine.models import AssumptionFragility
+
+        g = InvestigationGraph("soft_case", "John Smith")
+        # Two SOFT-selector pivot nodes (hop_depth > 0) dominate the graph
+        p1 = g.upsert_node(GraphNode(id="person:john", label="John Smith", entity_type=EntityType.PERSON, domain=DomainCategory.OSINT, selector_strength=SelectorStrength.SOFT, hop_depth=1))
+        p2 = g.upsert_node(GraphNode(id="person:jon", label="Jon Smyth", entity_type=EntityType.PERSON, domain=DomainCategory.OSINT, selector_strength=SelectorStrength.SOFT, hop_depth=1))
+        g.upsert_edge(GraphEdge(source_id=p1.id, target_id=p2.id, relation=RelationType.LINKED_IDENTITY, domain=DomainCategory.OSINT, confidence=0.4))
+        ach = g.run_skeptic_network_analytics()
+        selector_ka = next(ka for ka in ach.key_assumptions if "STRONG selectors" in ka.assumption)
+        self.assertEqual(selector_ka.fragility, AssumptionFragility.FRAGILE)
+
+    def test_dossier_surfaces_pai_cai_and_kac(self) -> None:
+        """The exported Markdown dossier includes the PAI/CAI provenance block and Key Assumptions Check."""
+        g = InvestigationGraph("dossier_case", "acme.io")
+        a = g.upsert_node(GraphNode(id="dom:acme.io", label="acme.io", entity_type=EntityType.DOMAIN, domain=DomainCategory.OSINT))
+        b = g.upsert_node(GraphNode(id="ip:1.2.3.4", label="1.2.3.4", entity_type=EntityType.IP_HOST, domain=DomainCategory.OSINT))
+        g.upsert_edge(
+            GraphEdge(
+                source_id=a.id,
+                target_id=b.id,
+                relation=RelationType.RESOLVES_TO,
+                domain=DomainCategory.OSINT,
+                admiralty_code="B2",
+                confidence=0.8,
+                receipts=[EvidenceReceipt(tool="shodan", domain=DomainCategory.OSINT, source_url="https://api.shodan.io", extracted_fact="port 443 open")],
+            )
+        )
+        dossier = g.export_markdown_dossier()
+        self.assertIn("PAI vs CAI", dossier)
+        self.assertIn("CAI (Commercially Available Information)", dossier)
+        self.assertIn("shodan", dossier)
+        self.assertIn("Key Assumptions Check", dossier)
+        # Fragility must render as a clean label, not the raw enum repr
+        self.assertNotIn("AssumptionFragility.", dossier)
+
+
 if __name__ == "__main__":
     unittest.main()
 

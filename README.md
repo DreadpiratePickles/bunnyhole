@@ -21,6 +21,7 @@ cryptographic `EvidenceReceipt`, a NATO Admiralty grade (`A1`–`F6`), and a Red
 - **Lead → Pivot → Prove** recursive engine (breadth × depth, with dynamic tapering) across 6 specialist agents: Journalist, Accountant, OSINT, On-Chain, Link Sleuth, and the Red-Cell Skeptic.
 - **Universal Investigation Graph** (OCCRP FollowTheMoney-compatible) with SHA-256 evidence receipts, NSA strong/soft selector chaining, betweenness-centrality cut-out detection, and a CIA ACH matrix.
 - **Red-Cell guardrails** that downgrade known false-positive traps (mass registered-agent addresses, shared Cloudflare/Anycast CDN IPs, soft-to-soft links).
+- **IC-aligned tradecraft:** every receipt is tagged **PAI vs CAI** (ODNI IC OSINT Strategy provenance taxonomy), and each dossier ends with a **CIA Key Assumptions Check** — the fragile assumptions the verdict rests on, because findings are leads, not verdicts.
 - **Karpathy 3-stage LLM Council** for adversarial multi-model deliberation (optional; degrades to a deterministic council with no API key).
 - **Cross-case entity memory** in local SQLite — entities seen in a prior case resurface automatically.
 - **Two interfaces:** a Typer CLI and an interactive FastAPI "War-Room" web UI.
