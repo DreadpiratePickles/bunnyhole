@@ -24,6 +24,7 @@ class DomainCategory(str, Enum):
     ONCHAIN = "onchain"            # Multi-chain EVM/BTC/SOL, First-Funder Mother Wallet, CEX Deposit Sweep, THORChain memo, Jito Bundlers
     PHYSICAL = "physical"          # ADS-B Corporate Jets (adsb.lol + ICAO hex), Maritime AIS Shadow Fleet (IMO/MMSI), Supply Chain
     SKEPTIC = "skeptic"            # Red-Cell verifier, NATO Admiralty A1-F6, CIA ACH Matrix, Betweenness Centrality cut-out detector
+    COMMERCIAL = "commercial"      # Solar BD specialization: B2B contact routes, buying signals, decision roles, tenders, programs (bunnyhole-solar)
 
 
 class SelectorStrength(str, Enum):
@@ -112,6 +113,16 @@ class EntityType(str, Enum):
     VESSEL = "Vessel"              # Maritime vessel (IMO / MMSI)
     BREACH_RECORD = "BreachRecord" # Infostealer compromise or Ransomware leak record
     ONION_SERVICE = "OnionService" # Tor .onion hidden service surfaced via dark-web search (Ahmia)
+    # --- bunnyhole-solar (commercial route-finding) ---
+    CONTACT_ROUTE = "ContactRoute" # A lawful public channel to reach a company (leadership page, vendor portal, role mailbox, event, intro path)
+    DECISION_ROLE = "DecisionRole" # A job function in the buying unit (Head of O&M, VP Asset Mgmt) - a role, never a profiled private person
+    BUYING_SIGNAL = "BuyingSignal" # A dated public event that raises propensity to buy (plant commissioned, O&M renewal, water restriction)
+    CONFERENCE = "Conference"      # Industry event where decision-makers gather
+    PROGRAM = "Program"            # Accelerator, corporate venture or innovation challenge with a public application route
+    TENDER = "Tender"              # Public procurement notice (SECI/NTPC/GeM/SAM.gov/TED)
+    JOB_POSTING = "JobPosting"     # Public job ad used only as an organizational buying/growth signal
+    SOLAR_ASSET = "SolarAsset"     # A PV plant / park (location + MW) where soiling matters
+    ASSOCIATION = "Association"    # Trade body / alliance (SEIA, SolarPower Europe, NSEFI, ISA, MESIA)
 
 
 class RelationType(str, Enum):
@@ -150,6 +161,16 @@ class RelationType(str, Enum):
     OPERATES_AIRCRAFT = "OPERATES_AIRCRAFT"
     OPERATES_VESSEL = "OPERATES_VESSEL"
     SANCTIONED_MATCH = "SANCTIONED_MATCH"
+    # --- bunnyhole-solar (commercial route-finding) ---
+    REACHABLE_VIA = "REACHABLE_VIA"          # Company -> ContactRoute
+    HAS_BUYING_SIGNAL = "HAS_BUYING_SIGNAL"  # Company -> BuyingSignal
+    TARGET_ROLE = "TARGET_ROLE"              # Company -> DecisionRole worth approaching
+    GATHERS_AT = "GATHERS_AT"                # Company/Role -> Conference
+    OPENS_DOOR_VIA = "OPENS_DOOR_VIA"        # Company -> Program / Association / warm-intro org
+    OPERATES_ASSET = "OPERATES_ASSET"        # Company -> SolarAsset
+    PUBLISHED_TENDER = "PUBLISHED_TENDER"    # Buyer -> Tender
+    HIRING_FOR = "HIRING_FOR"                # Company -> JobPosting
+    PARTNER_OF = "PARTNER_OF"                # Company -> OEM / O&M / investor partner
 
 
 class ConfidenceTier(str, Enum):

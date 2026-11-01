@@ -112,7 +112,39 @@ uv run bunnyhole cases --search "BrightPeak"
 
 ---
 
-## 5. Getting help
+## 5. ☀️ Selling into solar companies (`bunnyhole solar`)
+
+For a vendor of solar-panel self-cleaning tech. Finds **how** to reach the O&M / asset-management
+buyers at a solar company and **when** (dated buying signals), then writes a sequenced plan.
+
+```bash
+uv run bunnyhole solar scout "ReNew" --out renew-plan.md
+```
+
+```bash
+uv run bunnyhole solar sweep --region india --limit 15
+```
+
+```bash
+uv run bunnyhole solar playbook india
+```
+
+| Command | What you get |
+| --- | --- |
+| `solar scout <company or site>` | Heat score, buying signals, decision-making unit, ranked routes (confirmed vs catalog), 90-day plan, compliance, assumptions |
+| `solar sweep --region india` | The curated target list ranked by live news heat — who to call first |
+| `solar routes --region india --type ipp -v` | Every route in the playbook with step-by-step how-to |
+| `solar roles --type ipp` | Who decides, who champions, who blocks — and the pitch for each |
+| `solar targets --tag robotic_cleaning_adopter` | Companies that already bought automated cleaning (educated buyers) |
+| `solar playbook guerrilla` | Lawful non-traditional tactics with cost / risk flags |
+
+> Routes and roles, not people. Only published functional mailboxes (`procurement@`) are ever
+> recorded; personal addresses are discarded. Follow CAN-SPAM / GDPR / India DPDP + TRAI rules
+> (`bunnyhole solar playbook compliance`).
+
+---
+
+## 6. Getting help
 
 ```bash
 uv run bunnyhole --help

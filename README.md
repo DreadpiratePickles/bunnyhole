@@ -78,6 +78,7 @@ a lead earns the extra minutes.
   deterministic council with no API key).
 - **Cross-case memory** in local SQLite — an entity seen in a prior case resurfaces automatically.
 - **Two cockpits:** a Typer CLI and an interactive FastAPI / Textual "War-Room."
+- **☀️ Solar BD mode** (`bunnyhole solar`): the same engine specialised to find every lawful route to a solar company's O&M buyers — see below.
 
 ## 📦 Install
 
@@ -141,6 +142,42 @@ uv run bunnyhole serve                    # FastAPI War-Room at http://127.0.0.1
 | `--out report.md` | Writes a Markdown dossier | Anything you want to keep/share |
 | `--hypothesis "…"` | A question to steer ACH & priority | Qualifying a specific lead |
 | `--proxy` / `--tor` | Route all traffic through a proxy / Tor | Operating quietly (see below) |
+
+## ☀️ Solar BD mode (`bunnyhole solar`) — the `bunnyhole-solar` specialization
+
+Bunnyhole's investigation engine, pointed at a different question: **"how do I lawfully reach the
+people who buy O&M technology at this solar company, and when?"** Built for selling solar-panel
+self-cleaning technology to IPPs, utilities, EPCs and O&M contractors — globally and in India.
+
+It finds **routes and roles, not people**: leadership and investor pages, vendor-registration
+portals, functional mailboxes (`procurement@`, never personal addresses), archived site paths,
+hiring signals, filings that mention soiling, public tenders, soiling-research partners, plus a
+curated playbook of 58 routes (events, trade bodies, investors, independent engineers, OEMs,
+accelerators, trade press, compliant direct outreach, lawful guerrilla tactics). Public news is
+classified into **dated buying triggers** (plant commissioned, O&M renewal, water restriction,
+competitor robot adopted, new exec, innovation programme...) and everything is scored into a
+sequenced **Approach Plan** with receipts.
+
+```bash
+# One company -> ranked routes, decision-making unit, buying signals, 90-day plan (Markdown)
+uv run bunnyhole solar scout "Adani Green" --out adani-plan.md
+uv run bunnyhole solar scout https://some-ipp.example --region india --type ipp --gear deep
+
+# Who to approach first: rank the curated universe by live buying-signal heat
+uv run bunnyhole solar sweep --region india --limit 15
+uv run bunnyhole solar sweep --tag robotic_cleaning_adopter --front-door
+
+# The playbook itself (no network)
+uv run bunnyhole solar routes --region india --type ipp --verbose
+uv run bunnyhole solar roles --type epc
+uv run bunnyhole solar targets --region mena
+uv run bunnyhole solar playbook india        # india | guerrilla | compliance | events | programs | partners | triggers
+```
+
+The research behind the playbook (market, competitors and their go-to-market, buyer psychology,
+routes, India, guerrilla tactics) lives in [`research/10_solar_bd_executive_brief.md`](research/10_solar_bd_executive_brief.md)
+and volumes 11–16. Read [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md): B2B outreach to corporate
+roles only, under CAN-SPAM / GDPR / India's DPDP Act and TRAI rules.
 
 ## 🕵️ The Arsenal
 
@@ -234,10 +271,11 @@ uv run --extra dev mypy bunnyhole     # type check
 ```
 bunnyhole/
 ├── engine/        # models, intake parser, orchestrator, graph, storage, synthesizer, council, netutil
-├── agents/        # journalist, accountant, osint, onchain, link_sleuth specialists
+├── agents/        # journalist, accountant, osint, onchain, link_sleuth, solar_scout specialists
 ├── api/           # FastAPI server + interactive War-Room UI
 ├── cli/           # Typer command-line interface
-└── arsenal/       # cross-platform tool installer, health doctor, anonsurf control, API-key vault
+├── arsenal/       # cross-platform tool installer, health doctor, anonsurf control, API-key vault
+└── solar/         # bunnyhole-solar: route playbook, target universe, approach planner, solar orchestrator
 ```
 
 The flow: **intake** parses selectors & hypothesis → the **orchestrator** runs the recursive
@@ -260,6 +298,13 @@ The complete 9-volume intelligence & tradecraft spec lives in
 7. [Link Analysis & Dead-End Breaker](research/07_link_analysis_dead_end_breaker_and_interconnections.md)
 8. [Deep-Research Loop & Creative Endpoints](research/08_deep_research_loop_and_creative_endpoints.md)
 9. [LLM Council & Ultimate Architecture](research/09_llm_council_and_ultimate_architecture.md)
+10. [☀️ Solar BD Executive Brief — routes, market, buyers, India, guerrilla, the plan](research/10_solar_bd_executive_brief.md)
+11. [Solar Soiling & Cleaning Market](research/11_solar_soiling_and_cleaning_market.md)
+12. [Cleaning-Tech Competitors & Their Go-To-Market](research/12_solar_cleaning_competitors_and_gtm.md)
+13. [Solar Buyer Psychology & Procurement](research/13_solar_buyer_psychology_and_procurement.md)
+14. [Routes to Solar Executives](research/14_routes_to_solar_executives.md)
+15. [India Solar Market & Approach](research/15_india_solar_market_and_approach.md)
+16. [Guerrilla B2B Tactics for Solar](research/16_guerrilla_b2b_tactics_solar.md)
 
 ## 📄 Project docs
 

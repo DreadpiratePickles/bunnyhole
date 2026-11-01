@@ -14,6 +14,13 @@ By using Bunnyhole you agree to:
 - **Treat findings as leads, not verdicts.** Bunnyhole grades evidence (NATO Admiralty, Red-Cell
   Skeptic, ACH) precisely because automated attribution produces false positives. Corroborate
   before publishing or acting.
+- **B2B route-finding (`bunnyhole solar`) targets organisations and job functions, not people.**
+  It records corporate pages, portals, published *functional* mailboxes (`procurement@`, `media@`),
+  job ads, filings and tenders; personal-looking addresses are discarded and never stored. Use the
+  routes it finds for lawful business-to-business contact only: identify yourself, honour opt-outs,
+  and comply with CAN-SPAM (US), GDPR/ePrivacy (EU), PECR (UK), the DPDP Act and TRAI rules (India),
+  the Saudi/UAE PDPLs, and LinkedIn's no-automation terms. Never fly drones over, enter, or touch
+  equipment at a plant without written permission.
 - **Handle sensitive data carefully.** Case data and any leaked credentials you input are stored
   locally in `~/.bunnyhole/cases.db`. Protect, minimize, and delete it per your obligations.
 

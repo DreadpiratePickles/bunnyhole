@@ -47,6 +47,7 @@ _DOMAIN_STYLE = {
     "onchain": "yellow",
     "physical": "bright_magenta",
     "skeptic": "magenta",
+    "commercial": "bright_yellow",
 }
 
 

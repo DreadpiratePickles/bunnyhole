@@ -740,3 +740,295 @@ def serve_command(
 
 if __name__ == "__main__":
     app()
+
+
+# ======================================================================================
+# ☀️ bunnyhole-solar: B2B route-finding for selling solar-panel self-cleaning technology
+# ======================================================================================
+solar_app = typer.Typer(
+    name="solar",
+    help="☀️ Solar BD mode: map every lawful route to a solar company's O&M / asset-management decision-makers and build an Approach Plan.",
+    add_completion=False,
+)
+app.add_typer(solar_app, name="solar")
+
+
+def _render_solar_plan(result: dict) -> None:
+    from rich.markdown import Markdown
+
+    sol = result.get("solar", {})
+    prof = sol.get("profile", {})
+    heat = sol.get("heat", {})
+    band_style = {"HOT": "bold red", "WARM": "bold yellow", "COLD": "bold blue"}.get(heat.get("band", "COLD"), "white")
+    console.print()
+    console.print(
+        Panel(
+            f"[bold cyan]Target:[/bold cyan] {_rich_escape(prof.get('name', ''))}  |  [bold magenta]Type/Region:[/bold magenta] {prof.get('ctype', '?').upper()} / {prof.get('region', '?').upper()}  |  "
+            f"[bold white]Domain:[/bold white] {prof.get('domain') or '-'}  |  [dim]{prof.get('source')}[/dim]\n"
+            f"[{band_style}]Heat: {heat.get('band')} {heat.get('score')}/100[/{band_style}]  "
+            f"(news {heat.get('news_heat')}, tags {heat.get('prior_from_tags')}, hiring {heat.get('job_signals')}, filings {heat.get('filing_signals')}, tenders {heat.get('tender_signals')})\n"
+            f"[bold green]Routes:[/bold green] {len(sol.get('ranked_routes', []))} ({sum(1 for r in sol.get('ranked_routes', []) if r.get('status') == 'CONFIRMED')} confirmed live)  |  "
+            f"[bold green]Signals:[/bold green] {len(sol.get('signals', []))}  |  [bold green]Receipts:[/bold green] {result.get('stats', {}).get('total_receipts', 0)}",
+            title="☀️ [bold white]SOLAR APPROACH PLAN[/bold white]",
+            border_style="bright_yellow",
+        )
+    )
+    trig = heat.get("triggers", {})
+    if trig:
+        t = Table(title="📈 Buying signals (dated, from public news)", show_lines=False)
+        t.add_column("Trigger", style="bold yellow")
+        t.add_column("Weight", justify="right")
+        t.add_column("Headline", style="white")
+        t.add_column("Date", style="dim")
+        for tid, info in sorted(trig.items(), key=lambda kv: kv[1]["weight"], reverse=True)[:10]:
+            t.add_row(tid, str(info["weight"]), _rich_escape(info["headline"][:80]), str(info.get("date", ""))[:16])
+        console.print(t)
+
+    dmu = Table(title="🎯 Decision-making unit (roles, not people)", show_lines=False)
+    dmu.add_column("DMU", style="bold cyan")
+    dmu.add_column("Titles to look for", style="white")
+    dmu.add_column("Pitch angle", style="dim")
+    dmu.add_column("First touch", style="green")
+    for r in sol.get("decision_unit", [])[:8]:
+        dmu.add_row(r["dmu_role"], ", ".join(r["titles"][:3]), _rich_escape(r["pitch_angle"][:90]), r["first_touch"])
+    console.print(dmu)
+
+    rt = Table(title="🚪 Ranked routes (every lawful way in)", show_lines=False)
+    rt.add_column("#", justify="right", style="dim")
+    rt.add_column("Route", style="bold white")
+    rt.add_column("Cat", style="magenta")
+    rt.add_column("Status", style="green")
+    rt.add_column("Score", justify="right", style="bold yellow")
+    rt.add_column("Cost", style="dim")
+    rt.add_column("Where / first step", style="white")
+    for i, r in enumerate(sol.get("ranked_routes", [])[:18], 1):
+        where = r.get("url") or (", ".join(r.get("mailboxes", [])[:2]) if r.get("mailboxes") else r.get("portal_host") or "")
+        first = (r.get("how_to") or [""])[0]
+        rt.add_row(str(i), r["name"][:44], r["category"], ("✅ " if r["status"] == "CONFIRMED" else "") + r["status"], str(r["score"]), r.get("cost", ""), _rich_escape((where or first)[:70]))
+    console.print(rt)
+
+    for ph in sol.get("sequenced_plan", []):
+        console.print(f"\n[bold]{ph['phase']}[/bold] [dim]- {_rich_escape(ph['goal'])}[/dim]")
+        for r in ph["routes"][:5]:
+            console.print(f"  • {_rich_escape(r['name'])} [dim]({r['status']}, {r['score']})[/dim]: {_rich_escape((r.get('how_to') or [''])[0][:120])}")
+
+    ka = sol.get("key_assumptions", [])
+    if ka:
+        console.print()
+        console.print(Markdown("**Key assumptions:** " + " · ".join(f"{'🔴' if k['fragility']=='FRAGILE' else '🟡' if k['fragility']=='SUPPORTED' else '🟢'} {k['assumption']}" for k in ka)))
+
+
+@solar_app.command("scout")
+def solar_scout_command(
+    seed: str = typer.Argument(..., help="Solar company name or website (curated targets resolve automatically; anything else is inferred)"),
+    region: Optional[str] = typer.Option(None, "--region", "-r", help="Override region: india, us, eu, mena, apac, latam, africa, or an ISO country code"),
+    company_type: Optional[str] = typer.Option(None, "--type", "-t", help="Override type: ipp, utility, epc, om, ci, oem, fund, ie"),
+    gear: GearMode = typer.Option(GearMode.FAST, "--gear", "-g", help="fast = scout + GLEIF; deep = + news narrative, court dockets, domain infra (portal subdomains)"),
+    follow_parents: int = typer.Option(1, "--follow-parents", help="How many related/parent entities to sweep for signals (0-3)"),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write the Markdown Approach Plan to this file"),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the full graph + plan JSON to this file"),
+    no_persist: bool = typer.Option(False, "--no-persist", help="Do not save the case to ~/.bunnyhole/cases.db"),
+) -> None:
+    """Map every lawful route into ONE solar company and build a ranked, sequenced Approach Plan."""
+    from bunnyhole.solar.orchestrator import SolarOrchestrator
+
+    def _on_event(evt: dict) -> None:
+        if evt.get("type") == "agent_log":
+            d = evt["data"]
+            console.print(f"[dim][{d['agent'].upper()}][/dim] [bold]{_rich_escape(str(d['action']))}[/bold] ({_rich_escape(str(d['target']))}): {_rich_escape(str(d['detail']))}")
+
+    orch = SolarOrchestrator(seed, region=region, company_type=company_type, gear=gear, event_callback=_on_event, follow_parents=follow_parents, persist=not no_persist)
+    result = asyncio.run(orch.run())
+    _render_solar_plan(result)
+    if out:
+        out.write_text(orch.export_markdown_plan(), encoding="utf-8")
+        console.print(f"\n[bold green]✔ Saved Approach Plan to:[/bold green] {out}")
+    if json_out:
+        json_out.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+        console.print(f"[bold green]✔ Saved graph + plan JSON to:[/bold green] {json_out}")
+
+
+@solar_app.command("sweep")
+def solar_sweep_command(
+    region: Optional[str] = typer.Option(None, "--region", "-r", help="india, us, eu, mena, apac, latam, africa"),
+    company_type: Optional[str] = typer.Option(None, "--type", "-t", help="ipp, utility, epc, om, ci, oem, fund"),
+    tag: Optional[str] = typer.Option(None, "--tag", help="robotic_cleaning_adopter, dusty_fleet, innovation_program, listed, in_house_om, public_tender, epc_om_channel"),
+    limit: int = typer.Option(12, "--limit", "-n", help="How many targets to scan (ordered by prior heat)"),
+    front_door: bool = typer.Option(False, "--front-door", help="Also probe each company's website for vendor-registration / leadership routes (slower)"),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the ranked sweep to JSON"),
+) -> None:
+    """Rank MANY curated solar targets by live buying-signal heat - who to approach first."""
+    from bunnyhole.solar.orchestrator import SolarOrchestrator
+    from bunnyhole.solar.playbook import parse_company_type, parse_region
+    from bunnyhole.solar.targets import filter_targets, prior_heat
+
+    targets = filter_targets(parse_region(region) if region else None, parse_company_type(company_type) if company_type else None, tag)
+    targets = sorted(targets, key=prior_heat, reverse=True)[: max(1, limit)]
+    if not targets:
+        console.print("[bold red]No curated targets match.[/bold red] Try `bunnyhole solar targets` to see the universe.")
+        raise typer.Exit(1)
+    console.print(f"[dim]Sweeping {len(targets)} targets for live buying signals{' + front-door routes' if front_door else ''}...[/dim]")
+    orch = SolarOrchestrator(targets[0].name, persist=False)
+    rows = asyncio.run(orch.run_sweep(targets, front_door=front_door))
+    t = Table(title="🔥 Solar target sweep - ranked by heat", show_lines=False)
+    t.add_column("#", justify="right", style="dim")
+    t.add_column("Company", style="bold white")
+    t.add_column("Type", style="magenta")
+    t.add_column("Region", style="cyan")
+    t.add_column("Heat", justify="right", style="bold yellow")
+    t.add_column("Band", style="bold")
+    t.add_column("Top triggers", style="green")
+    t.add_column("Latest headline", style="white")
+    for i, r in enumerate(rows, 1):
+        t.add_row(str(i), r["name"][:34], r["type"], r["region"], str(r["heat"]), r["band"], ", ".join(r["top_triggers"])[:40], _rich_escape(r["top_headline"][:60]))
+    console.print(t)
+    if json_out:
+        json_out.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        console.print(f"[bold green]✔ Saved sweep to:[/bold green] {json_out}")
+
+
+@solar_app.command("routes")
+def solar_routes_command(
+    region: str = typer.Option("global", "--region", "-r", help="india, us, eu, mena, apac, latam, africa, global"),
+    company_type: str = typer.Option("ipp", "--type", "-t", help="ipp, utility, epc, om, ci, oem, fund, ie"),
+    category: Optional[str] = typer.Option(None, "--category", "-c", help="identify, event, association, warm_intro, program, media, credibility, direct, tender, guerrilla"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Print the how-to steps for every route"),
+) -> None:
+    """List every route in the playbook that applies to a target type/region (no network)."""
+    from bunnyhole.solar.playbook import RouteCategory, parse_company_type, parse_region, routes_for
+
+    cats = [RouteCategory(category)] if category else None
+    rs = routes_for(parse_region(region), parse_company_type(company_type), cats)
+    t = Table(title=f"🚪 {len(rs)} routes for a {company_type.upper()} in {region.upper()}", show_lines=verbose)
+    t.add_column("Route", style="bold white")
+    t.add_column("Category", style="magenta")
+    t.add_column("Reaches", style="cyan")
+    t.add_column("Eff", justify="right", style="bold yellow")
+    t.add_column("Cost", style="dim")
+    t.add_column("~Days", justify="right", style="dim")
+    t.add_column("How" if verbose else "First step", style="white")
+    for r in rs:
+        how = "\n".join(f"{i}. {s}" for i, s in enumerate(r.how_to, 1)) if verbose else r.how_to[0][:90]
+        if r.legal_note and verbose:
+            how += f"\n⚖ {r.legal_note}"
+        t.add_row(r.name, r.category.value, ", ".join(r.reaches[:3]), str(r.effectiveness), r.cost.value, str(r.days_to_meeting), _rich_escape(how))
+    console.print(t)
+
+
+@solar_app.command("targets")
+def solar_targets_command(
+    region: Optional[str] = typer.Option(None, "--region", "-r"),
+    company_type: Optional[str] = typer.Option(None, "--type", "-t"),
+    tag: Optional[str] = typer.Option(None, "--tag"),
+) -> None:
+    """Show the curated solar target universe (IPPs, utilities, EPCs, O&M, OEMs) with heat priors."""
+    from bunnyhole.solar.playbook import parse_company_type, parse_region
+    from bunnyhole.solar.targets import filter_targets, prior_heat
+
+    ts = sorted(filter_targets(parse_region(region) if region else None, parse_company_type(company_type) if company_type else None, tag), key=prior_heat, reverse=True)
+    t = Table(title=f"☀️ {len(ts)} curated targets", show_lines=False)
+    t.add_column("Company", style="bold white")
+    t.add_column("Domain", style="cyan")
+    t.add_column("Type", style="magenta")
+    t.add_column("HQ", style="dim")
+    t.add_column("Prior", justify="right", style="bold yellow")
+    t.add_column("Tags / note", style="white")
+    for x in ts:
+        t.add_row(x.name[:36], x.domain, x.ctype.value, x.hq_country, str(prior_heat(x)), _rich_escape((", ".join(x.tags) + (" - " + x.note if x.note else ""))[:80]))
+    console.print(t)
+
+
+@solar_app.command("roles")
+def solar_roles_command(company_type: str = typer.Option("ipp", "--type", "-t")) -> None:
+    """The decision-making unit for cleaning technology at a given company type (roles, never people)."""
+    from bunnyhole.solar.playbook import ROUTES_BY_ID, parse_company_type, roles_for
+
+    t = Table(title=f"🎯 Decision-making unit at a {company_type.upper()}", show_lines=True)
+    t.add_column("DMU", style="bold cyan")
+    t.add_column("Titles", style="white")
+    t.add_column("Cares about", style="green")
+    t.add_column("Fears", style="red")
+    t.add_column("Pitch angle", style="white")
+    t.add_column("First touch", style="dim")
+    for r in roles_for(parse_company_type(company_type)):
+        ft = ROUTES_BY_ID.get(r.first_touch)
+        t.add_row(r.dmu_role, ", ".join(r.title_patterns[:4]), "; ".join(r.cares_about[:3]), "; ".join(r.fears[:2]), _rich_escape(r.pitch_angle), ft.name if ft else r.first_touch)
+    console.print(t)
+
+
+@solar_app.command("playbook")
+def solar_playbook_command(
+    section: str = typer.Argument("india", help="india | guerrilla | compliance | events | programs | partners | triggers"),
+) -> None:
+    """Print a playbook section: India entry manual, guerrilla tactics, outreach law, events, programmes, warm-intro partners, buying triggers."""
+    from rich.markdown import Markdown
+
+    from bunnyhole.solar import playbook as pbk
+
+    s = section.lower().strip()
+    if s == "india":
+        md = ["# 🇮🇳 India entry playbook"]
+        for key, title in (("market_snapshot", "Market snapshot"), ("entry_structures", "Entry structures"), ("culture_and_norms", "Culture & norms"), ("calendar", "Calendar"), ("compliance_checklist", "Compliance checklist"), ("decision_escalation", "Decision escalation"), ("channel_partner_archetypes", "Channel partner archetypes")):
+            md.append(f"\n## {title}\n" + "\n".join(f"- {x}" for x in pbk.INDIA_PLAYBOOK[key]))  # type: ignore[union-attr]
+        md.append("\n## Institutions\n" + "\n".join(f"- **{k}** - {v}" for k, v in pbk.INDIA_PLAYBOOK["institutions"].items()))  # type: ignore[union-attr]
+        console.print(Markdown("\n".join(md)))
+    elif s == "guerrilla":
+        t = Table(title="🎪 Guerrilla tactics (lawful, consent-respecting)", show_lines=True)
+        t.add_column("Tactic", style="bold white")
+        t.add_column("Cost", style="dim")
+        t.add_column("Risk", style="red")
+        t.add_column("Regions", style="cyan")
+        t.add_column("Steps", style="white")
+        t.add_column("Legal", style="yellow")
+        for x in pbk.GUERRILLA_TACTICS:
+            t.add_row(x.name, x.cost.value, x.risk, ", ".join(r.value for r in x.regions), "\n".join(f"{i}. {st}" for i, st in enumerate(x.steps, 1)), x.legal)
+        console.print(t)
+    elif s == "compliance":
+        t = Table(title="⚖️ Outreach compliance by jurisdiction", show_lines=True)
+        t.add_column("Jurisdiction", style="bold white")
+        t.add_column("Law", style="cyan")
+        t.add_column("Rule", style="white")
+        for c in pbk.COMPLIANCE_RULES:
+            t.add_row(c.jurisdiction, c.law, c.rule)
+        console.print(t)
+    elif s == "events":
+        t = Table(title="📅 Where O&M / asset-management people gather (verify dates)", show_lines=False)
+        t.add_column("Event", style="bold white")
+        t.add_column("Region", style="cyan")
+        t.add_column("Next", style="yellow")
+        t.add_column("City", style="dim")
+        t.add_column("O&M density", justify="right")
+        t.add_column("Audience", style="white")
+        for e in sorted(pbk.EVENTS, key=lambda e: (e.region.value, -e.om_density)):
+            t.add_row(e.name[:44], e.region.value, e.next_dates or e.month, e.city, f"{e.om_density}/5", e.audience[:60])
+        console.print(t)
+    elif s == "programs":
+        t = Table(title="🚀 Accelerators & innovation doors", show_lines=False)
+        t.add_column("Programme", style="bold white")
+        t.add_column("Owner", style="cyan")
+        t.add_column("Region", style="dim")
+        t.add_column("Note", style="white")
+        for p in pbk.PROGRAMS:
+            t.add_row(p.name, p.owner, p.region.value, _rich_escape(p.note[:100]))
+        console.print(t)
+    elif s == "partners":
+        t = Table(title="🤝 Warm-intro organisations", show_lines=False)
+        t.add_column("Organisation", style="bold white")
+        t.add_column("Kind", style="magenta")
+        t.add_column("Region", style="dim")
+        t.add_column("Note", style="white")
+        for o in pbk.WARM_INTRO_ORGS:
+            t.add_row(o.name, o.kind, o.region.value, _rich_escape(o.note[:100]))
+        console.print(t)
+    elif s == "triggers":
+        t = Table(title="📈 Buying triggers the scout classifies from public news", show_lines=True)
+        t.add_column("Trigger", style="bold yellow")
+        t.add_column("Weight", justify="right")
+        t.add_column("Why it matters", style="white")
+        t.add_column("Pitch", style="green")
+        for tr in pbk.BUYING_TRIGGERS:
+            t.add_row(tr.trigger_id, str(tr.weight), tr.why, tr.pitch)
+        console.print(t)
+    else:
+        console.print("[bold red]Unknown section.[/bold red] Use: india | guerrilla | compliance | events | programs | partners | triggers")
+        raise typer.Exit(2)

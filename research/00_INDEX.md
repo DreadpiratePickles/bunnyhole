@@ -36,3 +36,24 @@ All architectural and investigative tradecraft research for **Bunnyhole** is org
    * **12 Creative "Secret Weapon" Zero-Key Endpoints:** **Shodan InternetDB** (`internetdb.shodan.io`), **Mnemonic Passive DNS** (`api.mnemonic.no/pdns/v3`), **RIPEstat BGP/ASN** (`stat.ripe.net`), **PeeringDB Physical Data Centers**, **Keybase Cryptographic Identity Proof Graph** (`keybase.io/_/api/1.0/user/lookup.json`), **Wikipedia Revision & Anonymous IP Whitewash Forensics**, **U.S. Senate Lobbying Disclosure Act (LDA) API**, **OpenAlex Scholarly/Grant Graph**, **HackerNews Algolia Archive**, **GoPlus Web3 Security & Honeypot/Malicious Address Oracle**, **Sourcify 4Byte Selector Decoder**, and **ENSData Unified Web3 Identity Resolver**.
 9. **[09_llm_council_and_ultimate_architecture.md](./09_llm_council_and_ultimate_architecture.md)**
    * **Karpathy `llm-council` 3-Stage Adversarial Deliberation:** Stage 1 parallel independent specialist opinions → Stage 2 anonymized peer review & forced ranking → Stage 3 Chairman verdict, adapted to multi-domain intelligence with strict `[R#]` SHA-256 receipt citation and the Red-Cell skeptic seat defending the innocent-coincidence hypothesis.
+
+---
+
+## ☀️ `bunnyhole-solar` — Solar B2B route-finding research (volumes 10–16)
+
+The specialization behind `bunnyhole solar`: selling solar-panel self-cleaning technology to IPPs, utilities, EPCs and O&M contractors. Volumes 11–16 are the raw research notes (every claim carries its source URL; facts, vendor claims and practitioner opinion are labelled); volume 10 is the synthesized brief and the recommended plan.
+
+10. **[10_solar_bd_executive_brief.md](./10_solar_bd_executive_brief.md)**
+   * The synthesis: every route to solar executives, the market, what makes a buyer open, India, lawful guerrilla tactics, and a ranked, sequenced approach plan. Start here.
+11. **[11_solar_soiling_and_cleaning_market.md](./11_solar_soiling_and_cleaning_market.md)**
+   * Soiling losses by region (IEA-PVPS, NREL, DEWA, Atacama), O&M and cleaning market sizes (Wood Mackenzie, Mordor and others — with their disagreements), per-MW cleaning prices, water use, who owns the budget and which KPIs they report (PR, availability, soiling ratio, OPEX/MW, DSCR), bankability and P50 gaps.
+12. **[12_solar_cleaning_competitors_and_gtm.md](./12_solar_cleaning_competitors_and_gtm.md)**
+   * The competitor map (waterless robots — Sunpure, LEAPTING, Sol-Bright, Taypro, Airtouch, Ecoppia, NOMADD, SolarCleano; coatings; electrodynamic screens; vibration; drones), business models, and **how each incumbent got its first customers** (Ecoppia's Ketura pilot → Bhadla; Airtouch via Enlight → Adani MSA; NOMADD via KAUST → Aramco licence), failures (Sun-X, BladeRanger), the validation stack buyers demand (IEC 62788-7-3, PI Berlin sand test, module-OEM letters, Nextracker compatibility letters).
+13. **[13_solar_buyer_psychology_and_procurement.md](./13_solar_buyer_psychology_and_procurement.md)**
+   * The decision-making unit (asset manager, O&M head, plant manager, procurement, IE, insurer, lender), buying triggers and contract cycles, pilot structures that convert (Enel Catania→Totana, Iberdrola PERSEO cleaning challenge, Free Electrons ~1-in-6), bankability, innovation programmes, why pilots die.
+14. **[14_routes_to_solar_executives.md](./14_routes_to_solar_executives.md)**
+   * Every lawful channel: public identification sources, the 2026–27 event calendar with dates and exhibiting costs, trade associations and fees, warm-intro paths, accelerators, media and awards, compliant direct outreach (CAN-SPAM, GDPR, PECR, DPDP + TRAI, Saudi/UAE PDPL), tools and prices, tender portals.
+15. **[15_india_solar_market_and_approach.md](./15_india_solar_market_and_approach.md)**
+   * India: ~171 GW installed (Sep 2026), Rajasthan/Gujarat/Khavda, soiling rates and cleaning costs, the robot vendor leaderboard, buyers and their O&M structure, institutions (MNRE, SECI, NTPC, GeM, ALMM, BIS QCO, customs on HS 8479.50), entry structures, culture and norms, events.
+16. **[16_guerrilla_b2b_tactics_solar.md](./16_guerrilla_b2b_tactics_solar.md)**
+   * Non-traditional tactics with evidence and risk flags: proof-first anchor pilots, soiling audits, physical mailers, data-led reports, dinners and roundtables, suite demos, drone/site-access law (DGCA, FAA Part 107, permit-to-work), India adaptation, a 90-day plan and metrics.

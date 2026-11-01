@@ -645,7 +645,8 @@ const DOMAIN_COLORS = {
   osint: '#38bdf8',
   onchain: '#a78bfa',
   physical: '#f43f5e',
-  skeptic: '#e879f9'
+  skeptic: '#e879f9',
+  commercial: '#fb923c'
 };
 
 function resizeCanvas() {
