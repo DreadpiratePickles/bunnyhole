@@ -86,6 +86,17 @@ WAYBACK_CDX = (
 )
 
 
+def roles_listed_on_page(text_low: str) -> Dict[str, int]:
+    """Which decision-role *titles* appear on a page (counts only). Names are never extracted - this says
+    'the company publicly lists a Head of O&M function', not who holds it."""
+    out: Dict[str, int] = {}
+    for role in pb.DECISION_ROLES:
+        n = sum(text_low.count(pat) for pat in role.title_patterns if len(pat) >= 4)
+        if n:
+            out[role.role_id] = n
+    return out
+
+
 def _sha_id(prefix: str, raw: str) -> str:
     return f"{prefix}:{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:12]}"
 
@@ -304,7 +315,7 @@ class SolarScoutAgent:
                     else:
                         discarded_personal += 1
                 socials.update(x.rstrip("/") + "/" for x in _SOCIAL_RE.findall(resp.text))
-                confirmed[route.route_id] = {"url": final_url, "title": title, "keywords": kw_hits[:5]}
+                confirmed[route.route_id] = {"url": final_url, "title": title, "keywords": kw_hits[:5], "roles_listed": roles_listed_on_page(text_low)}
 
         # Persist confirmed routes (same node id the playbook seeding uses, so catalog + live merge).
         for route_id, info in confirmed.items():
@@ -327,7 +338,7 @@ class SolarScoutAgent:
                 risk_flags=["ROUTE_CONFIRMED_LIVE", f"CATEGORY_{route.category.value.upper()}"],
                 attributes={"route_id": route_id, "category": route.category.value, "confirmed_url": info["url"], "page_title": info["title"],
                             "cost": route.cost.value, "days_to_meeting": route.days_to_meeting, "effectiveness": route.effectiveness,
-                            "reaches": list(route.reaches), "how_to": list(route.how_to), "status": "CONFIRMED"},
+                            "reaches": list(route.reaches), "how_to": list(route.how_to), "status": "CONFIRMED", "roles_listed": info.get("roles_listed", {})},
                 receipts=[rcpt],
                 hop_depth=hop_depth,
             ))

@@ -194,7 +194,11 @@ class ApproachPlanner:
             a = n.attributes
             evidence: List[str] = []
             if "leadership_page" in confirmed:
-                evidence.append(f"Leadership page confirmed: {confirmed['leadership_page'].get('confirmed_url')} - look for titles {a.get('title_patterns', [])[:3]}")
+                listed = (confirmed["leadership_page"].get("roles_listed") or {}).get(a.get("role_id"), 0)
+                if listed:
+                    evidence.append(f"Leadership page lists this function ({listed} title match{'es' if listed > 1 else ''}): {confirmed['leadership_page'].get('confirmed_url')}")
+                else:
+                    evidence.append(f"Leadership page confirmed: {confirmed['leadership_page'].get('confirmed_url')} - look for titles {a.get('title_patterns', [])[:3]}")
             if "annual_report_ir" in confirmed and a.get("dmu_role") in ("DECIDER", "APPROVER"):
                 evidence.append(f"Investor page confirmed: {confirmed['annual_report_ir'].get('confirmed_url')} - management section names this function")
             if jobs and a.get("role_id") in ("head_om", "plant_manager"):

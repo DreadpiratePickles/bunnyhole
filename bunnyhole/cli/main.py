@@ -1032,3 +1032,65 @@ def solar_playbook_command(
     else:
         console.print("[bold red]Unknown section.[/bold red] Use: india | guerrilla | compliance | events | programs | partners | triggers")
         raise typer.Exit(2)
+
+
+@solar_app.command("prep")
+def solar_prep_command(
+    name: str = typer.Argument(..., help="The role-holder's full professional name as it appears in press coverage"),
+    company: str = typer.Option(..., "--company", "-c", help="The company they represent (mandatory: professional context only)"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Company website, to search its own newsroom for releases quoting them"),
+    role: Optional[str] = typer.Option(None, "--role", "-r", help="Their title if you know it, e.g. 'Head of O&M' (maps to the decision-making unit)"),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write the Markdown conversation brief to this file"),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the brief as JSON"),
+) -> None:
+    """Meeting prep from a role-holder's PUBLIC PROFESSIONAL statements only (talks, interviews, bylines, releases, papers).
+
+    Scope is enforced: a company is required; emails, phones, handles and URLs are refused as seeds; no identity,
+    breach, social-media or people-search sources are ever queried; no contact or personal-life data is stored.
+    """
+    from rich.markdown import Markdown
+
+    from bunnyhole.solar.meeting_prep import MeetingPrepAgent, ScopeError
+
+    def _on_event(evt: dict) -> None:
+        if evt.get("type") == "agent_log":
+            d = evt["data"]
+            console.print(f"[dim][{d['agent'].upper()}][/dim] [bold]{_rich_escape(str(d['action']))}[/bold] ({_rich_escape(str(d['target']))}): {_rich_escape(str(d['detail']))}")
+
+    graph = InvestigationGraph(case_id="prep", seed_query=f"{name} ({company})")
+    graph.subscribe(_on_event)
+    agent = MeetingPrepAgent(graph)
+    try:
+        brief = asyncio.run(agent.build_brief(name, company, company_domain=domain, role_hint=role or ""))
+    except ScopeError as exc:
+        console.print(f"[bold red]Out of scope:[/bold red] {_rich_escape(str(exc))}")
+        raise typer.Exit(2) from exc
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold cyan]{_rich_escape(brief.name)}[/bold cyan] - {_rich_escape(brief.company)}  |  [dim]{_rich_escape(brief.role_hint or 'role not given')}[/dim]\n"
+            f"[bold green]Professional statements:[/bold green] {len(brief.statements)}  |  [bold yellow]Topics:[/bold yellow] "
+            f"{', '.join(f'{t} x{n}' for t, n in sorted(brief.topic_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]) or '-'}\n"
+            f"[dim]{_rich_escape(brief.scope_note)}[/dim]",
+            title="🗣️ [bold white]CONVERSATION BRIEF[/bold white]",
+            border_style="bright_yellow",
+        )
+    )
+    if brief.statements:
+        t = Table(title="📰 Public professional statements", show_lines=False)
+        t.add_column("Date", style="dim")
+        t.add_column("Kind", style="magenta")
+        t.add_column("Statement", style="white")
+        t.add_column("Source", style="cyan")
+        t.add_column("Topics", style="green")
+        for s in brief.statements[:15]:
+            t.add_row(s.date[:16], s.kind, _rich_escape(s.title[:80]), s.source[:24], ", ".join(s.topics[:2]))
+        console.print(t)
+    console.print(Markdown("\n".join(["**Openers**"] + [f"- {o}" for o in brief.openers] + ["", "**Questions**"] + [f"- {q}" for q in brief.questions] + ["", "**Stay on professional ground**"] + [f"- {a}" for a in brief.avoid])))
+    if out:
+        out.write_text(brief.export_markdown(), encoding="utf-8")
+        console.print(f"\n[bold green]✔ Saved conversation brief to:[/bold green] {out}")
+    if json_out:
+        json_out.write_text(json.dumps(brief.to_dict(), indent=2, default=str), encoding="utf-8")
+        console.print(f"[bold green]✔ Saved brief JSON to:[/bold green] {json_out}")

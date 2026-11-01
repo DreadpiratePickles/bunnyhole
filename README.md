@@ -167,6 +167,9 @@ uv run bunnyhole solar scout https://some-ipp.example --region india --type ipp 
 uv run bunnyhole solar sweep --region india --limit 15
 uv run bunnyhole solar sweep --tag robotic_cleaning_adopter --front-door
 
+# Meeting prep from a role-holder's PUBLIC PROFESSIONAL statements only (talks, interviews, bylines, releases, papers)
+uv run bunnyhole solar prep "Jane Doe" --company "Some IPP" --role "Head of O&M" --out jane-brief.md
+
 # The playbook itself (no network)
 uv run bunnyhole solar routes --region india --type ipp --verbose
 uv run bunnyhole solar roles --type epc
@@ -177,7 +180,9 @@ uv run bunnyhole solar playbook india        # india | guerrilla | compliance | 
 The research behind the playbook (market, competitors and their go-to-market, buyer psychology,
 routes, India, guerrilla tactics) lives in [`research/10_solar_bd_executive_brief.md`](research/10_solar_bd_executive_brief.md)
 and volumes 11–16. Read [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md): B2B outreach to corporate
-roles only, under CAN-SPAM / GDPR / India's DPDP Act and TRAI rules.
+roles only, under CAN-SPAM / GDPR / India's DPDP Act and TRAI rules. `solar prep` is deliberately
+narrow — it requires a company, refuses emails/phones/handles as seeds, never touches identity, breach,
+social-media or people-search sources, and keeps only what the person published professionally.
 
 ## 🕵️ The Arsenal
 

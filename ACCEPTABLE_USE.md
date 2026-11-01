@@ -20,7 +20,10 @@ By using Bunnyhole you agree to:
   routes it finds for lawful business-to-business contact only: identify yourself, honour opt-outs,
   and comply with CAN-SPAM (US), GDPR/ePrivacy (EU), PECR (UK), the DPDP Act and TRAI rules (India),
   the Saudi/UAE PDPLs, and LinkedIn's no-automation terms. Never fly drones over, enter, or touch
-  equipment at a plant without written permission.
+  equipment at a plant without written permission. The `solar prep` meeting-prep mode is limited by
+  design to a named role-holder's **public professional statements** (talks, interviews, bylines,
+  company releases, papers) in the context of the company they represent; it is not, and must not be
+  turned into, a tool for profiling a person's private life, contacts, whereabouts or social activity.
 - **Handle sensitive data carefully.** Case data and any leaked credentials you input are stored
   locally in `~/.bunnyhole/cases.db`. Protect, minimize, and delete it per your obligations.
 
