@@ -369,10 +369,13 @@ class ApproachPlanner:
                 steps = " ".join(f"({i}) {s}" for i, s in enumerate(r["how_to"][:3], 1))
                 L.append(f"- **{r['name']}** [{r['status']}, score {r['score']}]: {steps}" + (f" -> {r['url']}" if r["url"] else ""))
 
+        L += ["", "---", "", "## 5. Dated buying signals (highest value first)"]
         if d["signals"]:
-            L += ["", "---", "", "## 5. Dated buying signals (newest value first)", "", "| Date | Triggers | Headline | Publisher | Named? |", "| :--- | :--- | :--- | :--- | :---: |"]
+            L += ["", "| Date | Triggers | Headline | Publisher | Named? |", "| :--- | :--- | :--- | :--- | :---: |"]
             for s in d["signals"][:20]:
                 L.append(f"| {s['date'][:16]} | {', '.join(s['triggers'])} | [{s['headline'][:90]}]({s['url']}) | {s['publisher']} | {'yes' if s['named'] else 'no'} |")
+        else:
+            L.append("- None surfaced by the news sweep (no network, a quiet company, or a namesake problem). Re-run with `--gear deep`, or search the trade press by hand for the triggers in `bunnyhole solar playbook triggers`.")
 
         ep = d
         if ep["events"]:
