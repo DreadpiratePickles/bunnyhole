@@ -138,6 +138,7 @@ uv run bunnyhole solar playbook india
 | `solar targets --tag robotic_cleaning_adopter` | Companies that already bought automated cleaning (educated buyers) |
 | `solar playbook guerrilla` | Lawful non-traditional tactics with cost / risk flags |
 | `solar prep "Jane Doe" --company "Some IPP" --role "Head of O&M"` | A conversation brief from their public professional statements only: what they've said on stage / in print, openers that cite the source, questions to ask |
+| `solar profile "Jane Doe" --company "Some IPP" --domain some-ipp.com --purpose hiring` | Fuller professional-background profile: the company's own published bio + patents as inventor + their public statements. `--purpose hiring` prints hiring-law guardrails. Professional-public only |
 
 > Routes and roles, not people. Only published functional mailboxes (`procurement@`) are ever
 > recorded; personal addresses are discarded. Follow CAN-SPAM / GDPR / India DPDP + TRAI rules

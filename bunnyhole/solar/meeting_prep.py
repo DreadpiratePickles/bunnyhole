@@ -19,6 +19,8 @@ What it will not do (enforced in code, not only in docs)
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -67,6 +69,20 @@ PROFESSIONAL_TOPICS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("SAFETY", ("safety", "hse", "incident")),
     ("PEOPLE", ("hiring", "talent", "team", "workforce", "skills")),
 )
+
+PURPOSES: Tuple[str, ...] = ("meeting", "hiring", "partnership")
+
+# Shown whenever the profile will inform a hiring decision. These are guardrails, not legal advice.
+HIRING_GUARDRAILS: Tuple[str, ...] = (
+    "This is professional research, NOT a background check or a consumer report. If you formalise screening or use a third party, FCRA (US) and equivalent laws require the candidate's written consent, disclosure, and an adverse-action process before you act on anything.",
+    "Use only job-relevant professional information. Never consider or infer protected characteristics - race, colour, religion, sex, pregnancy, age, disability, national origin, marital or veteran status, or anything a photo or social profile would reveal.",
+    "Tell the candidate what you reviewed and let them respond before you rely on it; verify every claim with them directly.",
+    "Do not seek or use breach data, personal social media, home, family, health or financial information in a hiring decision - this engine never collects it, and neither should you by other means.",
+    "Keep what you collect to what the role needs, store it under your data-protection obligations, and delete it when the decision is made.",
+)
+
+PATENTSVIEW_LEGACY = "https://api.patentsview.org/patents/query"
+PATENTSVIEW_V1 = "https://search.patentsview.org/api/v1/patent/"
 
 PREP_ANGLES: Tuple[Tuple[str, str], ...] = (
     ("COMPANY", '"{n}" "{c}"'),
@@ -365,3 +381,142 @@ class MeetingPrepAgent:
                                   talking_points=talking_points, avoid=list(_AVOID), receipts=receipts)
         self._log("MEETING_PREP_DONE", f"{name} ({company})", f"{len(statements)} professional statements; topics={dict(topic_counts.most_common(4))}", level="discovery", receipts=len(receipts))
         return brief
+
+    async def professional_background(self, name: str, company: str, company_domain: Optional[str]) -> List["Statement"]:
+        """Bio sentences the ORGANISATION itself publishes about the person (leadership / about / team pages)."""
+        if not company_domain:
+            return []
+        clean = company_domain.lower().replace("https://", "").replace("http://", "").split("/")[0]
+        toks = _name_tokens(name)
+        out: List[Statement] = []
+        async with new_async_client(timeout=10.0, follow_redirects=True, headers=self.headers) as client:
+            for path in pb.ROUTES_BY_ID["leadership_page"].probe_paths[:10]:
+                resp = await self._get(client, f"https://{clean}{path}")
+                if resp is None or resp.status_code != 200 or not resp.text:
+                    continue
+                text = re.sub(r"\s+", " ", _TAG_RE.sub(" ", resp.text))
+                for sent in re.split(r"(?<=[.!?])\s+", text):
+                    low = sent.lower()
+                    if 20 <= len(sent) <= 400 and all(t in low for t in toks):
+                        out.append(Statement(kind="BACKGROUND", title=sent.strip()[:300], url=f"https://{clean}{path}", source=clean, date="",
+                                             topics=self.classify_topics(sent), triggers=[]))
+                if out:
+                    break
+        seen: set = set()
+        uniq: List[Statement] = []
+        for st in out:
+            if st.title not in seen:
+                seen.add(st.title)
+                uniq.append(st)
+        return uniq[:8]
+
+    async def patents_as_inventor(self, name: str, company: str) -> List["Statement"]:
+        """Granted patents naming the person as inventor (public professional output). Keyless best-effort; silent on failure."""
+        toks = _name_tokens(name)
+        if len(toks) < 2:
+            return []
+        first, last = toks[0], toks[-1]
+        key = os.environ.get("PATENTSVIEW_API_KEY", "").strip()
+        parsed: List[tuple] = []  # (id, title, date, assignee_org)
+        async with new_async_client(timeout=12.0, headers=self.headers) as client:
+            try:
+                if key:
+                    body = {"q": {"_and": [{"inventors.inventor_name_first": first}, {"inventors.inventor_name_last": last}]},
+                            "f": ["patent_id", "patent_title", "patent_date", "assignees.assignee_organization"], "o": {"size": 12}}
+                    kr = await client.post(PATENTSVIEW_V1, json=body, headers={**self.headers, "X-Api-Key": key})
+                    rows = (kr.json().get("patents", []) if kr is not None and kr.status_code == 200 else []) or []
+                    for r in rows:
+                        org = next((a.get("assignee_organization") for a in (r.get("assignees") or []) if a.get("assignee_organization")), "")
+                        parsed.append((r.get("patent_id", ""), r.get("patent_title", ""), r.get("patent_date", ""), org))
+                else:
+                    q = {"_and": [{"inventor_first_name": first}, {"inventor_last_name": last}]}
+                    f = ["patent_number", "patent_title", "patent_date", "assignee_organization"]
+                    url = f"{PATENTSVIEW_LEGACY}?q={quote_plus(json.dumps(q))}&f={quote_plus(json.dumps(f))}"
+                    lr = await self._get(client, url)
+                    rows = (lr.json().get("patents", []) if lr is not None and lr.status_code == 200 else []) or []
+                    for r in rows:
+                        org = r.get("assignee_organization") or next((a.get("assignee_organization") for a in (r.get("assignees") or []) if a.get("assignee_organization")), "")
+                        parsed.append((r.get("patent_number", ""), r.get("patent_title", ""), r.get("patent_date", ""), org))
+            except Exception:
+                return []
+        c_tok = (company.lower().split() or [""])[0]
+        built: List[Statement] = []
+        for pid, title, date, org in parsed[:12]:
+            if not title:
+                continue
+            purl = f"https://patents.google.com/patent/US{pid}" if pid else "https://patentsview.org"
+            built.append(Statement(kind="PATENT", title=f"{title} (assignee: {org or 'n/a'})", url=purl, source="PatentsView", date=str(date),
+                                   topics=self.classify_topics(title), triggers=[], named=bool(c_tok) and c_tok in (org or "").lower()))
+        relevant = [x for x in built if x.named]
+        return (relevant or built)[:8]
+
+    async def build_profile(self, name: str, company: str, company_domain: Optional[str] = None, role_hint: str = "",
+                            purpose: str = "meeting", origin_node_id: Optional[str] = None, hop_depth: int = 1) -> "ProfessionalProfile":
+        """A professional-background profile: the meeting brief plus org-published bio and patents, with a purpose banner.
+
+        Collects public PROFESSIONAL information only; it never queries breach, credential, phone, handle or
+        social-media sources and stores no private-life data. For purpose='hiring' it attaches HIRING_GUARDRAILS.
+        """
+        name, company = assert_professional_scope(name, company)
+        if purpose not in PURPOSES:
+            purpose = "meeting"
+        brief = await self.build_brief(name, company, company_domain=company_domain, role_hint=role_hint, origin_node_id=origin_node_id, hop_depth=hop_depth)
+        background = await self.professional_background(name, company, company_domain)
+        patents = await self.patents_as_inventor(name, company)
+        person_id = _sha("rolehold", f"{name.lower()}|{company.lower()}")
+        extra: List[Dict[str, str]] = []
+        for st in background + patents:
+            sid = _sha("profitem", f"{st.url}|{st.title[:40]}")
+            grade = "B1" if st.kind == "BACKGROUND" else "A2"
+            rcpt = EvidenceReceipt(tool=f"meeting_prep_{st.kind.lower()}", domain=DomainCategory.COMMERCIAL, admiralty_code=grade, selector_strength=SelectorStrength.SOFT,
+                                   source_url=st.url, extracted_fact=f"{st.kind}: {st.title[:120]}", raw_snippet=f"source={st.source} date={st.date}")
+            self.graph.upsert_node(GraphNode(id=sid, label=f"🧾 {st.kind}: {st.title[:52]}", entity_type=EntityType.DOCUMENT, domain=DomainCategory.COMMERCIAL,
+                                             ftm_schema="Document", selector_strength=SelectorStrength.SOFT, smoke_score=25.0, risk_flags=[f"PROFILE_{st.kind}"],
+                                             attributes={**st.__dict__, "kind": st.kind}, receipts=[rcpt], hop_depth=hop_depth + 1))
+            self.graph.upsert_edge(GraphEdge(source_id=person_id, target_id=sid, relation=RelationType.MENTIONED_IN, domain=DomainCategory.COMMERCIAL,
+                                             admiralty_code=grade, confidence=0.7, summary=st.kind, event_date=st.date or None, receipts=[rcpt]))
+            extra.append({"grade": grade, "fact": f"{st.kind} - {st.title[:90]}", "url": st.url})
+        affiliations = sorted({t.split("assignee: ", 1)[-1].rstrip(")") for t in (p.title for p in patents) if "assignee: " in t and "n/a" not in t} | {company})
+        compliance = list(HIRING_GUARDRAILS) if purpose == "hiring" else ["Use these professional facts to inform the conversation, cite the source, and stop referencing anything the person asks you not to."]
+        prof = ProfessionalProfile(brief=brief, purpose=purpose, background=background, patents=patents, affiliations=affiliations, compliance=compliance, receipts=extra)
+        self._log("PROFILE_DONE", f"{name} ({company})", f"purpose={purpose}; {len(background)} background, {len(patents)} patents, {len(brief.statements)} statements", level="discovery", receipts=len(extra))
+        return prof
+
+
+@dataclass
+class ProfessionalProfile:
+    """A meeting brief plus the organisation's published bio and the person's patents. Professional scope only."""
+    brief: ConversationBrief
+    purpose: str
+    background: List[Statement]
+    patents: List[Statement]
+    affiliations: List[str]
+    compliance: List[str]
+    receipts: List[Dict[str, str]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "purpose": self.purpose, "affiliations": self.affiliations, "compliance": self.compliance,
+            "background": [s.__dict__ for s in self.background], "patents": [s.__dict__ for s in self.patents],
+            "brief": self.brief.to_dict(), "receipts": self.receipts,
+        }
+
+    def export_markdown(self) -> str:
+        b = self.brief
+        L = [
+            f"# 🧾 PROFESSIONAL PROFILE: {b.name} ({b.company})",
+            f"**Purpose:** {self.purpose} | **Role (as given):** {b.role_hint or 'not specified'} | **Generated:** `{b.generated_at}`",
+            "",
+            f"> {b.scope_note} Professional, public, business-context information only - no breach, credential, account-enumeration, social-media or private-life data. Every line links to its public source.",
+        ]
+        if self.purpose == "hiring":
+            L += ["", "## ⚖️ Hiring-use guardrails (read first)"] + [f"- {c}" for c in self.compliance]
+        L += ["", "## Professional background (the organisation's own words)"]
+        L += [f"- {s.title} — [{s.source}]({s.url})" for s in self.background] or ["- No published bio found on the company site; confirm role and tenure with the person directly."]
+        L += ["", "## Patents as named inventor"]
+        L += [f"- [{s.title}]({s.url}) ({s.date})" for s in self.patents] or ["- None found via public patent search (or the lookup was unavailable)."]
+        if self.affiliations:
+            L += ["", "**Public affiliations (from patents / company):** " + ", ".join(self.affiliations)]
+        body = b.export_markdown().split("\n", 1)
+        L += ["", "---", "", body[1] if len(body) > 1 else ""]
+        return "\n".join(L)

@@ -1094,3 +1094,80 @@ def solar_prep_command(
     if json_out:
         json_out.write_text(json.dumps(brief.to_dict(), indent=2, default=str), encoding="utf-8")
         console.print(f"[bold green]✔ Saved brief JSON to:[/bold green] {json_out}")
+
+
+@solar_app.command("profile")
+def solar_profile_command(
+    name: str = typer.Argument(..., help="The person's full professional name as it appears in public sources"),
+    company: str = typer.Option(..., "--company", "-c", help="The organisation they represent (mandatory: professional context only)"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Company website, to read its own leadership/press pages for their published bio"),
+    role: Optional[str] = typer.Option(None, "--role", "-r", help="Their title if known, e.g. 'Head of O&M'"),
+    purpose: str = typer.Option("meeting", "--purpose", "-p", help="meeting | hiring | partnership (hiring adds compliance guardrails)"),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write the Markdown professional profile to this file"),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the profile as JSON"),
+) -> None:
+    """Professional-background profile from PUBLIC PROFESSIONAL sources only: press, appearances, bylines, papers, patents, the company's own bio.
+
+    Legal public OSINT, scoped on purpose: a company is required; emails/phones/handles/URLs are refused as seeds;
+    no breach, credential, account-enumeration, social-media or private-life data is ever collected or stored.
+    With --purpose hiring the output carries hiring-law guardrails (consent, role-relevance, no protected traits).
+    """
+    from rich.markdown import Markdown
+
+    from bunnyhole.solar.meeting_prep import PURPOSES, MeetingPrepAgent, ScopeError
+
+    if purpose not in PURPOSES:
+        console.print(f"[bold red]--purpose must be one of:[/bold red] {', '.join(PURPOSES)}")
+        raise typer.Exit(2)
+
+    def _on_event(evt: dict) -> None:
+        if evt.get("type") == "agent_log":
+            d = evt["data"]
+            console.print(f"[dim][{d['agent'].upper()}][/dim] [bold]{_rich_escape(str(d['action']))}[/bold] ({_rich_escape(str(d['target']))}): {_rich_escape(str(d['detail']))}")
+
+    graph = InvestigationGraph(case_id="profile", seed_query=f"{name} ({company})")
+    graph.subscribe(_on_event)
+    agent = MeetingPrepAgent(graph)
+    try:
+        prof = asyncio.run(agent.build_profile(name, company, company_domain=domain, role_hint=role or "", purpose=purpose))
+    except ScopeError as exc:
+        console.print(f"[bold red]Out of scope:[/bold red] {_rich_escape(str(exc))}")
+        raise typer.Exit(2) from exc
+
+    b = prof.brief
+    console.print()
+    console.print(
+        Panel(
+            f"[bold cyan]{_rich_escape(b.name)}[/bold cyan] — {_rich_escape(b.company)}  |  [dim]{_rich_escape(b.role_hint or 'role not given')}[/dim]  |  purpose: [bold]{purpose}[/bold]\n"
+            f"[bold green]Background lines:[/bold green] {len(prof.background)}  |  [bold green]Patents:[/bold green] {len(prof.patents)}  |  [bold green]Statements:[/bold green] {len(b.statements)}\n"
+            f"[dim]{_rich_escape(b.scope_note)} Professional, public, business-context only.[/dim]",
+            title="🧾 [bold white]PROFESSIONAL PROFILE[/bold white]",
+            border_style="bright_yellow",
+        )
+    )
+    if purpose == "hiring":
+        console.print(Panel("\n".join(f"• {_rich_escape(c)}" for c in prof.compliance), title="⚖️ Hiring-use guardrails", border_style="red"))
+    if prof.background:
+        console.print("[bold]Professional background (company's own words):[/bold]")
+        for s in prof.background[:6]:
+            console.print(f"  • {_rich_escape(s.title[:160])} [dim]({s.source})[/dim]")
+    if prof.patents:
+        console.print("[bold]Patents as named inventor:[/bold]")
+        for s in prof.patents[:6]:
+            console.print(f"  • {_rich_escape(s.title[:120])} [dim]{s.date}[/dim]")
+    if b.statements:
+        t = Table(title="📰 Public professional statements", show_lines=False)
+        t.add_column("Date", style="dim")
+        t.add_column("Kind", style="magenta")
+        t.add_column("Statement", style="white")
+        t.add_column("Source", style="cyan")
+        for s in b.statements[:12]:
+            t.add_row(s.date[:16], s.kind, _rich_escape(s.title[:80]), s.source[:22])
+        console.print(t)
+    console.print(Markdown("\n".join(["**Suggested questions**"] + [f"- {q}" for q in b.questions] + ["", "**Stay on professional ground**"] + [f"- {a}" for a in b.avoid])))
+    if out:
+        out.write_text(prof.export_markdown(), encoding="utf-8")
+        console.print(f"\n[bold green]✔ Saved professional profile to:[/bold green] {out}")
+    if json_out:
+        json_out.write_text(json.dumps(prof.to_dict(), indent=2, default=str), encoding="utf-8")
+        console.print(f"[bold green]✔ Saved profile JSON to:[/bold green] {json_out}")

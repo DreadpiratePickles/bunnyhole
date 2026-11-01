@@ -82,3 +82,46 @@ def test_brief_degrades_when_nothing_found():
 def test_cli_prep_rejects_personal_seed_and_requires_company():
     r = CliRunner(env={"COLUMNS": "300"}).invoke(app, ["solar", "prep", "jane@example.com", "--company", "Acme"])
     assert r.exit_code == 2 and "never an email" in r.output
+
+
+PATENTS_JSON = {"patents": [
+    {"patent_number": "11111111", "patent_title": "Waterless solar module cleaning apparatus", "patent_date": "2023-05-02", "assignee_organization": "Acme Solar"},
+    {"patent_number": "22222222", "patent_title": "Unrelated widget", "patent_date": "2019-01-01", "assignee_organization": "Other Co"},
+]}
+BIO_HTML = """<html><body><div class="bio">Jane Doe is Head of O&M at Acme Solar, where she has led plant operations since 2018. Jane Doe previously ran asset management at a 2 GW portfolio.</div></body></html>"""
+
+
+@respx.mock
+def test_build_profile_collects_background_and_patents_with_hiring_guardrails():
+    respx.get(url__regex=r"https://news\.google\.com/rss/search.*").mock(return_value=httpx.Response(200, text=PREP_RSS))
+    respx.get(url__regex=r"https://api\.openalex\.org/.*").mock(return_value=httpx.Response(200, json={"results": []}))
+    respx.get("https://acme-solar.com/leadership").mock(return_value=httpx.Response(200, text=BIO_HTML))
+    respx.get(url__regex=r"https://acme-solar\.com/.*").mock(return_value=httpx.Response(404))
+    respx.get(url__regex=r"https://api\.patentsview\.org/.*").mock(return_value=httpx.Response(200, json=PATENTS_JSON))
+    g = InvestigationGraph("profile", "Jane Doe")
+    prof = asyncio.run(MeetingPrepAgent(g).build_profile("Jane Doe", "Acme Solar", company_domain="acme-solar.com", role_hint="Head of O&M", purpose="hiring"))
+    assert prof.purpose == "hiring" and prof.compliance == list(mp.HIRING_GUARDRAILS)
+    assert any("Head of O&M at Acme Solar" in s.title for s in prof.background)
+    # company-assigned patent preferred over the unrelated one
+    assert [p.title for p in prof.patents] and all("Acme" in p.title for p in prof.patents)
+    assert "Acme Solar" in prof.affiliations
+    md = prof.export_markdown()
+    assert "Hiring-use guardrails" in md and "protected characteristics" in md
+    assert "Waterless solar module cleaning apparatus" in md and "Head of O&M at Acme Solar" in md
+    # still no personal-data sources were touched
+    dumped = json.dumps(g.to_dict())
+    assert "hudsonrock" not in dumped.lower() and "holehe" not in dumped.lower()
+
+
+@respx.mock
+def test_build_profile_meeting_purpose_has_no_hiring_block():
+    respx.route().mock(return_value=httpx.Response(503))
+    g = InvestigationGraph("profile", "Jane Doe")
+    prof = asyncio.run(MeetingPrepAgent(g).build_profile("Jane Doe", "Acme Solar", purpose="meeting"))
+    assert prof.purpose == "meeting"
+    assert "Hiring-use guardrails" not in prof.export_markdown()
+
+
+def test_cli_profile_rejects_bad_purpose():
+    r = CliRunner(env={"COLUMNS": "300"}).invoke(app, ["solar", "profile", "Jane Doe", "--company", "Acme", "--purpose", "spying"])
+    assert r.exit_code == 2 and "must be one of" in r.output

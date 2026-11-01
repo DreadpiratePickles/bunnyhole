@@ -170,6 +170,9 @@ uv run bunnyhole solar sweep --tag robotic_cleaning_adopter --front-door
 # Meeting prep from a role-holder's PUBLIC PROFESSIONAL statements only (talks, interviews, bylines, releases, papers)
 uv run bunnyhole solar prep "Jane Doe" --company "Some IPP" --role "Head of O&M" --out jane-brief.md
 
+# Fuller professional background profile (adds company-published bio + patents); --purpose hiring adds compliance guardrails
+uv run bunnyhole solar profile "Jane Doe" --company "Some IPP" --domain some-ipp.com --role "Head of O&M" --purpose hiring --out jane-profile.md
+
 # The playbook itself (no network)
 uv run bunnyhole solar routes --region india --type ipp --verbose
 uv run bunnyhole solar roles --type epc
