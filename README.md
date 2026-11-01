@@ -180,6 +180,9 @@ uv run bunnyhole solar targets --region mena
 uv run bunnyhole solar playbook india        # india | guerrilla | compliance | events | programs | partners | triggers
 ```
 
+**New to this mode?** Start with the plain-English [field guide for salespeople](docs/solar-sales-guide.md)
+— the weekly workflow, every command and flag, the hiring-research guardrails, and how to work each route.
+
 The research behind the playbook (market, competitors and their go-to-market, buyer psychology,
 routes, India, guerrilla tactics) lives in [`research/10_solar_bd_executive_brief.md`](research/10_solar_bd_executive_brief.md)
 and volumes 11–16. Read [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md): B2B outreach to corporate
