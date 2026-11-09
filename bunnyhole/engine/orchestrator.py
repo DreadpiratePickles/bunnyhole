@@ -13,6 +13,7 @@ from bunnyhole.agents.journalist import JournalistAgent
 from bunnyhole.agents.link_sleuth import LinkSleuthAgent, extract_entity_stem
 from bunnyhole.agents.onchain import OnChainAgent
 from bunnyhole.agents.osint import OSINTAgent
+from bunnyhole.agents.pi_sources import PISourcesAgent
 from bunnyhole.engine.council import InvestigativeCouncil
 from bunnyhole.engine.graph import InvestigationGraph
 from bunnyhole.engine.intake import AnchorMode, CaseIntakePacket, SmartIntakeParser
@@ -27,6 +28,22 @@ from bunnyhole.engine.models import (
     RelationType,
     SelectorStrength,
 )
+from bunnyhole.engine.pi import PIEngagement
+from bunnyhole.engine.pi_runtime import (
+    BREACH_SKIP_REASON,
+    CREDENTIAL_SKIP_REASON,
+    PIRunRecorder,
+    assemble_pi_block,
+    make_breach_blocker,
+    make_holehe_blocker,
+    redact_value,
+    run_conflict_check,
+    scrub_credential_text,
+    selectors_from_seeds,
+    strip_packet_credentials,
+    with_objective,
+)
+from bunnyhole.engine.profile import InvestigatorProfile, load_profile, match_watchlist
 from bunnyhole.engine.storage import CaseStore
 from bunnyhole.engine.synthesizer import InvestigativeSynthesizer
 
@@ -60,6 +77,11 @@ def classify_seed_type(seed: str) -> Tuple[str, EntityType, DomainCategory]:
     return ("company", EntityType.ORGANIZATION, DomainCategory.FIAT)
 
 
+# DexScreener token-name search matches company/person/handle strings against crypto tickers (a "$ROBINCAT" hit for a
+# person called Robin Cat is noise, not evidence), so PI mode does not run it for name-driven leads.
+_DEX_PI_SKIP = "token-name search is noise for company/person/handle leads; not run in PI mode"
+
+
 class BunnyholeOrchestrator:
     """
     Executes the recursive dzhng/deep-research Breadth x Depth loop across all 6 investigative agents,
@@ -78,9 +100,27 @@ class BunnyholeOrchestrator:
         exclusions: Optional[List[str]] = None,
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         intake_packet: Optional[CaseIntakePacket] = None,
+        profile: Optional[InvestigatorProfile] = None,
+        engagement: Optional[PIEngagement] = None,
     ) -> None:
         case_id = f"bh_{uuid.uuid4().hex[:8]}"
         self.seed_query = seed_query.strip()
+        # PI mode never uses credential/breach contents: drop them before ANY run logic can see them.
+        self._pi_redactions: List[str] = []
+        self._pi_credentials_dropped = 0
+        if engagement is not None:
+            self.seed_query, seed_tokens = scrub_credential_text(self.seed_query)
+            self._pi_redactions += seed_tokens
+            self._pi_credentials_dropped += len(seed_tokens)
+            if seed_tokens and (not self.seed_query.replace("[credential removed]", "").strip()):
+                raise ValueError(
+                    "PI mode does not use credential or breach contents, and the seed is only a credential. "
+                    "Give the subject's name, entity, domain or another selector instead."
+                )
+            if intake_packet is not None:
+                intake_packet, dropped, tokens = strip_packet_credentials(intake_packet)
+                self._pi_redactions += tokens
+                self._pi_credentials_dropped += dropped
         self.gear = gear
         self.max_depth = max(1, min(4, max_depth))
         self.initial_breadth = max(2, min(8, initial_breadth))
@@ -113,7 +153,89 @@ class BunnyholeOrchestrator:
         self.synthesis: Dict[str, Any] = {}
         self.council_deliberation: Dict[str, Any] = {}
         self.intake_packet: Optional[Dict[str, Any]] = intake_packet.model_dump() if intake_packet else None
+        # Remembered investigator context (persona lens + watchlist). Loads the persisted profile when
+        # not supplied; a missing profile yields harmless generalist defaults with no disk writes.
+        self.profile: InvestigatorProfile = profile if profile is not None else load_profile()
+        self._emphasize_sanctions: bool = self.profile.persona_profile().emphasize_sanctions
         self._sem = asyncio.Semaphore(5)
+
+        # PI stream (optional). With no engagement none of this exists and behaviour is unchanged.
+        self.engagement: Optional[PIEngagement] = with_objective(engagement) if engagement is not None else None
+        self.pi_sources: Optional[PISourcesAgent] = None
+        self.pi_recorder: Optional[PIRunRecorder] = None
+        self._pi_prior_cases: List[Dict[str, Any]] = []
+        self._pi_selectors: Dict[str, List[str]] = {}
+        self._pi_ownership_links: List[Dict[str, Any]] = []
+        self._pi_conflict_checked = False
+        self._pi_deep_run: bool = self.gear == GearMode.DEEP  # gates the "no corroborated finding" escalation trigger
+        if self.engagement is not None:
+            self.pi_sources = PISourcesAgent(self.graph, gear=self.gear)
+            self.pi_recorder = PIRunRecorder()
+            self._pi_credential_entry: Optional[Any] = None
+            self._pi_note_dropped_credentials(0)
+            # Breach/infostealer lookups also run inside other OSINT methods (email pivots, domain recon, handle
+            # sweeps): shadow them on this instance so nothing in PI mode ever collects breach contents.
+            for method, source, target_arg in (
+                ("investigate_hudsonrock_infostealer", "hudsonrock", 0),
+                ("_scan_leakcheck", "leakcheck", 0),
+                ("_lookup_emailrep", "emailrep", 0),
+                ("investigate_credential_combo", "credential_combo", 1),
+            ):
+                setattr(self.osint, method, make_breach_blocker(self.pi_recorder, source, target_arg=target_arg))
+            if self.engagement.passive_only:
+                # Holehe probes account-recovery flows with the target's email: not passive, so blocked and logged.
+                self.osint._run_local_arsenal_holehe = make_holehe_blocker(self.pi_recorder)  # type: ignore[method-assign]
+
+    def _pi_note_dropped_credentials(self, dropped: int) -> None:
+        """Keep exactly ONE source-log entry for dropped credentials (the value is never echoed)."""
+        if self.pi_recorder is None:
+            return
+        self._pi_credentials_dropped += dropped
+        if not self._pi_credentials_dropped:
+            return
+        detail = (
+            f"{self._pi_credentials_dropped} credential entr(y/ies) dropped before the run; "
+            f"{CREDENTIAL_SKIP_REASON} (nothing was derived from them, not even the email half)"
+        )
+        if self._pi_credential_entry is None:
+            self.pi_recorder.skip("credentials", "intake", detail)
+            self._pi_credential_entry = self.pi_recorder.entries[-1]
+        else:
+            self._pi_credential_entry.detail = detail
+
+    def _pi_strip_credentials(self, packet: CaseIntakePacket) -> CaseIntakePacket:
+        """PI mode: return the packet without credentials/``email:secret`` tokens and log the drop once."""
+        if self.engagement is None:
+            return packet
+        clean, dropped, tokens = strip_packet_credentials(packet)
+        self._pi_redactions += tokens
+        self._pi_note_dropped_credentials(dropped)
+        return clean
+
+    def _pi_skip(self, source: str, target: str, detail: str) -> None:
+        if self.pi_recorder is not None:
+            self.pi_recorder.skip(source, target, detail)
+
+    def _pi_task(self, source: str, target: str, coro: Any) -> Any:
+        """In PI mode wrap a source call so its outcome (hit/negative/skipped/error) is logged; else pass through."""
+        if self.pi_recorder is None:
+            return coro
+        return self.pi_recorder.run(source, target, self.graph, coro)
+
+    async def _pi_collect_psc(self, company_name: str, origin_node_id: str, hop_depth: int) -> None:
+        """Companies House PSC lookup; keeps the returned ownership links for the PI ownership walk."""
+        assert self.pi_sources is not None
+        owners = await self.pi_sources.investigate_companies_house_psc(company_name, origin_node_id, hop_depth)
+        self._pi_ownership_links.extend(owners or [])
+
+    def _pi_start_case(self, seed_tuples: List[Tuple[str, str]]) -> None:
+        """PI mode: derive selectors and run the conflict check once per case (failures are non-fatal)."""
+        if self.engagement is None or self.pi_recorder is None or self._pi_conflict_checked:
+            return
+        self._pi_conflict_checked = True
+        self._pi_selectors = selectors_from_seeds(seed_tuples, self.engagement.subject_is_person)
+        values = [self.seed_query] + [v for lt, v in seed_tuples if lt not in ("credential", "document")]
+        self._pi_prior_cases = run_conflict_check(self.case_store, values, self.graph.case_id, self.pi_recorder)
 
     def _create_seed_node(self, seed_str: str, hop_depth: int = 0, forced_type: Optional[str] = None) -> Tuple[str, GraphNode]:
         lead_type, ent_type, dom_cat = classify_seed_type(seed_str)
@@ -155,67 +277,96 @@ class BunnyholeOrchestrator:
             return
         async with self._sem:
             tasks = []
+            pi = self._pi_task  # identity in normal mode; in PI mode logs every source call incl. negatives
             if lead_type == "domain":
-                tasks.append(self.osint.investigate_domain_infrastructure(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_wayback_ghost_edits(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_news_and_narrative(value, origin_node_id, hop_depth))
+                tasks.append(pi("osint_domain", value, self.osint.investigate_domain_infrastructure(value, origin_node_id, hop_depth)))
+                tasks.append(pi("wayback", value, self.journalist.investigate_wayback_ghost_edits(value, origin_node_id, hop_depth)))
+                tasks.append(pi("news_narrative", value, self.journalist.investigate_news_and_narrative(value, origin_node_id, hop_depth)))
                 stem = extract_entity_stem(value)
                 if len(stem) >= 4:
-                    tasks.append(self.accountant.investigate_gleif_corporate_hierarchy(stem, origin_node_id, hop_depth))
-                    tasks.append(self.onchain.investigate_dexscreener_tokens(stem, origin_node_id, hop_depth))
+                    tasks.append(pi("gleif", stem, self.accountant.investigate_gleif_corporate_hierarchy(stem, origin_node_id, hop_depth)))
+                    if self.engagement is None:
+                        tasks.append(pi("dexscreener", stem, self.onchain.investigate_dexscreener_tokens(stem, origin_node_id, hop_depth)))
+                    else:
+                        self._pi_skip("dexscreener", stem, _DEX_PI_SKIP)
+                    if self._emphasize_sanctions:
+                        tasks.append(pi("opensanctions", stem, self.accountant.investigate_opensanctions(stem, origin_node_id, hop_depth)))
 
             elif lead_type == "wallet":
-                tasks.append(self.onchain.investigate_evm_address(value, origin_node_id, hop_depth))
+                tasks.append(pi("onchain_evm", value, self.onchain.investigate_evm_address(value, origin_node_id, hop_depth)))
                 if value.lower().endswith(".eth"):
                     stem = value.lower().replace(".eth", "")
                     if len(stem) >= 3:
-                        tasks.append(self.osint.investigate_identity_and_handle(stem, origin_node_id, hop_depth))
+                        tasks.append(pi("osint_identity", stem, self.osint.investigate_identity_and_handle(stem, origin_node_id, hop_depth)))
 
             elif lead_type == "bitcoin":
-                tasks.append(self.onchain.investigate_bitcoin_utxo(value, origin_node_id, hop_depth))
+                tasks.append(pi("onchain_bitcoin", value, self.onchain.investigate_bitcoin_utxo(value, origin_node_id, hop_depth)))
 
             elif lead_type == "aircraft":
-                tasks.append(self.accountant.investigate_aircraft_adsb(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_news_and_narrative(value, origin_node_id, hop_depth))
+                tasks.append(pi("aircraft_adsb", value, self.accountant.investigate_aircraft_adsb(value, origin_node_id, hop_depth)))
+                tasks.append(pi("news_narrative", value, self.journalist.investigate_news_and_narrative(value, origin_node_id, hop_depth)))
 
             elif lead_type == "ip":
-                tasks.append(self.osint.investigate_ip_shodan_and_ripestat(value, origin_node_id, hop_depth))
-                tasks.append(self.osint.investigate_hudsonrock_infostealer(value, "ip", origin_node_id, hop_depth))
+                tasks.append(pi("ip_shodan_ripestat", value, self.osint.investigate_ip_shodan_and_ripestat(value, origin_node_id, hop_depth)))
+                if self.engagement is None:
+                    tasks.append(pi("hudsonrock", value, self.osint.investigate_hudsonrock_infostealer(value, "ip", origin_node_id, hop_depth)))
+                else:
+                    self._pi_skip("hudsonrock", value, BREACH_SKIP_REASON)
 
             elif lead_type == "email":
-                tasks.append(self.osint.investigate_email_pivots(value, origin_node_id, hop_depth))
+                tasks.append(pi("email_pivots", value, self.osint.investigate_email_pivots(value, origin_node_id, hop_depth)))
                 handle_part = value.split("@")[0]
                 if len(handle_part) >= 3:
-                    tasks.append(self.osint.investigate_identity_and_handle(handle_part, origin_node_id, hop_depth))
+                    tasks.append(pi("osint_identity", handle_part, self.osint.investigate_identity_and_handle(handle_part, origin_node_id, hop_depth)))
 
             elif lead_type == "phone":
-                tasks.append(self.osint.investigate_phone_number(value, origin_node_id, hop_depth))
+                tasks.append(pi("phone_lookup", value, self.osint.investigate_phone_number(value, origin_node_id, hop_depth)))
 
             elif lead_type == "credential":
-                tasks.append(self.osint.investigate_credential_combo(value, origin_node_id, hop_depth))
+                if self.pi_recorder is not None:
+                    # The target is the (masked) origin node: the secret never reaches the source log.
+                    self.pi_recorder.skip("credential_combo", origin_node_id, CREDENTIAL_SKIP_REASON)
+                else:
+                    tasks.append(self.osint.investigate_credential_combo(value, origin_node_id, hop_depth))
 
             elif lead_type == "document":
                 self.journalist.inspect_document_binary_forensics(value, origin_node_id=origin_node_id)
 
             elif lead_type == "username":
-                tasks.append(self.osint.investigate_identity_and_handle(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_hackernews_archive(value, origin_node_id, hop_depth))
-                tasks.append(self.onchain.investigate_dexscreener_tokens(value, origin_node_id, hop_depth))
+                tasks.append(pi("osint_identity", value, self.osint.investigate_identity_and_handle(value, origin_node_id, hop_depth)))
+                tasks.append(pi("hackernews", value, self.journalist.investigate_hackernews_archive(value, origin_node_id, hop_depth)))
+                if self.engagement is None:
+                    tasks.append(pi("dexscreener", value, self.onchain.investigate_dexscreener_tokens(value, origin_node_id, hop_depth)))
+                else:
+                    self._pi_skip("dexscreener", value, _DEX_PI_SKIP)
 
             else:  # company / person / general topic
-                tasks.append(self.accountant.investigate_gleif_corporate_hierarchy(value, origin_node_id, hop_depth))
-                tasks.append(self.accountant.investigate_sec_edgar(value, origin_node_id, hop_depth))
-                tasks.append(self.accountant.investigate_nonprofit_990s_and_usaspending(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_news_and_narrative(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_court_dockets(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_wikipedia_revisions(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_openalex_academic_and_grants(value, origin_node_id, hop_depth))
-                tasks.append(self.journalist.investigate_hackernews_archive(value, origin_node_id, hop_depth))
-                tasks.append(self.onchain.investigate_dexscreener_tokens(value, origin_node_id, hop_depth))
+                tasks.append(pi("gleif", value, self.accountant.investigate_gleif_corporate_hierarchy(value, origin_node_id, hop_depth)))
+                tasks.append(pi("opensanctions", value, self.accountant.investigate_opensanctions(value, origin_node_id, hop_depth)))
+                tasks.append(pi("sec_edgar", value, self.accountant.investigate_sec_edgar(value, origin_node_id, hop_depth)))
+                tasks.append(pi("nonprofit_990s", value, self.accountant.investigate_nonprofit_990s_and_usaspending(value, origin_node_id, hop_depth)))
+                tasks.append(pi("news_narrative", value, self.journalist.investigate_news_and_narrative(value, origin_node_id, hop_depth)))
+                tasks.append(pi("court_dockets", value, self.journalist.investigate_court_dockets(value, origin_node_id, hop_depth)))
+                tasks.append(pi("wikipedia", value, self.journalist.investigate_wikipedia_revisions(value, origin_node_id, hop_depth)))
+                tasks.append(pi("openalex", value, self.journalist.investigate_openalex_academic_and_grants(value, origin_node_id, hop_depth)))
+                tasks.append(pi("hackernews", value, self.journalist.investigate_hackernews_archive(value, origin_node_id, hop_depth)))
+                if self.engagement is None:
+                    tasks.append(pi("dexscreener", value, self.onchain.investigate_dexscreener_tokens(value, origin_node_id, hop_depth)))
+                else:
+                    self._pi_skip("dexscreener", value, _DEX_PI_SKIP)
                 if self.gear == GearMode.DEEP:
                     stem = extract_entity_stem(value)
                     if len(stem) >= 4:
-                        tasks.append(self.osint.investigate_identity_and_handle(stem, origin_node_id, hop_depth))
+                        tasks.append(pi("osint_identity", stem, self.osint.investigate_identity_and_handle(stem, origin_node_id, hop_depth)))
+                if self.pi_sources is not None:  # PI-only free sources (Companies House PSC, GAC sanctions, CFPB, Wikidata)
+                    tasks.append(pi("uk_psc", value, self._pi_collect_psc(value, origin_node_id, hop_depth)))
+                    tasks.append(pi("ca_sanctions", value, self.pi_sources.screen_canadian_sanctions(value, origin_node_id, hop_depth)))
+                    # Official keyless lists (OFAC SDN, UN, UK): the keyless replacement for an OpenSanctions key.
+                    tasks.append(pi("ofac_sdn", value, self.pi_sources.screen_ofac_sdn(value, origin_node_id, hop_depth)))
+                    tasks.append(pi("un_consolidated", value, self.pi_sources.screen_un_consolidated(value, origin_node_id, hop_depth)))
+                    tasks.append(pi("uk_sanctions_list", value, self.pi_sources.screen_uk_sanctions_list(value, origin_node_id, hop_depth)))
+                    tasks.append(pi("cfpb_complaints", value, self.pi_sources.investigate_cfpb_complaints(value, origin_node_id, hop_depth)))
+                    tasks.append(pi("wikidata", value, self.pi_sources.investigate_wikidata_entity(value, origin_node_id, hop_depth)))
 
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -245,7 +396,8 @@ class BunnyholeOrchestrator:
         - Supports both `AnchorMode.CONVERGENCE` (separate root islands -> prove IF/HOW they connect)
           and `AnchorMode.LOCKED_PROFILE` (confirmed same entity -> link all selectors to a single Target Profile root).
         """
-        norm = SmartIntakeParser.normalize_packet(packet)
+        packet = self._pi_strip_credentials(packet)  # PI mode: before the parser or any lead can see a secret
+        norm = self._pi_strip_credentials(SmartIntakeParser.normalize_packet(packet))
         self.intake_packet = norm.model_dump()
         self.seed_query = norm.title
         self.graph.seed_query = norm.title
@@ -262,6 +414,7 @@ class BunnyholeOrchestrator:
         if not seed_tuples and norm.raw_omni_input:
             ltype, _, _ = classify_seed_type(norm.raw_omni_input)
             seed_tuples = [(ltype, norm.raw_omni_input)]
+        self._pi_start_case(seed_tuples)
 
         self.graph.log(
             DomainCategory.SKEPTIC,
@@ -390,6 +543,7 @@ class BunnyholeOrchestrator:
 
         lead_type, root_node = self._create_seed_node(self.seed_query, hop_depth=0)
         self.graph.explored_seeds.add(f"{lead_type}:{self.seed_query.lower().strip()}")
+        self._pi_start_case([(lead_type, self.seed_query)])
 
         self.graph.log(
             DomainCategory.SKEPTIC,
@@ -534,4 +688,20 @@ class BunnyholeOrchestrator:
             "learnings": self.learnings[:40],
             "follow_up_questions": self.follow_up_questions[:15],
         }
+        # Personalization: the persona lens this case ran through + any watchlist targets it surfaced.
+        base["persona"] = self.profile.persona.value
+        base["analyst_framing"] = self.profile.analyst_framing()
+        base["watchlist_hits"] = match_watchlist(base.get("nodes", []), self.profile.watchlist)
+        if self.engagement is not None and self.pi_recorder is not None:
+            base["pi"] = assemble_pi_block(
+                self.engagement,
+                base,
+                self.pi_recorder.entries,
+                cross_case_prior=self._pi_prior_cases,
+                selectors=self._pi_selectors,
+                ownership_links=self._pi_ownership_links,
+                deep_run=self._pi_deep_run,
+            ).model_dump(mode="json")
+            if self._pi_redactions:  # safety net: no credential string survives anywhere in the PI result
+                base = redact_value(base, self._pi_redactions)
         return base

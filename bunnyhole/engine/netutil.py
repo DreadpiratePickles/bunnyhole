@@ -8,10 +8,12 @@ These helpers centralize that check so every outbound fetch can validate before 
 
 from __future__ import annotations
 
+import functools
 import ipaddress
+import logging
 import re
 import socket
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -34,6 +36,19 @@ _ALLOWED_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h", "socks4")
 # constructor and call site. None means "direct connection".
 _DEFAULT_PROXY: Optional[str] = None
 _TOR_PROXY: str = DEFAULT_TOR_PROXY
+
+
+logger = logging.getLogger(__name__)
+
+#: ``cb(url, status_code, error)``: called once per finished HTTP exchange. ``status_code`` is None and ``error``
+#: is the exception class name (never its message, which can echo URLs) when the transport failed.
+ResponseObserver = Callable[[str, Optional[int], Optional[str]], None]
+
+# Opt-in response observer. Default None: httpx is never touched and nothing is wrapped. The PI source log
+# registers one for the duration of a run so a source that was answered HTTP 401 is not logged as a clean
+# negative (see pi_runtime.PIRunRecorder).
+_RESPONSE_OBSERVER: Optional[ResponseObserver] = None
+_ORIGINAL_ASYNC_SEND: Any = None
 
 
 class InvalidProxyError(ValueError):
@@ -72,6 +87,66 @@ def set_tor_proxy(proxy: str) -> None:
 def get_tor_proxy() -> str:
     """Return the Tor SOCKS proxy URL used for .onion fetches."""
     return _TOR_PROXY
+
+
+def _notify(observer: ResponseObserver, url: str, status: Optional[int], error: Optional[str]) -> None:
+    try:
+        observer(url, status, error)
+    except Exception:  # noqa: BLE001 - an observer bug must never break an investigative request
+        logger.debug("response observer raised", exc_info=True)
+
+
+def _install_send_observer() -> None:
+    """Wrap ``httpx.AsyncClient.send`` once. Covers clients from new_async_client() and direct httpx clients."""
+    global _ORIGINAL_ASYNC_SEND
+    if _ORIGINAL_ASYNC_SEND is not None:
+        return
+    original = httpx.AsyncClient.send
+    _ORIGINAL_ASYNC_SEND = original
+
+    @functools.wraps(original)
+    async def observed_send(self: httpx.AsyncClient, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
+        observer = _RESPONSE_OBSERVER
+        if observer is None:
+            return await original(self, request, *args, **kwargs)
+        try:
+            response = await original(self, request, *args, **kwargs)
+        except Exception as exc:
+            _notify(observer, str(request.url), None, type(exc).__name__)
+            raise
+        _notify(observer, str(response.request.url), response.status_code, None)
+        return response
+
+    httpx.AsyncClient.send = observed_send  # type: ignore[method-assign]
+
+
+def _uninstall_send_observer() -> None:
+    global _ORIGINAL_ASYNC_SEND
+    if _ORIGINAL_ASYNC_SEND is not None:
+        httpx.AsyncClient.send = _ORIGINAL_ASYNC_SEND  # type: ignore[method-assign]
+        _ORIGINAL_ASYNC_SEND = None
+
+
+def set_response_observer(observer: Optional[ResponseObserver]) -> None:
+    """Register (or clear, with None) a callback told the status of every async HTTP exchange.
+
+    Opt-in and process-wide. While unset there is zero overhead: ``httpx.AsyncClient.send`` is the untouched
+    original. While set, every ``httpx.AsyncClient`` (built by :func:`new_async_client` or directly, as most
+    agents do) reports ``(url, status_code, None)`` per response, or ``(url, None, "<ExceptionClass>")`` before
+    the transport error is re-raised. The observer must be fast and non-blocking; exceptions it raises are
+    swallowed. Redirect hops are not reported separately (only the final response).
+    """
+    global _RESPONSE_OBSERVER
+    _RESPONSE_OBSERVER = observer
+    if observer is None:
+        _uninstall_send_observer()
+    else:
+        _install_send_observer()
+
+
+def get_response_observer() -> Optional[ResponseObserver]:
+    """Return the registered response observer, or None."""
+    return _RESPONSE_OBSERVER
 
 
 def new_async_client(

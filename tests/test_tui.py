@@ -85,5 +85,49 @@ class TuiComposeTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class TuiPlainLanguageTest(unittest.TestCase):
+    def test_resolve_run_reads_language_and_updates_controls(self) -> None:
+        async def scenario() -> None:
+            app = BunnyholeTUI()
+            async with app.run_test(size=(120, 40)):
+                resolved = app._resolve_run("dig deep into acme.io")
+                self.assertIsNotNone(resolved)
+                packet, gear, depth, breadth = resolved
+                self.assertIn("acme.io", packet.domains_or_ips)
+                self.assertEqual(gear.value, "deep")
+                self.assertEqual(depth, 3)
+                # the dropdowns must reflect what will actually run
+                from textual.widgets import Select
+
+                self.assertEqual(app.query_one("#gear", Select).value, "deep")
+                self.assertEqual(app.query_one("#depth", Select).value, 3)
+
+        asyncio.run(scenario())
+
+    def test_dropdowns_override_when_language_is_silent(self) -> None:
+        async def scenario() -> None:
+            from textual.widgets import Select
+
+            app = BunnyholeTUI()
+            async with app.run_test(size=(120, 40)):
+                app.query_one("#gear", Select).value = "deep"
+                app.query_one("#depth", Select).value = 4
+                resolved = app._resolve_run("acme.io")  # no speed/depth cue -> dropdowns win
+                self.assertIsNotNone(resolved)
+                _packet, gear, depth, _breadth = resolved
+                self.assertEqual(gear.value, "deep")
+                self.assertEqual(depth, 4)
+
+        asyncio.run(scenario())
+
+    def test_non_actionable_input_returns_none(self) -> None:
+        async def scenario() -> None:
+            app = BunnyholeTUI()
+            async with app.run_test(size=(120, 40)):
+                self.assertIsNone(app._resolve_run("take a quick look"))
+
+        asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
