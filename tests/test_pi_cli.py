@@ -1,90 +1,42 @@
 """CLI tests for the PI stream: ``--pi`` flags on trace/intake and the ``bunnyhole pi`` reference sub-app.
 
-No network and no real ~/.bunnyhole access: the orchestrator is a recording fake, the saved profile is
-replaced by a default one, and ``bunnyhole.engine.pi_report`` is stubbed through ``sys.modules`` so these
-tests pass whether or not the real report module has landed.
+Sections: the gates at the CLI, plumbing (happy path), ``--pi-report``, ``bunnyhole pi``, and hardening (``--cred``,
+subject type, grammar). The input-hardening passes (subject-type self-declaration, ``--purpose-category``,
+free-text screening, credential refusal) are in ``test_pi_cli_input_hardening.py``.
+
+No network and no real ~/.bunnyhole access: the orchestrator is a recording fake that returns a PI block, the saved
+profile is replaced by a default one, and ``bunnyhole.engine.pi_report`` is stubbed through ``sys.modules`` (the
+``stub_report`` fixture) so the report tests do not depend on the real report module.
 """
+
+# Replaces: test_pi_cli.py (consolidated 2026-11-09).
 
 from __future__ import annotations
 
 import sys
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import pytest
-from rich.console import Console
-from typer.testing import CliRunner
+from pi_helpers import FakePIOrchestrator as FakeOrchestrator
+from pi_helpers import isolate_cli
+from pi_helpers import run_cli as _run
 
 from bunnyhole.cli import main as cli_main
-from bunnyhole.cli import pi_commands
-from bunnyhole.engine import profile as profile_mod
 from bunnyhole.engine.models import GearMode
 from bunnyhole.engine.personas import Persona
-from bunnyhole.engine.pi import CaseType, PIBlock, PIEngagement
+from bunnyhole.engine.pi import CaseType, PIEngagement
 from bunnyhole.engine.pi_reference import playbook_for
 
 PURPOSE = "vet a counterparty before signing a supply contract"
-runner = CliRunner()
 CATEGORY = ("--purpose-category", "counterparty_due_diligence")
 PERSON_BASIS = (*CATEGORY, "--matter-ref", "MSA-2026-114")
 
 
-class FakeOrchestrator:
-    """Records constructor kwargs; returns a minimal result carrying a PI block when an engagement is set."""
-
-    instances: List["FakeOrchestrator"] = []
-
-    def __init__(self, **kwargs: Any) -> None:
-        self.kwargs = kwargs
-        self.graph = types.SimpleNamespace(export_markdown_dossier=lambda: "# dossier")
-        FakeOrchestrator.instances.append(self)
-
-    def _result(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {
-            "case_id": "bh_fake01",
-            "seed_query": self.kwargs.get("seed_query", ""),
-            "stats": {"total_nodes": 0, "total_edges": 0, "total_receipts": 0, "cutout_brokers": 0},
-            "ach_assessment": {},
-            "deep_research": {"gear": "deep", "initial_breadth": 4, "max_depth": 3},
-            "interconnections": {},
-            "nodes": [],
-        }
-        engagement: Optional[PIEngagement] = self.kwargs.get("engagement")
-        if engagement is not None:
-            block = PIBlock(
-                engagement=engagement,
-                findings=[
-                    {"node_id": "a", "label": "A", "finding_label": "confirmed", "source_count": 3},
-                    {"node_id": "b", "label": "B", "finding_label": "lead", "source_count": 1},
-                ],
-                coverage=[
-                    {"source_class": "court_dockets", "searched": True, "outcome": "negative"},
-                    {"source_class": "crypto_onchain", "searched": False, "outcome": "not_searched"},
-                ],
-                custodians=[
-                    {"finding": "bank", "custodian": "the bank", "instrument": "subpoena", "jurisdiction": "us"}
-                ],
-            )
-            result["pi"] = block.model_dump(mode="json")
-        return result
-
-    async def run_investigation(self) -> Dict[str, Any]:
-        return self._result()
-
-    async def run_intake_investigation(self, packet: Any) -> Dict[str, Any]:
-        self.packet = packet
-        return self._result()
-
-
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch: pytest.MonkeyPatch) -> None:
-    FakeOrchestrator.instances = []
-    monkeypatch.setattr(cli_main, "BunnyholeOrchestrator", FakeOrchestrator)
-    monkeypatch.setattr(profile_mod, "load_profile", lambda *a, **k: profile_mod.InvestigatorProfile())
-    wide = Console(width=240)
-    monkeypatch.setattr(cli_main, "console", wide)
-    monkeypatch.setattr(pi_commands, "console", wide)
+    isolate_cli(monkeypatch, FakeOrchestrator, stub_render=False)
 
 
 @pytest.fixture
@@ -99,10 +51,6 @@ def stub_report(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
     module.build_pi_report = build_pi_report  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "bunnyhole.engine.pi_report", module)
     return seen
-
-
-def _run(*args: str) -> Any:
-    return runner.invoke(cli_main.app, list(args))
 
 
 # ------------------------------------------------------------------------------------------ the gates

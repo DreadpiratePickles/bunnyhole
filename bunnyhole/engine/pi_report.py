@@ -128,8 +128,9 @@ def _ach(result: Mapping[str, Any]) -> Dict[str, Any]:
     """The ACH assessment under ``ach`` or ``ach_assessment``; empty when absent or blank."""
     for key in ("ach", "ach_assessment"):
         raw = result.get(key)
-        if hasattr(raw, "model_dump"):
-            raw = raw.model_dump()
+        dump = getattr(raw, "model_dump", None)
+        if callable(dump):
+            raw = dump()
         if isinstance(raw, Mapping) and any(raw.get(k) for k in ("primary_question", "winning_hypothesis")):
             return dict(raw)
     return {}

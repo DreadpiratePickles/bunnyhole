@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, List, Optional
-
-import httpx
+from typing import Any, Dict, List, Tuple
 
 from bunnyhole.engine.graph import InvestigationGraph
+from bunnyhole.engine.llm_providers import complete_with_fallback, configured_providers
+
+#: Direct providers tried in order for the narrative synthesis (OpenRouter is the council's per-seat route).
+SYNTHESIS_PROVIDERS: Tuple[str, ...] = ("gemini", "anthropic", "openai")
 
 
 class InvestigativeSynthesizer:
     """
     Synthesizes accumulated `learnings[]`, SHA-256 `EvidenceReceipts`, Keystone Brokers,
     Adamic-Adar Triadic Closures, and CIA ACH scores into a citation-backed Investigative Brief.
-    Supports Gemini, Anthropic Claude, OpenAI, Local Ollama, and a zero-key deterministic narrative engine.
+    Supports Gemini, Anthropic Claude, OpenAI (explicit fallback chain) and a zero-key deterministic narrative engine.
     """
 
     def __init__(self, graph: InvestigationGraph) -> None:
@@ -189,17 +190,19 @@ class InvestigativeSynthesizer:
     ) -> Dict[str, Any]:
         """
         Produce the deterministic citation-backed brief first, and if an LLM API key
-        (GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY) is configured in the Vault,
-        augment it with an AI Investigative Analyst narrative synthesis.
+        (GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY) is configured, augment it with an AI narrative.
+
+        Providers are tried in order (Gemini, Anthropic, OpenAI) until one answers; each failure is logged and
+        listed in ``llm_fallback`` (``reason`` + ``failures``). With no key nothing is sent anywhere.
         """
         base_report = self.build_deterministic_brief(learnings, interconnections, cross_case_hits)
         receipts = base_report["receipt_index"]
 
-        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-
-        if not (gemini_key or anthropic_key or openai_key) or not receipts:
+        base_report["llm_fallback"] = {"reason": "no_provider_configured", "failures": []}
+        if not configured_providers(SYNTHESIS_PROVIDERS):
+            return base_report
+        if not receipts:
+            base_report["llm_fallback"] = {"reason": "no_receipts", "failures": []}
             return base_report
 
         prompt_facts = "\n".join(
@@ -213,75 +216,29 @@ class InvestigativeSynthesizer:
             "Highlight cross-domain bridges, financial/on-chain anomalies, and what the investigator should subpoena or pivot on next. "
             "Never invent facts outside the provided receipts."
         )
+        outcome = await complete_with_fallback(
+            system_prompt,
+            f"Seed: {self.graph.seed_query}\n\nReceipts:\n{prompt_facts}",
+            providers=SYNTHESIS_PROVIDERS,
+            max_tokens=700,
+            timeout=14.0,
+            graph=self.graph,
+            purpose="investigative synthesis",
+        )
+        base_report["llm_fallback"] = {"reason": outcome.reason, "failures": outcome.failures()}
 
-        llm_text: Optional[str] = None
-        provider_used: Optional[str] = None
-
-        try:
-            async with httpx.AsyncClient(timeout=14.0) as client:
-                if gemini_key:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-                    resp = await client.post(
-                        url,
-                        json={
-                            "contents": [
-                                {"parts": [{"text": f"{system_prompt}\n\nSeed: {self.graph.seed_query}\n\nReceipts:\n{prompt_facts}"}]}
-                            ]
-                        },
-                    )
-                    if resp.status_code == 200:
-                        candidates = resp.json().get("candidates", [])
-                        if candidates:
-                            llm_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text")
-                            provider_used = "gemini-2.5-flash"
-
-                elif anthropic_key:
-                    resp = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key": anthropic_key,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": "claude-3-5-sonnet-latest",
-                            "max_tokens": 700,
-                            "system": system_prompt,
-                            "messages": [{"role": "user", "content": f"Seed: {self.graph.seed_query}\n\nReceipts:\n{prompt_facts}"}],
-                        },
-                    )
-                    if resp.status_code == 200:
-                        content = resp.json().get("content", [])
-                        if content:
-                            llm_text = content[0].get("text")
-                            provider_used = "claude-3-5-sonnet"
-
-                elif openai_key:
-                    resp = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {openai_key}"},
-                        json={
-                            "model": "gpt-4o-mini",
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": f"Seed: {self.graph.seed_query}\n\nReceipts:\n{prompt_facts}"},
-                            ],
-                            "max_tokens": 700,
-                        },
-                    )
-                    if resp.status_code == 200:
-                        choices = resp.json().get("choices", [])
-                        if choices:
-                            llm_text = choices[0].get("message", {}).get("content")
-                            provider_used = "gpt-4o-mini"
-        except Exception:
-            pass
-
-        if llm_text:
+        if outcome.text:
             base_report["engine"] = "hybrid_llm_and_deterministic_synthesizer"
-            base_report["llm_provider"] = provider_used
+            base_report["llm_provider"] = outcome.model
+            base_report["llm_provider_name"] = outcome.provider
             base_report["markdown_brief"] = (
-                f"### 🤖 AI Investigative Analyst Synthesis (`{provider_used}`)\n{llm_text.strip()}\n\n---\n\n"
+                f"### 🤖 AI Investigative Analyst Synthesis (`{outcome.model}`)\n{outcome.text.strip()}\n\n---\n\n"
+                + base_report["markdown_brief"]
+            )
+        elif outcome.attempts:
+            failed = "; ".join(a.describe() for a in outcome.attempts)
+            base_report["markdown_brief"] = (
+                f"> **LLM synthesis unavailable** ({failed}). Showing the deterministic evidence brief only.\n\n"
                 + base_report["markdown_brief"]
             )
 

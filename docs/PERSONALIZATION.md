@@ -6,7 +6,7 @@ Bunnyhole adapts to *how you investigate*. Three pieces work together, all keyle
 2. **A remembered profile** — your persona, watchlist, jurisdictions and defaults, persisted across cases.
 3. **OpenSanctions sanctions/PEP screening** — a new data source wired into every corporate/person lead.
 
-Everything lives in `~/.bunnyhole/profile.json` (the same secured config dir as your keys and case DB). Nothing is uploaded anywhere.
+Everything lives in `~/.bunnyhole/profile.json` (the same secured config dir as your keys and case DB; `$BUNNYHOLE_HOME` relocates it). Nothing is uploaded anywhere.
 
 ---
 
@@ -25,6 +25,9 @@ uv run bunnyhole personas          # list them (● marks your active one)
 | `compliance` | KYC/AML DD: UBO, sanctions/PEP, adverse media | deep / d3 / b4 | ✔ |
 | `threat_intel` | Infra pivoting, breach exposure, attribution | fast / d2 / b6 | — |
 | `crypto_tracer` | On-chain fund-flow tracing, bridges, off-ramps | deep / d3 / b5 | ✔ |
+| `pi` | Private-investigator method on the lawful, passive layer (auto-selected by `--pi`, see [PI_STREAM.md](PI_STREAM.md)) | deep / d3 / b4 | ✔ |
+
+`--persona` is case-insensitive (`--persona Compliance` works); an unknown key is rejected (exit 2) with the six valid keys.
 
 When a persona emphasizes sanctions, OpenSanctions screening also runs on domain-derived company stems, not just explicit company/person leads.
 
@@ -42,7 +45,7 @@ uv run bunnyhole profile --persona compliance --watch acme.io --watch 0xDEADBEEF
 # Standing scope: jurisdictions of interest + exclusions folded into every case
 uv run bunnyhole profile --jurisdiction KY --jurisdiction VG --exclude unrelated.com
 
-# Override a persona's run defaults (these win over the persona)
+# Override a persona's run defaults (these win over the persona; depth 1-4, breadth 2-8)
 uv run bunnyhole profile --gear deep --depth 4
 
 # Tidy up
@@ -70,8 +73,10 @@ A new FollowTheMoney-native data source screens names/entities against the **con
 
 - **Self-hosted [yente](https://www.opensanctions.org/docs/self-hosted/)** — fully keyless. Point Bunnyhole at it:
   ```bash
-  export OPENSANCTIONS_API_URL="http://localhost:8000"
+  export OPENSANCTIONS_API_URL="http://localhost:9000"
+  # or store it in the vault: uv run bunnyhole keys --set OPENSANCTIONS_API_URL=http://localhost:9000
   ```
+  (yente defaults to port 8000, which is also `bunnyhole serve`'s default: run one of them on another port.)
 - **Hosted free tier** — set a key (stored in your vault via `bunnyhole keys`):
   ```bash
   uv run bunnyhole keys --set OPENSANCTIONS_API_KEY=xxxx

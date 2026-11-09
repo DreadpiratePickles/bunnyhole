@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextvars
 import logging
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 from bunnyhole.engine import netutil
@@ -168,7 +168,7 @@ class PIRunRecorder:
     def _record(self, source: str, target: str, status: str, detail: str) -> None:
         self.entries.append(
             SourceLogEntry(
-                source=source, target=target, status=status, detail=detail, at_utc=_now_utc()  # type: ignore[arg-type]
+                source=source, target=target, status=status, detail=detail, at_utc=_now_utc()
             )
         )
 
@@ -229,7 +229,7 @@ class PIRunRecorder:
         self._record(source, target, status, detail)
 
 
-def make_holehe_blocker(recorder: PIRunRecorder) -> Callable[[str, str, int], Awaitable[None]]:
+def make_holehe_blocker(recorder: PIRunRecorder) -> Callable[[str, str, int], Coroutine[Any, Any, None]]:
     """Replacement for ``OSINTAgent._run_local_arsenal_holehe`` in passive-only PI mode.
 
     Holehe probes sites' account-recovery and sign-up flows with the target's email address. That is

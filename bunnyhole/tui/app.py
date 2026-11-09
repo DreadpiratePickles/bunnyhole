@@ -8,12 +8,15 @@ is relayed into the UI as thread-safe messages so the log and stats update in re
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
+from rich.console import RenderableType
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import (
     Button,
@@ -34,6 +37,9 @@ from bunnyhole.engine.models import GearMode
 from bunnyhole.engine.orchestrator import BunnyholeOrchestrator, classify_seed_type
 
 PRESETS = ["vitalik.eth", "uniswap.org", "N628TS", "ethereum.org"]
+MAX_INPUT_CHARS = 20000  # same cap as the API's raw intake text
+_MAX_CELL_CHARS = 200  # entity-table cells; the Node pane shows the full label
+_WEB_SCHEMES = ("http", "https")
 
 _LEVEL_STYLE = {
     "discovery": "bold cyan",
@@ -72,6 +78,34 @@ class RunFailed(Message):
     def __init__(self, error: str) -> None:
         self.error = error
         super().__init__()
+
+
+class ArsenalLoaded(Message):
+    """Carries the rendered arsenal panel from the loader thread to the app thread."""
+
+    def __init__(self, renderable: RenderableType) -> None:
+        self.renderable = renderable
+        super().__init__()
+
+
+def _plain(value: Any, limit: Optional[int] = None) -> Text:
+    """Untrusted value -> literal Text (never parsed as markup), optionally truncated."""
+    text = "" if value is None else str(value)
+    if limit is not None and len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return Text(text)
+
+
+def _unsubscribe(graph: Any, callback: Callable[[Dict[str, Any]], None]) -> None:
+    """Detach a telemetry callback from an investigation graph (graph.py has no unsubscribe API)."""
+    remover = getattr(graph, "unsubscribe", None)
+    if callable(remover):
+        remover(callback)
+        return
+    listeners = getattr(graph, "_event_listeners", None)
+    if isinstance(listeners, list):
+        while callback in listeners:
+            listeners.remove(callback)
 
 
 class BunnyholeTUI(App):
@@ -115,7 +149,9 @@ class BunnyholeTUI(App):
         self._result: Dict[str, Any] = {}
         self._nodes_by_id: Dict[str, Dict[str, Any]] = {}
         self._orchestrator: Optional[BunnyholeOrchestrator] = None
-        self._running = False
+        # NOT ``_running``: that name is Textual's own MessagePump state (True while the app runs), so reusing it
+        # blocked every Run ("already running") and flipping it to False corrupted the message pump.
+        self._investigation_running = False
 
     # ---- layout -------------------------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -124,9 +160,10 @@ class BunnyholeTUI(App):
             with Vertical(id="sidebar"):
                 yield Label("ASK  (plain language)")
                 yield Input(
-                    value=self._initial_seed,
+                    value=self._initial_seed[:MAX_INPUT_CHARS],
                     placeholder="e.g. dig deep into acme.io, same operator as its token?",
                     id="seed",
+                    max_length=MAX_INPUT_CHARS,
                 )
                 yield Static(
                     "Type a seed or a whole question — I parse the selectors and read "
@@ -163,20 +200,21 @@ class BunnyholeTUI(App):
                 with TabPane("Links", id="tab-links"):
                     yield Static("Run an investigation to map interconnections.", id="linksbody")
                 with TabPane("Council", id="tab-council"):
-                    yield Markdown("", id="councilbody")
+                    yield Markdown("", id="councilbody", open_links=False)
                 with TabPane("ACH", id="tab-ach"):
                     yield Static("", id="achbody")
                 with TabPane("Dossier", id="tab-dossier"):
-                    yield Markdown("", id="dossierbody")
+                    yield Markdown("", id="dossierbody", open_links=False)
                 with TabPane("Arsenal", id="tab-arsenal"):
                     yield Static("Loading…", id="arsenalbody")
         yield Static("TIMELINE  —  run an investigation to build the chronology", id="timeline")
-        log: RichLog = RichLog(id="log", highlight=False, markup=True, wrap=False, max_lines=2000)
+        # markup=False: every line is a Text; a stray string can never be parsed as markup.
+        log: RichLog = RichLog(id="log", highlight=False, markup=False, wrap=False, max_lines=2000)
         yield log
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#log", RichLog).write("[dim]Ready. Enter a seed and press Run (or Enter).[/dim]")
+        self.query_one("#log", RichLog).write(Text("Ready. Enter a seed and press Run (or Enter).", style="dim"))
         self._load_arsenal()
         if self._initial_seed:
             self.query_one("#seed", Input).cursor_position = len(self._initial_seed)
@@ -211,6 +249,19 @@ class BunnyholeTUI(App):
     def _on_seed_submit(self) -> None:
         self._start_run()
 
+    def on_markdown_link_clicked(self, event: Markdown.LinkClicked) -> None:
+        """Dossier/council links come from untrusted pages: open only http(s), never file:// or apps."""
+        event.stop()
+        href = (event.href or "").strip()
+        try:
+            scheme = urlsplit(href).scheme.lower()
+        except ValueError:
+            scheme = ""
+        if scheme in _WEB_SCHEMES:
+            self.open_url(href)
+        else:
+            self.notify(f"Not opening non-web link: {href[:120]}", severity="warning", markup=False)
+
     @on(DataTable.RowHighlighted, "#entities")
     def _on_row(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key is None:
@@ -228,28 +279,36 @@ class BunnyholeTUI(App):
         bare seed still honors the dropdowns while "go deep" / "3 hops" always win.
         """
         log = self.query_one("#log", RichLog)
-        cmd: InterpretedCommand = interpret_command(text)
-        self.query_one("#understood", Static).update(cmd.understanding)
+        try:
+            cmd: InterpretedCommand = interpret_command(text)
+        except Exception as exc:  # a parser bug must not take the whole TUI down
+            detail = f"Could not parse that request: {type(exc).__name__}: {exc}"
+            log.write(Text(f"✖ {detail}", style="bold red"))
+            self.notify(detail, severity="error", title="Parse error", markup=False)
+            return None
+        self.query_one("#understood", Static).update(_plain(cmd.understanding))
         if not cmd.is_actionable:
-            log.write(f"[yellow]… {cmd.understanding}[/yellow]")
-            self.notify(cmd.understanding, severity="warning", title="Nothing to investigate")
+            log.write(Text(f"… {cmd.understanding}", style="yellow"))
+            self.notify(cmd.understanding, severity="warning", title="Nothing to investigate", markup=False)
             return None
 
         gear = cmd.packet.gear if cmd.gear_from_language else GearMode(self.query_one("#gear", Select).value)
-        depth = cmd.packet.depth if cmd.depth_from_language else int(self.query_one("#depth", Select).value)
+        depth_choice = self.query_one("#depth", Select).value
+        # the select is allow_blank=False with int options; anything else falls back to the parsed packet depth
+        depth = cmd.packet.depth if cmd.depth_from_language or not isinstance(depth_choice, int) else depth_choice
         breadth = cmd.packet.breadth
         # reflect the resolved profile back into the controls + packet
         self.query_one("#gear", Select).value = gear.value
         self.query_one("#depth", Select).value = depth
         cmd.packet.gear, cmd.packet.depth, cmd.packet.breadth = gear, depth, breadth
 
-        log.write(f"[bold cyan]▶[/bold cyan] {cmd.understanding}")
+        log.write(Text.assemble(("▶ ", "bold cyan"), str(cmd.understanding)))
         for note in cmd.notes:
-            log.write(f"   [dim]· {note}[/dim]")
+            log.write(Text(f"   · {note}", style="dim"))
         return cmd.packet, gear, depth, breadth
 
     def _start_run(self) -> None:
-        if self._running:
+        if self._investigation_running:
             self.notify("An investigation is already running.", severity="warning")
             return
         text = self.query_one("#seed", Input).value.strip()
@@ -262,7 +321,7 @@ class BunnyholeTUI(App):
             self.query_one("#seed", Input).focus()
             return
         packet, gear, depth, breadth = resolved
-        self._running = True
+        self._investigation_running = True
         self.query_one("#statsbar", Static).update(self._stats_text(status="running"))
         self._run_worker(packet, gear, depth, breadth)
 
@@ -307,29 +366,29 @@ class BunnyholeTUI(App):
         self.query_one("#log", RichLog).write(line)
 
     def on_run_finished(self, message: RunFinished) -> None:
-        self._running = False
+        self._investigation_running = False
         self._result = message.result
         self._orchestrator = message.orchestrator
         self._populate(message.result)
-        self.query_one("#log", RichLog).write("[bold green]✔ Investigation complete.[/bold green]")
+        self.query_one("#log", RichLog).write(Text("✔ Investigation complete.", style="bold green"))
 
     def on_run_failed(self, message: RunFailed) -> None:
-        self._running = False
+        self._investigation_running = False
         self.query_one("#statsbar", Static).update(self._stats_text(status="error"))
-        self.query_one("#log", RichLog).write(f"[bold red]✖ {message.error}[/bold red]")
-        self.notify(message.error, severity="error", title="Investigation failed")
+        self.query_one("#log", RichLog).write(Text(f"✖ {message.error}", style="bold red"))
+        self.notify(message.error, severity="error", title="Investigation failed", markup=False)
 
     # ---- rendering ----------------------------------------------------------------------------
-    def _stats_text(self, status: str = "idle") -> str:
-        stats = (self._result or {}).get("stats", {})
-        badge = {"idle": "[dim]idle[/dim]", "running": "[bold yellow]running…[/bold yellow]",
-                 "error": "[bold red]error[/bold red]", "done": "[bold green]done[/bold green]"}.get(status, status)
-        return (
-            f"[b magenta]BUNNYHOLE[/b magenta]  {badge}   "
-            f"nodes [b green]{stats.get('total_nodes', 0)}[/b green]  "
-            f"edges [b green]{stats.get('total_edges', 0)}[/b green]  "
-            f"receipts [b green]{stats.get('total_receipts', 0)}[/b green]  "
-            f"brokers [b #f0997b]{stats.get('cutout_brokers', 0)}[/b #f0997b]"
+    def _stats_text(self, status: str = "idle") -> Text:
+        stats = (self._result or {}).get("stats", {}) or {}
+        badge = {"idle": ("idle", "dim"), "running": ("running…", "bold yellow"),
+                 "error": ("error", "bold red"), "done": ("done", "bold green")}.get(status, (status, "default"))
+        return Text.assemble(
+            ("BUNNYHOLE", "bold magenta"), "  ", badge, "   ",
+            "nodes ", (str(stats.get("total_nodes", 0)), "bold green"), "  ",
+            "edges ", (str(stats.get("total_edges", 0)), "bold green"), "  ",
+            "receipts ", (str(stats.get("total_receipts", 0)), "bold green"), "  ",
+            "brokers ", (str(stats.get("cutout_brokers", 0)), "bold #f0997b"),
         )
 
     def _populate(self, result: Dict[str, Any]) -> None:
@@ -338,12 +397,20 @@ class BunnyholeTUI(App):
         table = self.query_one("#entities", DataTable)
         table.clear()
         for n in sorted(nodes, key=lambda x: (x.get("is_cutout_broker", False), x.get("smoke_score", 0)), reverse=True):
-            flags = ", ".join(n.get("risk_flags", [])[:2]) or "—"
+            # Every cell is literal Text: a label like "[/x]" would otherwise be parsed as markup and crash.
+            flags = ", ".join(str(f) for f in n.get("risk_flags", [])[:2]) or "—"
             smoke = f"{n.get('smoke_score', 0):.0f}"
-            label = n.get("label", n["id"])
+            label = str(n.get("label", n["id"]))
             if n.get("is_cutout_broker"):
                 label = f"◆ {label}"
-            table.add_row(label, n.get("entity_type", ""), n.get("domain", ""), smoke, flags, key=n["id"])
+            table.add_row(
+                _plain(label, _MAX_CELL_CHARS),
+                _plain(n.get("entity_type", ""), _MAX_CELL_CHARS),
+                _plain(n.get("domain", ""), _MAX_CELL_CHARS),
+                _plain(smoke),
+                _plain(flags, _MAX_CELL_CHARS),
+                key=n["id"],
+            )
 
         self.query_one("#statsbar", Static).update(self._stats_text(status="done"))
         self._render_links(result.get("interconnections", {}))
@@ -381,14 +448,15 @@ class BunnyholeTUI(App):
         t.append("KEYSTONE / CUT-OUT BROKERS\n", style="bold yellow")
         for k in keystones[:5]:
             t.append(f"  ◆ {k.get('label', '')} ", style="yellow")
-            t.append(f"bridges {', '.join(k.get('domains_bridged', []))} (CB {k.get('betweenness_centrality', 0)})\n", style="dim")
+            bridged = ", ".join(str(d) for d in k.get("domains_bridged", []))
+            t.append(f"bridges {bridged} (CB {k.get('betweenness_centrality', 0)})\n", style="dim")
         if not keystones:
             t.append("  none detected\n", style="dim")
         paths = inter.get("targeted_paths") or inter.get("cross_domain_paths", [])
         t.append("\nCROSS-DOMAIN PATHS\n", style="bold cyan")
         for p in paths[:5]:
             t.append(f"  {p.get('hop_count', '?')}-hop ", style="cyan")
-            t.append(" → ".join(p.get("step_labels", [])[:5]) + "\n", style="default")
+            t.append(" → ".join(str(x) for x in p.get("step_labels", [])[:5]) + "\n", style="default")
         preds = inter.get("predicted_missing_links", [])
         if preds:
             t.append("\nPREDICTED (Adamic-Adar)\n", style="bold magenta")
@@ -414,13 +482,17 @@ class BunnyholeTUI(App):
 
     def _render_timeline(self, items: List[Dict[str, Any]]) -> None:
         if not items:
-            self.query_one("#timeline", Static).update("TIMELINE  —  no dated events")
+            self.query_one("#timeline", Static).update(Text("TIMELINE  —  no dated events"))
             return
-        parts = []
-        for it in items[:8]:
-            flag = " ⚠" if it.get("anomaly_flag") else ""
-            parts.append(f"[cyan]{str(it.get('timestamp', ''))[:10]}[/cyan] {it.get('title', '')[:22]}{flag}")
-        self.query_one("#timeline", Static).update("TIMELINE  " + "   ".join(parts))
+        line = Text("TIMELINE  ")
+        for idx, it in enumerate(items[:8]):
+            if idx:
+                line.append("   ")
+            line.append(str(it.get("timestamp", ""))[:10], style="cyan")
+            line.append(" " + str(it.get("title", ""))[:22])
+            if it.get("anomaly_flag"):
+                line.append(" ⚠")
+        self.query_one("#timeline", Static).update(line)
 
     def _pivot_selected(self) -> None:
         if not self._orchestrator:
@@ -433,11 +505,11 @@ class BunnyholeTUI(App):
             self.notify("Highlight an entity to pivot.", severity="warning")
             return
         node = self._nodes_by_id.get(str(row_key.value))
-        if not node or self._running:
+        if not node or self._investigation_running:
             return
         seed = node.get("attributes", {}).get("raw_seed") or str(node.get("label", "")).lstrip("🎯🔐🌐👤🖥️ ").strip()
-        self.query_one("#log", RichLog).write(f"[bold cyan]⚡ Pivot[/bold cyan] on [bold]{seed}[/bold]")
-        self._running = True
+        self.query_one("#log", RichLog).write(Text.assemble(("⚡ Pivot", "bold cyan"), " on ", (seed, "bold")))
+        self._investigation_running = True
         self._pivot_worker(node["id"], seed, int(node.get("hop_depth", 1)) + 1)
 
     @work(exclusive=False)
@@ -445,9 +517,12 @@ class BunnyholeTUI(App):
         def callback(evt: Dict[str, Any]) -> None:
             self.post_message(EngineEvent(evt))
 
+        orch = self._orchestrator
+        if orch is None:
+            self.post_message(RunFailed("No investigation to pivot from."))
+            return
+        orch.graph.subscribe(callback)
         try:
-            orch = self._orchestrator
-            orch.graph.subscribe(callback)
             ltype, _, _ = classify_seed_type(seed)
             await orch._execute_lead(ltype, seed, node_id, hop_depth=hop)
             orch._harvest_step_learnings_and_followups(current_hop=hop)
@@ -457,9 +532,13 @@ class BunnyholeTUI(App):
             self.post_message(RunFinished(result, orch))
         except Exception as exc:
             self.post_message(RunFailed(f"{type(exc).__name__}: {exc}"))
+        finally:
+            _unsubscribe(orch.graph, callback)  # one subscriber per pivot would otherwise leak forever
 
     @work(exclusive=False, thread=True)
     def _load_arsenal(self) -> None:
+        # Runs in a worker thread: never query widgets here. post_message is thread-safe, never blocks, and is a
+        # no-op once the app has shut down; the app thread does the query (and tolerates a torn-down screen).
         try:
             from bunnyhole.arsenal.manager import ArsenalManager
 
@@ -467,22 +546,29 @@ class BunnyholeTUI(App):
             tools = mgr.check_arsenal_status()
             keys = mgr.get_api_keys_status()
         except Exception as exc:
-            self.call_from_thread(self.query_one("#arsenalbody", Static).update, f"Arsenal unavailable: {exc}")
+            self.post_message(ArsenalLoaded(Text(f"Arsenal unavailable: {type(exc).__name__}: {exc}")))
             return
         t = Text()
-        installed = sum(1 for x in tools if x["installed"])
+        installed = sum(1 for x in tools if x.get("installed"))
         t.append(f"TOOLS ({installed}/{len(tools)} installed)\n", style="bold cyan")
         for tool in tools:
-            mark = "✔" if tool["installed"] else "○"
-            style = "green" if tool["installed"] else "dim"
-            t.append(f"  {mark} {tool['name']}\n", style=style)
-        configured = sum(1 for k in keys if k["configured"])
+            mark = "✔" if tool.get("installed") else "○"
+            style = "green" if tool.get("installed") else "dim"
+            t.append(f"  {mark} {tool.get('name', '?')}\n", style=style)
+        configured = sum(1 for k in keys if k.get("configured"))
         t.append(f"\nAPI KEYS ({configured}/{len(keys)} set)\n", style="bold yellow")
         for k in keys:
-            mark = "●" if k["configured"] else "○"
-            style = "green" if k["configured"] else "dim"
-            t.append(f"  {mark} {k['key']}\n", style=style)
-        self.call_from_thread(self.query_one("#arsenalbody", Static).update, t)
+            mark = "●" if k.get("configured") else "○"
+            style = "green" if k.get("configured") else "dim"
+            t.append(f"  {mark} {k.get('key', '?')}\n", style=style)
+        self.post_message(ArsenalLoaded(t))
+
+    def on_arsenal_loaded(self, message: ArsenalLoaded) -> None:
+        try:
+            body = self.query_one("#arsenalbody", Static)
+        except NoMatches:
+            return  # the Arsenal pane is gone (screen torn down mid-load): nothing to update
+        body.update(message.renderable)
 
 
 def launch(seed: Optional[str] = None) -> None:

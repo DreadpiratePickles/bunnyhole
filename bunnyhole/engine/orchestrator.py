@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import re
 import uuid
@@ -16,6 +17,7 @@ from bunnyhole.agents.osint import OSINTAgent
 from bunnyhole.agents.pi_sources import PISourcesAgent
 from bunnyhole.engine.council import InvestigativeCouncil
 from bunnyhole.engine.graph import InvestigationGraph
+from bunnyhole.engine.ids import canonical_wallet_id
 from bunnyhole.engine.intake import AnchorMode, CaseIntakePacket, SmartIntakeParser
 from bunnyhole.engine.models import (
     ConfidenceTier,
@@ -44,8 +46,105 @@ from bunnyhole.engine.pi_runtime import (
     with_objective,
 )
 from bunnyhole.engine.profile import InvestigatorProfile, load_profile, match_watchlist
-from bunnyhole.engine.storage import CaseStore
+from bunnyhole.engine.storage import build_case_store
 from bunnyhole.engine.synthesizer import InvestigativeSynthesizer
+
+# Compact IANA TLD allowlist: ISO 3166-1 alpha-2 ccTLDs + the common generic TLDs that
+# actually appear in investigative data. A label is accepted as a domain only when its final
+# label is one of these (or a punycode `xn--` label). This keeps 'node.js' and 'john.smith'
+# out of the domain bucket ('js'/'smith' are not real TLDs) with a documented, compact trade-off:
+# a genuine but obscure new-gTLD not in this set is read as a general term, not a domain.
+_CCTLDS = (
+    "ac ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bw by bz "
+    "ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg er es et eu fi fj fk "
+    "fm fo fr ga gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir "
+    "is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mg mh mk "
+    "ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl "
+    "pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sk sl sm sn so sr ss st sv sx sy sz tc td "
+    "tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw"
+)
+_GTLDS = (
+    "com org net int edu gov mil info biz name pro xyz app dev io ai co me tv cc online site tech store blog "
+    "shop live cloud digital network media news agency ventures capital finance fund group global world "
+    "foundation llc ltd inc gmbh crypto eth finance exchange wtf gg sh "
+)
+_IANA_TLDS = frozenset((_CCTLDS + " " + _GTLDS).split())
+
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+$")
+#: A handle is letter-led and carries at least one of _ . - or a digit, so plain words ('note',
+#: 'admin') are not mistaken for credential identifiers.
+_HANDLE_RE = re.compile(r"^@?[A-Za-z][A-Za-z0-9_.-]{2,29}$")
+_BASE58_CHARS = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+_AIRCRAFT_RE = re.compile(r"^N[1-9][0-9A-HJ-NP-Z]{0,4}$")
+
+
+def _is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_handle_like(ident: str) -> bool:
+    return bool(_HANDLE_RE.match(ident)) and (
+        ident.startswith("@") or any(c.isdigit() or c in "_.-" for c in ident)
+    )
+
+
+def _is_credential(s: str) -> bool:
+    """A credential is ``identifier:secret`` where identifier is a real email or handle and the
+    secret is a single non-space, non-trivial token (not a label, port, or ``host:8080``)."""
+    if "://" in s or ":" not in s:
+        return False
+    ident, secret = s.split(":", 1)
+    ident = ident.strip()
+    if not secret or any(ch.isspace() for ch in secret):
+        return False
+    if not (_EMAIL_RE.match(ident) or _is_handle_like(ident)):
+        return False
+    return len(secret) >= 4 and not secret.isdigit()
+
+
+def _is_bitcoin_address(s: str) -> bool:
+    """Real Bitcoin address: bech32 (``bc1``) or base58 (26-35 chars, valid charset, has a letter)."""
+    low = s.lower()
+    if low.startswith("bc1"):
+        return 14 <= len(s) <= 90 and all(c in "qpzry9x8gf2tvdw0s3jn54khce6mua7l" for c in low[3:])
+    if s[:1] in ("1", "3"):
+        return 26 <= len(s) <= 35 and all(c in _BASE58_CHARS for c in s) and any(c.isalpha() for c in s)
+    return False
+
+
+def _is_aircraft_tail(s: str) -> bool:
+    """FAA N-number: reject bare ``N`` + two digits ('N26') that collide with brand names; a real
+    tail either carries a letter in its suffix or is at least 4 characters long."""
+    u = s.upper()
+    if not _AIRCRAFT_RE.match(u):
+        return False
+    suffix = u[1:]
+    return len(u) >= 4 or any(c.isalpha() for c in suffix)
+
+
+def mask_credential(value: str) -> str:
+    """Return a display-safe form of a credential seed: the identifier kept, the secret masked.
+
+    ``ceo@acme.com:hunter2`` -> ``ceo@acme.com:****``. A value without a secret is fully masked.
+    """
+    v = (value or "").strip()
+    if ":" in v:
+        ident, _secret = v.split(":", 1)
+        if ident:
+            return f"{ident}:****"
+    return "****"
+
+
+def _valid_public_suffix(host: str) -> bool:
+    labels = host.split(".")
+    if len(labels) < 2:
+        return False
+    tld = labels[-1].lower()
+    return tld in _IANA_TLDS or tld.startswith("xn--")
 
 
 def classify_seed_type(seed: str) -> Tuple[str, EntityType, DomainCategory]:
@@ -53,26 +152,37 @@ def classify_seed_type(seed: str) -> Tuple[str, EntityType, DomainCategory]:
     s = seed.strip()
     if s.lower().endswith((".pdf", ".docx")):
         return ("document", EntityType.DOCUMENT, DomainCategory.JOURNALISM)
-    if ":" in s and not s.startswith(("http://", "https://")) and ("@" in s.split(":", 1)[0] or len(s.split(":", 1)[1]) >= 6):
+    # IP (v4 or v6) before credential, so IPv6 literals like '2001:db8::1' are not read as creds.
+    if _is_ip_address(s):
+        return ("ip", EntityType.IP_HOST, DomainCategory.OSINT)
+    if _is_credential(s):
         return ("credential", EntityType.TRACKER_ID, DomainCategory.OSINT)
     if re.match(r"^0x[a-fA-F0-9]{40}$", s) or s.lower().endswith(".eth"):
         return ("wallet", EntityType.CRYPTO_WALLET, DomainCategory.ONCHAIN)
-    if re.match(r"^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,59}$", s):
+    if _is_bitcoin_address(s):
         return ("bitcoin", EntityType.CRYPTO_WALLET, DomainCategory.ONCHAIN)
-    if re.match(r"^N[1-9][0-9A-HJ-NP-Z]{0,4}$", s.upper()) and len(s) <= 6 and any(c.isdigit() for c in s):
+    if _is_aircraft_tail(s):
         return ("aircraft", EntityType.AIRCRAFT, DomainCategory.PHYSICAL)
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", s):
-        return ("ip", EntityType.IP_HOST, DomainCategory.OSINT)
     digits_only = re.sub(r"\D", "", s)
-    if (s.startswith("+") or re.match(r"^[\d\s().+-]{10,18}$", s)) and 10 <= len(digits_only) <= 15:
+    if (
+        (s.startswith("+") or re.match(r"^[\d\s().+-]{10,18}$", s))
+        and 10 <= len(digits_only) <= 15
+        and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", s)  # a dotted-quad (e.g. invalid IP) is not a phone
+    ):
         return ("phone", EntityType.PHONE, DomainCategory.OSINT)
-    if "@" in s and "." in s.split("@")[-1] and not s.startswith("@"):
+    if "@" in s and "." in s.split("@")[-1] and not s.startswith("@") and _EMAIL_RE.match(s):
         return ("email", EntityType.EMAIL, DomainCategory.OSINT)
     if s.startswith(("http://", "https://")):
+        host = s.split("//", 1)[1].split("/")[0].split(":")[0]
+        if _valid_public_suffix(host):
+            return ("domain", EntityType.DOMAIN, DomainCategory.OSINT)
+    if " " not in s and re.match(r"^[a-zA-Z0-9.-]+$", s) and _valid_public_suffix(s):
         return ("domain", EntityType.DOMAIN, DomainCategory.OSINT)
-    if re.match(r"^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$", s) and " " not in s:
-        return ("domain", EntityType.DOMAIN, DomainCategory.OSINT)
-    if s.startswith("@") or (re.match(r"^[a-zA-Z0-9_.-]{3,30}$", s) and any(c.isdigit() or c in "_-" for c in s)):
+    if s.startswith("@") or (
+        re.match(r"^[a-zA-Z0-9_.-]{3,30}$", s)
+        and not re.match(r"^[\d.]+$", s)
+        and any(c.isdigit() or c in "_-" for c in s)
+    ):
         return ("username", EntityType.ACCOUNT, DomainCategory.OSINT)
     return ("company", EntityType.ORGANIZATION, DomainCategory.FIAT)
 
@@ -108,6 +218,10 @@ class BunnyholeOrchestrator:
         # PI mode never uses credential/breach contents: drop them before ANY run logic can see them.
         self._pi_redactions: List[str] = []
         self._pi_credentials_dropped = 0
+        # Non-PI runs: the plaintext secret of any `email:secret` seed is kept ONLY here, in memory,
+        # for the credential-combo agent. It is masked in every receipt/label and scrubbed from the
+        # compiled result and persisted case (see mask_credential / _scrub_result_credentials).
+        self._credential_secrets: List[str] = []
         if engagement is not None:
             self.seed_query, seed_tokens = scrub_credential_text(self.seed_query)
             self._pi_redactions += seed_tokens
@@ -142,7 +256,10 @@ class BunnyholeOrchestrator:
         self.osint = OSINTAgent(self.graph, gear=self.gear)
         self.onchain = OnChainAgent(self.graph, gear=self.gear)
         self.link_sleuth = LinkSleuthAgent(self.graph, gear=self.gear)
-        self.case_store = CaseStore()
+        # Persistence is optional: a corrupt or read-only case DB must not break an investigation.
+        # build_case_store recovers (move-aside) or returns a no-op store carrying the reason.
+        self.case_store: Any = build_case_store()
+        self._persist_error: Optional[str] = getattr(self.case_store, "persist_error", None)
         self.synthesizer = InvestigativeSynthesizer(self.graph)
         self.council = InvestigativeCouncil(self.graph)
 
@@ -158,6 +275,9 @@ class BunnyholeOrchestrator:
         self.profile: InvestigatorProfile = profile if profile is not None else load_profile()
         self._emphasize_sanctions: bool = self.profile.persona_profile().emphasize_sanctions
         self._sem = asyncio.Semaphore(5)
+        # Count of agent-task exceptions swallowed by a gather (non-PI). PI mode records its own via
+        # PIRunRecorder, whose wrapper never re-raises, so this stays 0 there (no double counting).
+        self._agent_errors: int = 0
 
         # PI stream (optional). With no engagement none of this exists and behaviour is unchanged.
         self.engagement: Optional[PIEngagement] = with_objective(engagement) if engagement is not None else None
@@ -184,7 +304,9 @@ class BunnyholeOrchestrator:
                 setattr(self.osint, method, make_breach_blocker(self.pi_recorder, source, target_arg=target_arg))
             if self.engagement.passive_only:
                 # Holehe probes account-recovery flows with the target's email: not passive, so blocked and logged.
-                self.osint._run_local_arsenal_holehe = make_holehe_blocker(self.pi_recorder)  # type: ignore[method-assign]
+                # Shadowed on the instance like the breach blockers above (setattr: mypy rejects assigning a plain
+                # function to a method attribute; the blocker's signature mirrors _run_local_arsenal_holehe).
+                setattr(self.osint, "_run_local_arsenal_holehe", make_holehe_blocker(self.pi_recorder))  # noqa: B010
 
     def _pi_note_dropped_credentials(self, dropped: int) -> None:
         """Keep exactly ONE source-log entry for dropped credentials (the value is never echoed)."""
@@ -244,8 +366,22 @@ class BunnyholeOrchestrator:
         clean_val = seed_str.strip()
         if lead_type == "domain":
             clean_val = clean_val.replace("https://", "").replace("http://", "").split("/")[0].lower()
-        masked_lbl = clean_val.split(":", 1)[0] + ":***" if lead_type == "credential" and ":" in clean_val else clean_val
-        node_id = f"{lead_type}:{masked_lbl.lower().replace(' ', '_')[:48]}"
+        if lead_type == "credential" and ":" in clean_val:
+            masked_lbl = clean_val.split(":", 1)[0] + ":***"
+            # Keep the plaintext secret in memory (only) for the credential-combo agent, and record it
+            # for the result/persistence scrub. The engagement==None guard keeps PI mode untouched.
+            if self.engagement is None:
+                self._credential_secrets.append(clean_val)
+                secret = clean_val.split(":", 1)[1].strip()
+                if len(secret) >= 6:
+                    self._credential_secrets.append(secret)
+        else:
+            masked_lbl = clean_val
+        if lead_type in ("wallet", "bitcoin") and clean_val:
+            # the one id the on-chain agent also uses for this wallet (engine/ids.py), so its findings land here
+            node_id = canonical_wallet_id("btc" if lead_type == "bitcoin" else "eth", clean_val)
+        else:
+            node_id = f"{lead_type}:{masked_lbl.lower().replace(' ', '_')[:48]}"
         rcpt = EvidenceReceipt(
             tool="bunnyhole_case_director",
             domain=dom_cat,
@@ -295,7 +431,7 @@ class BunnyholeOrchestrator:
             elif lead_type == "wallet":
                 tasks.append(pi("onchain_evm", value, self.onchain.investigate_evm_address(value, origin_node_id, hop_depth)))
                 if value.lower().endswith(".eth"):
-                    stem = value.lower().replace(".eth", "")
+                    stem = value.lower().removesuffix(".eth")
                     if len(stem) >= 3:
                         tasks.append(pi("osint_identity", stem, self.osint.investigate_identity_and_handle(stem, origin_node_id, hop_depth)))
 
@@ -369,7 +505,30 @@ class BunnyholeOrchestrator:
                     tasks.append(pi("wikidata", value, self.pi_sources.investigate_wikidata_entity(value, origin_node_id, hop_depth)))
 
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await self._gather_logged(tasks, f"lead:{lead_type}")
+
+    async def _gather_logged(self, tasks: List[Any], stage: str) -> List[Any]:
+        """Await gathered agent tasks, turning every swallowed exception into a logged agent event and
+        a count in ``deep_research.agent_errors`` — so a bug in one agent is visible, not silent.
+
+        Behaviour is otherwise identical to ``gather(..., return_exceptions=True)``: results (and the
+        exception objects) are returned in order. In PI mode the PIRunRecorder wrapper catches inside
+        each task and returns None, so no exception reaches here and nothing is double counted.
+        """
+        if not tasks:
+            return []
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, BaseException):
+                self._agent_errors += 1
+                self.graph.log(
+                    DomainCategory.SKEPTIC,
+                    "AGENT_TASK_ERROR",
+                    stage,
+                    f"{type(res).__name__}: {res}",  # type + message only; agents never put secrets here
+                    level="warning",
+                )
+        return results
 
     def _harvest_step_learnings_and_followups(self, current_hop: int) -> None:
         """
@@ -398,7 +557,11 @@ class BunnyholeOrchestrator:
         """
         packet = self._pi_strip_credentials(packet)  # PI mode: before the parser or any lead can see a secret
         norm = self._pi_strip_credentials(SmartIntakeParser.normalize_packet(packet))
-        self.intake_packet = norm.model_dump()
+        packet_dump = norm.model_dump()
+        # Never persist or return raw credentials. PI mode already emptied them; non-PI masks the secret.
+        if packet_dump.get("credentials"):
+            packet_dump["credentials"] = [mask_credential(c) for c in packet_dump["credentials"]]
+        self.intake_packet = packet_dump
         self.seed_query = norm.title
         self.graph.seed_query = norm.title
         if norm.hypothesis:
@@ -436,7 +599,7 @@ class BunnyholeOrchestrator:
                 selector_strength=SelectorStrength.STRONG,
                 source_url="intake://locked_target_profile",
                 extracted_fact=f"User-confirmed Target Profile bundling {len(seed_tuples)} known credentials/selectors",
-                raw_snippet=str([v for _, v in seed_tuples])[:300],
+                raw_snippet=str([mask_credential(v) if lt == "credential" else v for lt, v in seed_tuples])[:300],
             )
             locked_hub_node = self.graph.upsert_node(
                 GraphNode(
@@ -473,28 +636,31 @@ class BunnyholeOrchestrator:
                 )
 
         # Hop 1: Parallel expansion of all intake selectors
-        await asyncio.gather(
-            *[self._execute_lead(lt, v, n.id, hop_depth=1) for lt, v, n in root_nodes],
-            return_exceptions=True,
+        await self._gather_logged(
+            [self._execute_lead(lt, v, n.id, hop_depth=1) for lt, v, n in root_nodes],
+            "intake_hop1",
         )
         self._harvest_step_learnings_and_followups(current_hop=1)
 
         # If in CONVERGENCE mode with >= 2 root selectors, also run direct co-occurrence checks between top root pairs!
-        if norm.anchor_mode == AnchorMode.CONVERGENCE and len(root_nodes) >= 2:
+        # Credential roots are excluded from co-occurrence: their raw value is a secret and must never
+        # be built into an outbound search query (Google News / CourtListener).
+        co_roots = [rn for rn in root_nodes if rn[0] != "credential"]
+        if norm.anchor_mode == AnchorMode.CONVERGENCE and len(co_roots) >= 2:
             co_pairs = []
-            for i in range(min(3, len(root_nodes))):
-                for j in range(i + 1, min(4, len(root_nodes))):
+            for i in range(min(3, len(co_roots))):
+                for j in range(i + 1, min(4, len(co_roots))):
                     co_pairs.append(
                         self.link_sleuth.verify_interconnection_cooccurrence(
-                            root_nodes[i][1],
-                            root_nodes[i][2].id,
-                            root_nodes[j][1],
-                            root_nodes[j][2].id,
+                            co_roots[i][1],
+                            co_roots[i][2].id,
+                            co_roots[j][1],
+                            co_roots[j][2].id,
                             hop_depth=1,
                         )
                     )
             if co_pairs:
-                await asyncio.gather(*co_pairs, return_exceptions=True)
+                await self._gather_logged(co_pairs, "intake_cooccurrence")
 
         self.link_sleuth.break_dead_ends(current_hop=1)
 
@@ -511,12 +677,12 @@ class BunnyholeOrchestrator:
                 f"Chasing top {len(next_leads)} scored leads down the rabbit hole: {[l.seed_value for l in next_leads]}",
                 level="discovery",
             )
-            await asyncio.gather(
-                *[
+            await self._gather_logged(
+                [
                     self._execute_lead(l.lead_type, l.seed_value, l.origin_node_id, hop_depth=hop)
                     for l in next_leads
                 ],
-                return_exceptions=True,
+                f"intake_hop{hop}",
             )
             self._harvest_step_learnings_and_followups(current_hop=hop)
             self.link_sleuth.break_dead_ends(current_hop=hop)
@@ -573,12 +739,12 @@ class BunnyholeOrchestrator:
                 f"Chasing top {len(next_leads)} scored leads down the rabbit hole: {[l.seed_value for l in next_leads]}",
                 level="discovery",
             )
-            await asyncio.gather(
-                *[
+            await self._gather_logged(
+                [
                     self._execute_lead(l.lead_type, l.seed_value, l.origin_node_id, hop_depth=hop)
                     for l in next_leads
                 ],
-                return_exceptions=True,
+                f"hop{hop}",
             )
             self._harvest_step_learnings_and_followups(current_hop=hop)
             self.link_sleuth.break_dead_ends(current_hop=hop)
@@ -599,7 +765,7 @@ class BunnyholeOrchestrator:
                     )
                 )
         if co_tasks:
-            await asyncio.gather(*co_tasks, return_exceptions=True)
+            await self._gather_logged(co_tasks, "predicted_cooccurrence")
 
         return await self._finalize_and_persist_investigation()
 
@@ -620,19 +786,21 @@ class BunnyholeOrchestrator:
             level="discovery",
         )
 
-        await asyncio.gather(
-            self._execute_lead(type_a, entity_a, node_a.id, hop_depth=1),
-            self._execute_lead(type_b, entity_b, node_b.id, hop_depth=1),
-            self.link_sleuth.verify_interconnection_cooccurrence(entity_a, node_a.id, entity_b, node_b.id, hop_depth=1),
-            return_exceptions=True,
+        await self._gather_logged(
+            [
+                self._execute_lead(type_a, entity_a, node_a.id, hop_depth=1),
+                self._execute_lead(type_b, entity_b, node_b.id, hop_depth=1),
+                self.link_sleuth.verify_interconnection_cooccurrence(entity_a, node_a.id, entity_b, node_b.id, hop_depth=1),
+            ],
+            "bidirectional_hop1",
         )
 
         # Expand converged leads or top leads from both sides
         next_leads = self.graph.pop_next_leads(max_hop=2, batch_size=self.initial_breadth)
         if next_leads:
-            await asyncio.gather(
-                *[self._execute_lead(l.lead_type, l.seed_value, l.origin_node_id, hop_depth=2) for l in next_leads],
-                return_exceptions=True,
+            await self._gather_logged(
+                [self._execute_lead(l.lead_type, l.seed_value, l.origin_node_id, hop_depth=2) for l in next_leads],
+                "bidirectional_hop2",
             )
 
         self._harvest_step_learnings_and_followups(current_hop=2)
@@ -643,20 +811,73 @@ class BunnyholeOrchestrator:
         source_query: Optional[str] = None,
         target_query: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Correlate against SQLite Cross-Case Entity Memory, run Karpathy 3-Stage LLM Council + Synthesis, and save case to ~/.bunnyhole/cases.db."""
-        self.cross_case_hits = self.case_store.correlate_cross_case_entities(self.graph)
+        """Correlate against SQLite Cross-Case Entity Memory, run Karpathy 3-Stage LLM Council + Synthesis, and save case to ~/.bunnyhole/cases.db.
+
+        No single stage failure loses the finished work: cross-case correlation, synthesis and the
+        council each fall back to a deterministic default (recorded in ``result['stage_errors']``),
+        and a failed persist is reported in ``result['persist_error']`` — never silently swallowed.
+        """
+        stage_errors: Dict[str, str] = {}
+
+        try:
+            # Under a PI engagement another case's seed query is a different client's subject, so the
+            # cross-case receipts must not carry prior seed text (only `case <id>`).
+            self.cross_case_hits = self.case_store.correlate_cross_case_entities(
+                self.graph, include_seed_text=self.engagement is None
+            )
+        except Exception as exc:  # noqa: BLE001 - optional enrichment; recorded, not fatal
+            self.cross_case_hits = []
+            stage_errors["cross_case"] = f"{type(exc).__name__}: {exc}"
+            self.graph.log(
+                DomainCategory.SKEPTIC, "STAGE_ERROR", "correlate_cross_case_entities",
+                stage_errors["cross_case"], level="warning",
+            )
+
         interconnections = self.link_sleuth.analyze_interconnected_web()
         if source_query and target_query:
             interconnections["targeted_paths"] = self.link_sleuth.find_interconnection_paths(source_query, target_query)
-        self.synthesis, self.council_deliberation = await asyncio.gather(
+
+        synth_res: Dict[str, Any] | BaseException
+        council_res: Dict[str, Any] | BaseException
+        synth_res, council_res = await asyncio.gather(
             self.synthesizer.synthesize_investigation(self.learnings, interconnections, self.cross_case_hits),
             self.council.run_full_council(interconnections, self.cross_case_hits),
+            return_exceptions=True,
         )
+        if isinstance(synth_res, BaseException):
+            stage_errors["synthesis"] = f"{type(synth_res).__name__}: {synth_res}"
+            self.synthesis = {}  # compile_full_result falls back to the deterministic brief
+            self.graph.log(
+                DomainCategory.SKEPTIC, "STAGE_ERROR", "synthesize_investigation",
+                stage_errors["synthesis"], level="warning",
+            )
+        else:
+            self.synthesis = synth_res
+        if isinstance(council_res, BaseException):
+            stage_errors["council"] = f"{type(council_res).__name__}: {council_res}"
+            self.council_deliberation = {}
+            self.graph.log(
+                DomainCategory.SKEPTIC, "STAGE_ERROR", "run_full_council",
+                stage_errors["council"], level="warning",
+            )
+        else:
+            self.council_deliberation = council_res
+
         res = self.compile_full_result(source_query=source_query, target_query=target_query)
+        if stage_errors:
+            res["stage_errors"] = stage_errors
+
+        persist_error = self._persist_error
         try:
             self.case_store.save_case(self.graph, res)
-        except Exception:
-            pass
+            persist_error = persist_error or getattr(self.case_store, "persist_error", None)
+        except Exception as exc:  # noqa: BLE001 - persistence is optional; report, never silently pass
+            persist_error = f"{type(exc).__name__}: {exc}"
+            self.graph.log(
+                DomainCategory.SKEPTIC, "STAGE_ERROR", "save_case", persist_error, level="warning",
+            )
+        if persist_error:
+            res["persist_error"] = persist_error
         return res
 
     def compile_full_result(
@@ -687,6 +908,7 @@ class BunnyholeOrchestrator:
             "total_learnings": len(self.learnings),
             "learnings": self.learnings[:40],
             "follow_up_questions": self.follow_up_questions[:15],
+            "agent_errors": self._agent_errors,
         }
         # Personalization: the persona lens this case ran through + any watchlist targets it surfaced.
         base["persona"] = self.profile.persona.value
@@ -704,4 +926,36 @@ class BunnyholeOrchestrator:
             ).model_dump(mode="json")
             if self._pi_redactions:  # safety net: no credential string survives anywhere in the PI result
                 base = redact_value(base, self._pi_redactions)
+        elif self._credential_secrets:
+            # Non-PI safety net: replace any plaintext credential that reached the compiled result with
+            # its masked form (`ident:****`), keeping the non-secret identifier readable.
+            base = self._scrub_credential_result(base)
         return base
+
+    def _scrub_credential_result(self, value: Any) -> Any:
+        """Deep copy of ``value`` with every tracked plaintext credential replaced by its masked form.
+
+        Unlike the PI redactor (which blanks to ``[credential removed]``), this keeps the identifier:
+        ``ceo@acme.com:hunter2`` -> ``ceo@acme.com:****`` and a bare secret -> ``****``. Longest tokens
+        first, so a full ``email:secret`` is masked before its bare secret is.
+        """
+        pairs = [(tok, mask_credential(tok)) for tok in sorted(set(self._credential_secrets), key=len, reverse=True)]
+
+        def clean(text: str) -> str:
+            for needle, repl in pairs:
+                if needle and needle in text:
+                    text = text.replace(needle, repl)
+            return text
+
+        def walk(node: Any) -> Any:
+            if isinstance(node, str):
+                return clean(node)
+            if isinstance(node, dict):
+                return {(clean(k) if isinstance(k, str) else k): walk(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [walk(v) for v in node]
+            if isinstance(node, tuple):
+                return tuple(walk(v) for v in node)
+            return node
+
+        return walk(value)

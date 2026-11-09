@@ -3,24 +3,49 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+_SELECTOR_TOKEN_RE = re.compile(r"[@\w.-]+", re.UNICODE)
+
+
+def selector_token_match(term: str, text: str) -> bool:
+    """Match a selector ``term`` against ``text`` on token/label boundaries, not as a raw substring.
+
+    This stops ``'ab'`` from matching ``'cabinet.com'``. Rules (all case-insensitive):
+
+    * a domain (contains a dot, not ``@``-led) matches an exact host or a subdomain on a dot
+      boundary: ``acme.io`` hits ``acme.io`` and ``x.acme.io`` but not ``notacme.io``;
+    * a wallet/handle (``0x...``, ``@handle``, ``*.eth``) matches an exact token;
+    * any other term (a name) matches on whole-word boundaries.
+    """
+    t = (term or "").strip().lower()
+    if not t:
+        return False
+    hay = (text or "").lower()
+    tokens = _SELECTOR_TOKEN_RE.findall(hay)
+    if t.startswith("@") or t.startswith("0x") or t.endswith(".eth"):
+        return t in tokens
+    if "." in t:
+        return any(tok == t or tok.endswith("." + t) for tok in tokens)
+    return re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", hay, re.UNICODE) is not None
+
 
 class GearMode(str, Enum):
     """2-Gear Execution Profile."""
-    FAST = "fast"   # Gear 1: Rapid API, DNS/CT, Scrapling HTTP Fetcher, Blockscout, GLEIF, EDGAR, Cavalier
-    DEEP = "deep"   # Gear 2: Adds Scrapling StealthyFetcher headless, Wayback diffing, PDF/DOCX RSID forensics, Holehe email sweep, 2-hop burner expansion
+    FAST = "fast"   # Gear 1: Rapid API, DNS/CT, HTTP site fetch, Blockscout, GLEIF, EDGAR, Cavalier
+    DEEP = "deep"   # Gear 2: Adds Wayback diffing, PDF/DOCX RSID forensics, Holehe email sweep, 2-hop burner expansion
 
 
 class DomainCategory(str, Enum):
     """The investigative pillars of Bunnyhole."""
     JOURNALISM = "journalism"      # News, Wayback CDX ghost-edits, PDF/DOCX RSID forensics, CourtListener, Pink-Slime detection
     FIAT = "fiat"                  # SEC EDGAR, Beneish M-Score, GLEIF parent/child, FEC, IRS 990s, Sanctions, Offshore, UCC-1
-    OSINT = "osint"                # CT logs, DNS SOA RNAME, Scrapling, Favicon mmh3, .js.map, GitHub .patch & PoL, HudsonRock, Holehe
+    OSINT = "osint"                # CT logs, DNS SOA RNAME, site fingerprint, Favicon mmh3, .js.map, GitHub .patch & PoL, HudsonRock, Holehe
     ONCHAIN = "onchain"            # Multi-chain EVM/BTC/SOL, First-Funder Mother Wallet, CEX Deposit Sweep, THORChain memo, Jito Bundlers
     PHYSICAL = "physical"          # ADS-B Corporate Jets (adsb.lol + ICAO hex), Maritime AIS Shadow Fleet (IMO/MMSI), Supply Chain
     SKEPTIC = "skeptic"            # Red-Cell verifier, NATO Admiralty A1-F6, CIA ACH Matrix, Betweenness Centrality cut-out detector
@@ -163,7 +188,7 @@ class ConfidenceTier(str, Enum):
 class EvidenceReceipt(BaseModel):
     """Immutable proof attached to every discovered node or edge."""
     receipt_id: str = Field(default_factory=lambda: "")
-    tool: str = Field(..., description="Tool/library used (e.g. scrapling, edgartools, gleif, crt.sh, blockscout, adsb.lol)")
+    tool: str = Field(..., description="Tool/library used (e.g. httpx_dom_fingerprint, edgartools, gleif, crt.sh, blockscout, adsb.lol)")
     domain: DomainCategory
     admiralty_code: str = Field("B2", description="NATO STANAG 2511 code, e.g. A1, B2, C3")
     selector_strength: SelectorStrength = SelectorStrength.STRONG
@@ -217,7 +242,10 @@ class GraphEdge(BaseModel):
     tier: ConfidenceTier = ConfidenceTier.CORROBORATED
     summary: str = Field("", description="Short label explaining the connection")
     event_date: Optional[str] = Field(None, description="ISO date/timestamp if temporal (tx, filing, article)")
-    amount_usd: Optional[float] = Field(None, description="Monetary value if financial/crypto flow")
+    event_date_earliest: Optional[str] = Field(None, description="Earliest event date across all merged contributors")
+    event_date_latest: Optional[str] = Field(None, description="Latest event date across all merged contributors")
+    amount_usd: Optional[float] = Field(None, description="Monetary value if financial/crypto flow (summed across merged contributors)")
+    merged_count: int = Field(1, description="How many distinct observations were merged into this edge")
     skeptic_notes: Optional[str] = Field(None, description="Red-Cell Skeptic verification or false-positive warning")
     receipts: List[EvidenceReceipt] = Field(default_factory=list)
 

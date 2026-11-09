@@ -324,7 +324,7 @@ def playbook_progress_for(playbook: Playbook, source_log: Sequence[SourceLogEntr
         progress.append(
             PlaybookProgress(
                 order=step.order, action=step.action, sources=list(step.sources),
-                status=status_value, evidence="; ".join(parts),  # type: ignore[arg-type]
+                status=status_value, evidence="; ".join(parts),
             )
         )
     return progress
@@ -409,7 +409,7 @@ def sanctions_screening_for(
                  "node_id": node_id, "relevance": relevance.get(node_id, "unknown")}
             )
     return (
-        SanctionsScreening(status=status, screened=screened, not_screened=not_screened, hits=hits),  # type: ignore[arg-type]
+        SanctionsScreening(status=status, screened=screened, not_screened=not_screened, hits=hits),
         ignored,
     )
 

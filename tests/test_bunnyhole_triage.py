@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import unittest
+from unittest.mock import AsyncMock
+
+import httpx
+import respx
 
 from bunnyhole.agents.accountant import (
     AccountantAgent,
@@ -64,6 +69,12 @@ class TestBunnyholeTriageAndCouncil(unittest.TestCase):
             "total_assets_t1": 190.0,
             "net_income_t": 15.0,
             "operating_cash_flow_t": 18.0,
+            "dep_rate_t": 0.08,
+            "dep_rate_t1": 0.08,
+            "sga_ratio_t": 0.20,
+            "sga_ratio_t1": 0.20,
+            "leverage_t": 0.40,
+            "leverage_t1": 0.38,
         })
         self.assertFalse(clean["is_flagged"])
         self.assertLess(clean["m_score"], -1.78)
@@ -83,6 +94,12 @@ class TestBunnyholeTriageAndCouncil(unittest.TestCase):
             "total_assets_t1": 180.0,
             "net_income_t": 45.0,
             "operating_cash_flow_t": -15.0,
+            "dep_rate_t": 0.08,
+            "dep_rate_t1": 0.08,
+            "sga_ratio_t": 0.20,
+            "sga_ratio_t1": 0.20,
+            "leverage_t": 0.40,
+            "leverage_t1": 0.38,
         })
         self.assertTrue(manipulated["is_flagged"])
         self.assertIn("BENEISH_M_SCORE_MANIPULATION_ALERT", manipulated["flags"])
@@ -313,8 +330,26 @@ class TestBunnyholeTriageAndCouncil(unittest.TestCase):
             )
         )
         osint = OSINTAgent(g)
-        r1 = asyncio.run(osint.investigate_credential_combo("alice@corp-a.io:UltraSecretPass99!", "seed:1", hop_depth=0))
-        r2 = asyncio.run(osint.investigate_credential_combo("bob_anon@proton.me:UltraSecretPass99!", "seed:2", hop_depth=0))
+        # Hermetic: the email pivot would shell out to the holehe CLI (live probes of ~120 sites) when it is on PATH.
+        osint._run_local_arsenal_holehe = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        # Hermetic: the HIBP k-anonymity range endpoint is mocked (respx). Only the 5-char SHA-1 prefix is ever
+        # requested; the range body lists this secret's suffix with a low (distinctive) breach count.
+        secret = "UltraSecretPass99!"
+        sha1 = hashlib.sha1(secret.encode("utf-8")).hexdigest().upper()
+        prefix5, suffix35 = sha1[:5], sha1[5:]
+        range_body = f"0018A45C4D1DEF81644B54AB7F969B88D65:1\r\n{suffix35}:2\r\nFFFFF1E2B6E6A0B0D0C0B0A09080706050A:7\r\n"
+        with respx.mock(assert_all_called=True) as router:
+            route = router.get(f"https://api.pwnedpasswords.com/range/{prefix5}").mock(
+                return_value=httpx.Response(200, text=range_body)
+            )
+            r1 = asyncio.run(osint.investigate_credential_combo(f"alice@corp-a.io:{secret}", "seed:1", hop_depth=0))
+            r2 = asyncio.run(osint.investigate_credential_combo(f"bob_anon@proton.me:{secret}", "seed:2", hop_depth=0))
+        self.assertEqual(route.call_count, 2)
+        for call in route.calls:
+            self.assertNotIn(secret, str(call.request.url))  # k-anonymity: the plaintext never leaves
+            self.assertNotIn(suffix35, str(call.request.url))
+        self.assertEqual(r1["pwned_count"], 2)
+        self.assertTrue(r1["is_distinctive"])
         self.assertEqual(r1["pwd_node_id"], r2["pwd_node_id"])
         self.assertIn(r1["pwd_node_id"], g.nodes)
         # Both accounts must connect to the exact same deterministic password fingerprint node

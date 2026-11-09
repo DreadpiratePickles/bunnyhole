@@ -1,0 +1,8 @@
+# Lint-only hooks: ruff check on the files being committed. No formatter, so nothing reformats the repo.
+# Install once with `pre-commit install`; run on demand with `pre-commit run`.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.2  # keep in step with the ruff version in uv.lock
+    hooks:
+      - id: ruff-check
+        args: [--no-fix]

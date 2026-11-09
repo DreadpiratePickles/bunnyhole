@@ -9,7 +9,7 @@ from __future__ import annotations
 import calendar
 import re
 from datetime import date, datetime, timezone
-from typing import Any, Collection, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from bunnyhole.engine.pi import (
     CaseType,
@@ -169,7 +169,7 @@ _ABOUT_THE_SUBJECT = ("subject", "related")
 
 def downgrade_unrelated_hits(
     source_log: List[SourceLogEntry],
-    nodes: List[Mapping[str, Any]],
+    nodes: Sequence[Mapping[str, Any]],
     relevance_by_node: Mapping[str, str],
     receipt_tool_prefixes: Mapping[str, Tuple[str, ...]],
 ) -> List[SourceLogEntry]:

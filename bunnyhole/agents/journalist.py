@@ -9,10 +9,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 from urllib.parse import quote_plus, urlparse
 
-import httpx
 from pypdf import PdfReader
 
 from bunnyhole.engine.graph import InvestigationGraph
@@ -29,6 +28,7 @@ from bunnyhole.engine.models import (
     SelectorStrength,
     TimelineItem,
 )
+from bunnyhole.engine.netutil import new_async_client
 
 
 def _shingle_set(text: str, k: int = 4) -> Set[Tuple[str, ...]]:
@@ -65,7 +65,7 @@ class JournalistAgent:
         rss_url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
         articles: List[Dict[str, str]] = []
         try:
-            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=self.headers) as client:
+            async with new_async_client(timeout=12.0, follow_redirects=True, headers=self.headers) as client:
                 resp = await client.get(rss_url)
                 if resp.status_code == 200 and resp.text:
                     root = ET.fromstring(resp.text)
@@ -213,7 +213,7 @@ class JournalistAgent:
             f"&fl=timestamp,original,statuscode,digest,length&filter=statuscode:200&collapse=digest&limit=60"
         )
         try:
-            async with httpx.AsyncClient(timeout=12.0, headers=self.headers) as client:
+            async with new_async_client(timeout=12.0, headers=self.headers) as client:
                 resp = await client.get(cdx_url)
                 if resp.status_code != 200 or not resp.text.strip():
                     return
@@ -308,7 +308,7 @@ class JournalistAgent:
         token = os.environ.get("COURTLISTENER_API_TOKEN", "").strip()
         headers = {**self.headers, "Authorization": f"Token {token}"} if token else self.headers
         try:
-            async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
+            async with new_async_client(timeout=12.0, headers=headers) as client:
                 resp = await client.get(url)
                 if resp.status_code in (401, 403):
                     self.graph.log(
@@ -423,7 +423,7 @@ class JournalistAgent:
             f"&titles={quote_plus(title_query)}&rvlimit=30&rvprop=ids|timestamp|user|userid|size|comment&format=json"
         )
         try:
-            async with httpx.AsyncClient(timeout=10.0, headers=self.headers) as client:
+            async with new_async_client(timeout=10.0, headers=self.headers) as client:
                 resp = await client.get(api_url)
                 if resp.status_code != 200:
                     return
@@ -518,7 +518,7 @@ class JournalistAgent:
         """Query OpenAlex API (250M+ scholarly works, authors, institutions & funding grants) for deep-tech/biotech/founder verification."""
         url = f"https://api.openalex.org/works?search={quote_plus(query)}&per-page=3"
         try:
-            async with httpx.AsyncClient(timeout=10.0, headers=self.headers) as client:
+            async with new_async_client(timeout=10.0, headers=self.headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
@@ -591,7 +591,7 @@ class JournalistAgent:
         """Query HackerNews Algolia API for historical Show HN launches, founder handles, and community discussions."""
         url = f"https://hn.algolia.com/api/v1/search?query={quote_plus(query)}&tags=story&hitsPerPage=4"
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
@@ -681,7 +681,7 @@ class JournalistAgent:
         elif path.suffix.lower() == ".pdf":
             try:
                 reader = PdfReader(str(path))
-                meta = reader.metadata or {}
+                meta: Mapping[Any, Any] = reader.metadata or {}
                 for k, v in meta.items():
                     findings["metadata"][str(k)] = str(v)
                 # Check for timezone offset in CreationDate / ModDate (e.g. D:20261012142210+03'00')
