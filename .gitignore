@@ -20,8 +20,16 @@ ENV/
 .ruff_cache/
 .mypy_cache/
 .coverage
+.coverage.*
 htmlcov/
 coverage.xml
+.hypothesis/
+.tox/
+.nox/
+
+# Logs & scratch
+*.log
+tmp/
 
 # Bunnyhole runtime state & secrets
 *.db

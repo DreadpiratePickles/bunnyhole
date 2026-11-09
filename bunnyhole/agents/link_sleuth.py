@@ -9,7 +9,6 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
-import httpx
 import networkx as nx
 
 from bunnyhole.engine.graph import InvestigationGraph
@@ -23,6 +22,8 @@ from bunnyhole.engine.models import (
     RelationType,
     SelectorStrength,
 )
+from bunnyhole.engine.netutil import new_async_client
+from bunnyhole.engine.pi_credentials import scrub_credential_text
 
 CORPORATE_STOPWORDS = {
     "inc", "llc", "ltd", "limited", "corp", "corporation", "company", "co",
@@ -65,13 +66,16 @@ def extract_entity_stem(name: str) -> str:
     Extract a high-entropy distinctive stem token from a corporate, domain, or project name for orthogonal pivoting.
     Returns '' if the name consists solely of generic dictionary/corporate stopwords, preventing combinatorial graph explosion.
     """
-    cleaned = re.sub(r"^[^\w]+", "", name.lower())
+    cleaned = re.sub(r"^[^\w]+", "", name.lower(), flags=re.UNICODE)
     cleaned = re.sub(r"^https?://(www\.)?", "", cleaned)
-    cleaned = re.sub(r"^(https?|www)\b[\W_]*", "", cleaned)
+    cleaned = re.sub(r"^(https?|www)\b[\W_]*", "", cleaned, flags=re.UNICODE)
     cleaned = re.sub(r"\.(com|org|io|fi|xyz|net|co|ai|eth|gg|app).*$", "", cleaned)
+    # Unicode-aware tokenisation: '\w' matches accented/Cyrillic/CJK letters, so 'Müller' -> 'müller'
+    # and 'Иванов' survive instead of being shredded at the first non-ASCII byte. ASCII legal-form
+    # stopwords ('gmbh', 'ltd', ...) still strip because they tokenise identically.
     tokens = [
-        t for t in re.findall(r"[a-z0-9]{4,}", cleaned)
-        if t not in CORPORATE_STOPWORDS and not t.isdigit()
+        t for t in re.findall(r"\w+", cleaned, flags=re.UNICODE)
+        if len(t) >= 4 and t not in CORPORATE_STOPWORDS and not t.isdigit()
     ]
     return tokens[0] if tokens else ""
 
@@ -241,6 +245,10 @@ class LinkSleuthAgent:
         clean_b = re.sub(r"^[^\w@0x]+", "", entity_b).split("(")[0].strip()[:35]
         if not clean_a or not clean_b or clean_a.lower() == clean_b.lower():
             return None
+        # Never put a credential (`email:secret`) into an outbound search query. If either side still
+        # carries a credential-shaped token, scrubbing changes it, so this pairing is not probed.
+        if scrub_credential_text(clean_a)[1] or scrub_credential_text(clean_b)[1]:
+            return None
 
         joint_query = f'"{clean_a}" "{clean_b}"'
         self.graph.log(
@@ -252,7 +260,7 @@ class LinkSleuthAgent:
         rss_url = f"https://news.google.com/rss/search?q={quote_plus(joint_query)}&hl=en-US&gl=US&ceid=US:en"
         cl_url = f"https://www.courtlistener.com/api/rest/v4/search/?q={quote_plus(joint_query)}&type=r"
         try:
-            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, follow_redirects=True, headers=self.headers) as client:
                 # 1. Check CourtListener Federal Dockets first (A1/A2 Judicial Record)
                 try:
                     cl_resp = await client.get(cl_url)

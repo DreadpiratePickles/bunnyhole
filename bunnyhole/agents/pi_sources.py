@@ -25,6 +25,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Tuple
 import httpx
 
 from bunnyhole.agents import sanctions_lists
+from bunnyhole.agents.accountant import sec_user_agent
 from bunnyhole.agents.pi_source_records import (  # noqa: F401  (re-exported with the names they always had here)
     _CH_SHARES_BAND,
     CFPB_API_URL,
@@ -138,7 +139,8 @@ class PISourcesAgent(_ReferenceRecordsMixin):
         self.graph = graph
         self.gear = gear
         self.std_headers = {
-            "User-Agent": "BunnyholeInvestigativeEngine/0.2 (OSINT research tool; research@bunnyhole.local)",
+            # operator-configurable research identity (BUNNYHOLE_SEC_USER_AGENT), shared with the SEC EDGAR client
+            "User-Agent": sec_user_agent(),
             "Accept": "application/json",
         }
 

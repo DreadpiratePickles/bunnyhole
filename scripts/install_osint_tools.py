@@ -9,10 +9,10 @@ Supports:
   - Fedora / RHEL (dnf + pipx/uv + go)
   - macOS (Homebrew + uv/pipx + go, no root required)
 
-Usage:
-  python3 scripts/install_osint_tools.py --check          # Non-destructive health check & API vault setup
+Usage (from the repo root; the script itself needs only the Python standard library):
+  uv run python scripts/install_osint_tools.py --check    # Non-destructive tool health check (writes nothing)
   sudo python3 scripts/install_osint_tools.py             # Full install on Linux (Kali/Parrot/Debian/Arch/Fedora)
-  python3 scripts/install_osint_tools.py                  # Full install on macOS (Homebrew + uv/pipx)
+  uv run python scripts/install_osint_tools.py            # Full install on macOS (Homebrew + uv/pipx)
 """
 
 from __future__ import annotations
@@ -170,20 +170,23 @@ def install_go_tools() -> None:
 
 
 def setup_api_keys() -> None:
-    """Ensure API key vaults exist at both ~/.bunnyhole/api_keys.env and ~/.osint-apis/api_keys.env."""
-    print(f"\n{GREEN}=== Setting Up Unified API Keys Vault ==={RESET}")
+    """Ensure the primary API key vault ($BUNNYHOLE_HOME/api_keys.env, default ~/.bunnyhole) exists (0600).
+
+    Never writes the legacy ~/.osint-apis/api_keys.env: Bunnyhole only reads it.
+    """
+    print(f"\n{GREEN}=== Setting Up the API Keys Vault ==={RESET}")
     project_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(project_root))
     try:
         from bunnyhole.arsenal.manager import BUNNYHOLE_ENV_FILE, LEGACY_OSINT_ENV_FILE, ArsenalManager
-        mgr = ArsenalManager()
-        if not BUNNYHOLE_ENV_FILE.exists():
-            mgr.set_api_key("FEC_API_KEY", "DEMO_KEY")
-        print(f"{GREEN}[OK]{RESET} Unified API vault ready at:")
-        print(f"  • {BUNNYHOLE_ENV_FILE}")
-        print(f"  • {LEGACY_OSINT_ENV_FILE}")
+        created = ArsenalManager().ensure_vault_file()
+        state = "created" if created else "already present"
+        print(f"{GREEN}[OK]{RESET} API vault {state}: {BUNNYHOLE_ENV_FILE}")
+        if LEGACY_OSINT_ENV_FILE.exists():
+            print(f"  • legacy {LEGACY_OSINT_ENV_FILE} is read too (never written)")
+        print("  • add keys with: uv run bunnyhole keys --set NAME=VALUE")
     except Exception as exc:
-        print(f"{YELLOW}[WARN]{RESET} Fallback API template setup: {exc}")
+        print(f"{YELLOW}[WARN]{RESET} Could not prepare the API vault: {exc}")
 
 
 def main() -> None:

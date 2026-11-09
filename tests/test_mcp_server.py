@@ -297,8 +297,12 @@ class ProfileToolsTest(unittest.TestCase):
         mcp_server.watchlist_remove_tool(["acme.io"])
         self.assertEqual(mcp_server.get_profile_tool()["watchlist"], ["0xabc"])
 
-    def test_bad_persona_falls_back_to_generalist(self) -> None:
-        self.assertEqual(mcp_server.set_persona_tool("wizard")["persona"], "generalist")
+    def test_bad_persona_is_an_error_not_a_silent_generalist(self) -> None:
+        # requirement changed: an unknown persona used to fall back to generalist silently (tests/test_mcp_persona.py)
+        out = mcp_server.set_persona_tool("wizard")
+        self.assertIn("wizard", out["error"])
+        self.assertNotIn("persona", out)
+        self.assertEqual(mcp_server.get_profile_tool()["persona"], "generalist")  # untouched default
 
 
 class PIReferenceToolTest(unittest.TestCase):

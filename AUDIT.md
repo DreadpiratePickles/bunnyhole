@@ -1,3 +1,9 @@
+> **Historical snapshot (2026-10): superseded; see [docs/](docs/) and CI for current state.**
+> This audit is kept as written on 2026-10-24 and is not maintained. Its counts (for example "8/8 passing"
+> and "~10,500 LOC") describe that date only: the suite has since grown to thousands of hermetic tests, and the
+> package to over 26,000 lines. `scripts/osint_orchestrator.py`, the quarantined legacy script it mentions,
+> was removed on 2026-11-09 (it remains in git history).
+
 # Bunnyhole — Security & Code-Quality Audit
 
 **Date:** 2026-10-24

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import List, Optional
+from typing import Callable, List, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
@@ -124,6 +124,44 @@ def _dedup_list(seq: List[str]) -> List[str]:
     return out
 
 
+# -------------------------------------------------------------------------------------------------
+# Omni-text selector patterns. Every quantifier is bounded (RFC limits where one exists: 64-char email
+# local part, 63-char DNS label) and the path pattern only starts at a token boundary, so the parser
+# stays linear on adversarial input (long runs of 'ab.', digits, dots, unicode letters, ...).
+# -------------------------------------------------------------------------------------------------
+_EXCLUSION_VALUE = r"[a-zA-Z0-9_.\-@]{3,64}(?![a-zA-Z0-9_.\-@])"
+# The keyword forms are tried before the bare '-' form, so '-exclude:x' excludes 'x' (not the word 'exclude').
+_RE_EXCLUSION = re.compile(r"(?<!\S)(?:-?(?i:exclude|ignore):|-)(" + _EXCLUSION_VALUE + ")")
+_RE_EVIDENCE_FILE = re.compile(r"(?<![/\w.\-~])([/\w.\-~]{1,1024}\.(?:pdf|docx))\b", re.IGNORECASE)
+_EMAIL_CORE = r"[a-zA-Z0-9_.+-]{1,64}@[a-zA-Z0-9-]{1,63}(?:\.[a-zA-Z0-9-]{1,63}){1,8}"
+_RE_CREDENTIAL = re.compile(r"\b(" + _EMAIL_CORE + r":[^\s,;\"']{4,64})(?=\s|$|[,;])")
+_RE_EMAIL = re.compile(r"\b(" + _EMAIL_CORE + r")\b")
+_RE_EVM_WALLET = re.compile(r"\b(0x[a-fA-F0-9]{40})\b")
+_RE_ENS = re.compile(r"\b([a-zA-Z0-9_-]{3,40}\.eth)\b", re.IGNORECASE)
+_RE_BTC_WALLET = re.compile(r"\b((?:bc1|[13])[a-zA-HJ-NP-Z0-9]{25,59})\b")
+_RE_IPV4 = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+_RE_URL = re.compile(r"\b(https?://[^\s,;\"')]{1,2048})\b")
+_RE_DOMAIN = re.compile(
+    r"\b([a-zA-Z0-9-]{2,63}\.(?:com|org|io|net|co|ai|xyz|fi|gg|app|dev|me|info|biz|ch|uk|de|ky|vg|pa))\b",
+    re.IGNORECASE,
+)
+_RE_TAIL = re.compile(r"\b(N[1-9][0-9A-HJ-NP-Z]{1,4})\b")
+_RE_PHONE = re.compile(r"(?:\+\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)[\s.-]?|\d{2,4}[\s.-])\d{3,4}[\s.-]\d{3,4}\b")
+_RE_HANDLE = re.compile(r"(?:^|\s)@([a-zA-Z0-9_.-]{3,30})\b")
+
+
+def _extract(pattern: "re.Pattern[str]", text: str, take: "Callable[[re.Match[str]], Optional[bool]]") -> str:
+    """Remove every match of ``pattern`` from ``text`` (replaced by a space), calling ``take`` on each.
+
+    ``take`` returning ``False`` keeps that match in the text (it was not accepted as a selector).
+    """
+
+    def _replace(m: "re.Match[str]") -> str:
+        return m.group(0) if take(m) is False else " "
+
+    return pattern.sub(_replace, text)
+
+
 class SmartIntakeParser:
     """
     Deterministic multi-selector parser that turns messy clipboard dumps, OSINT notes,
@@ -163,85 +201,70 @@ class SmartIntakeParser:
         aircraft_tails: List[str] = []
         evidence_files: List[str] = []
 
-        # 1. Exclusions: -domain.com or exclude:xyz or ignore:xyz
-        for m in re.finditer(r"(?:^|\s)(?:-|(?:exclude|ignore):)([a-zA-Z0-9_.\-@]{3,64})", working):
-            exclusions.append(m.group(1).strip())
-            working = working.replace(m.group(0), " ")
+        # Every extractor removes exactly the span it matched (re.sub with a collecting callback), in one
+        # linear pass per pattern. All patterns are bounded (see the _RE_* constants) so adversarial input
+        # cannot trigger catastrophic backtracking.
+
+        # 1. Exclusions: -domain.com, exclude:xyz, ignore:xyz, -exclude:xyz, -ignore:xyz
+        working = _extract(_RE_EXCLUSION, working, lambda m: exclusions.append(m.group(1).strip()))
 
         # 2. Local evidence files (.pdf / .docx)
-        for m in re.finditer(r"([/\w.\-~]+\.(?:pdf|docx))\b", working, flags=re.IGNORECASE):
-            evidence_files.append(m.group(1).strip())
-            working = working.replace(m.group(0), " ")
+        working = _extract(_RE_EVIDENCE_FILE, working, lambda m: evidence_files.append(m.group(1).strip()))
 
-        # 3. Leaked Credentials / Combo-list entries (email:password or user:password, excluding http:// or https://)
-        for m in re.finditer(
-            r"\b([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+:[^\s,;\"']{4,64})(?=\s|$|[,;])",
-            working,
-        ):
+        # 3. Leaked Credentials / Combo-list entries (email:password, excluding http:// or https://)
+        def _take_credential(m: "re.Match[str]") -> None:
             cred = m.group(1)
             credentials.append(cred)
-            email_part = cred.split(":", 1)[0]
-            emails.append(email_part)
-            working = working.replace(m.group(0), " ")
+            emails.append(cred.split(":", 1)[0])
+
+        working = _extract(_RE_CREDENTIAL, working, _take_credential)
 
         # 4. Standalone Emails
-        for m in re.finditer(r"\b([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b", working):
-            emails.append(m.group(1))
-            working = working.replace(m.group(0), " ")
+        working = _extract(_RE_EMAIL, working, lambda m: emails.append(m.group(1)))
 
         # 5. EVM Wallets (0x...), ENS names (*.eth), and Bitcoin Wallets (bc1...)
-        for m in re.finditer(r"\b(0x[a-fA-F0-9]{40})\b", working):
-            wallets.append(m.group(1))
-            working = working.replace(m.group(0), " ")
-
-        for m in re.finditer(r"\b([a-zA-Z0-9_-]{3,40}\.eth)\b", working, flags=re.IGNORECASE):
-            wallets.append(m.group(1).lower())
-            working = working.replace(m.group(0), " ")
-
-        for m in re.finditer(r"\b((?:bc1|[13])[a-zA-HJ-NP-Z0-9]{25,59})\b", working):
-            wallets.append(m.group(1))
-            working = working.replace(m.group(0), " ")
+        working = _extract(_RE_EVM_WALLET, working, lambda m: wallets.append(m.group(1)))
+        working = _extract(_RE_ENS, working, lambda m: wallets.append(m.group(1).lower()))
+        working = _extract(_RE_BTC_WALLET, working, lambda m: wallets.append(m.group(1)))
 
         # 6. IPv4 Addresses
-        for m in re.finditer(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", working):
-            domains_or_ips.append(m.group(1))
-            working = working.replace(m.group(0), " ")
+        working = _extract(_RE_IPV4, working, lambda m: domains_or_ips.append(m.group(1)))
 
-        # 7. URLs & Domains
-        for m in re.finditer(r"\b(https?://[^\s,;\"')]+)\b", working):
-            parsed = urlparse(m.group(1))
-            if parsed.netloc:
-                domains_or_ips.append(parsed.netloc.lower())
-            working = working.replace(m.group(0), " ")
+        # 7. URLs & Domains. A malformed URL (``http://a]b[c``) makes urlparse raise ValueError; it is dropped
+        # from the text (it is not a usable selector) and parsing carries on.
+        def _take_url(m: "re.Match[str]") -> None:
+            try:
+                netloc = urlparse(m.group(1)).netloc
+            except ValueError:
+                return
+            if netloc:
+                domains_or_ips.append(netloc.lower())
 
-        for m in re.finditer(
-            r"\b([a-zA-Z0-9-]{2,63}\.(?:com|org|io|net|co|ai|xyz|fi|gg|app|dev|me|info|biz|ch|uk|de|ky|vg|pa))\b",
-            working,
-            flags=re.IGNORECASE,
-        ):
-            domains_or_ips.append(m.group(1).lower())
-            working = working.replace(m.group(0), " ")
+        working = _extract(_RE_URL, working, _take_url)
+        working = _extract(_RE_DOMAIN, working, lambda m: domains_or_ips.append(m.group(1).lower()))
 
         # 8. FAA Aircraft Tail Numbers (e.g. N628TS)
-        for m in re.finditer(r"\b(N[1-9][0-9A-HJ-NP-Z]{1,4})\b", working):
+        def _take_tail(m: "re.Match[str]") -> None:
             tail = m.group(1).upper()
             aircraft_tails.append(tail)
             orgs_or_names.append(tail)
-            working = working.replace(m.group(0), " ")
 
-        # 9. Phone Numbers (e.g., +1-415-555-0199, +44 20 7946 0921, (415) 555-0199)
-        for m in re.finditer(r"(?:\+\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)[\s.-]?|\d{2,4}[\s.-])\d{3,4}[\s.-]\d{3,4}\b", working):
+        working = _extract(_RE_TAIL, working, _take_tail)
+
+        # 9. Phone Numbers (e.g., +1-415-555-0199, +44 20 7946 0921, (415) 555-0199). A match whose digit count
+        # is not a plausible phone number is left in the text.
+        def _take_phone(m: "re.Match[str]") -> bool:
             raw_ph = m.group(0).strip()
             digits = re.sub(r"\D", "", raw_ph)
-            if 10 <= len(digits) <= 15:
-                norm_ph = f"+{digits}" if raw_ph.startswith("+") or len(digits) > 10 else f"+1{digits}"
-                phones.append(norm_ph)
-                working = working.replace(m.group(0), " ")
+            if not 10 <= len(digits) <= 15:
+                return False
+            phones.append(f"+{digits}" if raw_ph.startswith("+") or len(digits) > 10 else f"+1{digits}")
+            return True
+
+        working = _extract(_RE_PHONE, working, _take_phone)
 
         # 10. Explicit @Handles
-        for m in re.finditer(r"(?:^|\s)@([a-zA-Z0-9_.-]{3,30})\b", working):
-            usernames.append(f"@{m.group(1)}")
-            working = working.replace(m.group(0), " ")
+        working = _extract(_RE_HANDLE, working, lambda m: usernames.append(f"@{m.group(1)}"))
 
         # 11. Determine if remaining text is a single handle/company seed or a natural-language hypothesis
         rem = re.sub(r"\s+", " ", working).strip(" ,;:-")

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import ipaddress
 import json
+import logging
 import os
+import re
+import warnings
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, Iterator, List, Optional, TypedDict
 
 import typer
 import uvicorn
@@ -24,20 +29,63 @@ from bunnyhole.engine.graph import InvestigationGraph
 from bunnyhole.engine.intake import AnchorMode, CaseIntakePacket, SmartIntakeParser
 from bunnyhole.engine.models import GearMode
 from bunnyhole.engine.orchestrator import BunnyholeOrchestrator
-from bunnyhole.engine.pi import CaseType
+from bunnyhole.engine.pi import CaseType, PIEngagement
 from bunnyhole.engine.pi_credentials import REDACTED_CREDENTIAL, strip_packet_credentials
+
+if TYPE_CHECKING:
+    from bunnyhole.arsenal.manager import ArsenalManager
 
 app = typer.Typer(
     name="bunnyhole",
     help="🐇🕳️ Bunnyhole: Autonomous Multi-Domain Investigative AI (Journalism, Forensic Accounting, Red Team OSINT, Link Sleuth & On-Chain Crypto)",
     add_completion=False,
+    no_args_is_help=True,
 )
 console = Console()
 app.add_typer(pi_commands.pi_app, name="pi")
 
 
+class _EngagementKwargs(TypedDict, total=False):
+    engagement: PIEngagement
+
+
+def _engagement_kwargs(engagement: Optional[PIEngagement]) -> _EngagementKwargs:
+    """``engagement=`` only in PI mode: a non-PI run never passes the keyword (the orchestrator default stays)."""
+    return {"engagement": engagement} if engagement is not None else {}
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        import bunnyhole
+
+        console.print(f"bunnyhole {bunnyhole.__version__}")
+        raise typer.Exit()
+
+
+PERSONA_HELP = "Run through an investigator persona lens for this case (see `bunnyhole personas`)."
+
+
+def _persona_option(value: Optional[str]) -> Optional[str]:
+    """Typer callback for every ``--persona``: case-insensitive, and an unknown key is a usage error (exit 2)."""
+    if value is None:
+        return None
+    from bunnyhole.engine.personas import UnknownPersonaError, parse_persona
+
+    try:
+        return parse_persona(value).value
+    except UnknownPersonaError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+
+DEPTH_MIN, DEPTH_MAX = 1, 4
+BREADTH_MIN, BREADTH_MAX = 2, 8
+
+
 @app.callback()
 def _global_options(
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True, help="Print the Bunnyhole version and exit."
+    ),
     proxy: Optional[str] = typer.Option(
         None, "--proxy", help="Route all outbound HTTP through this proxy (e.g. http://host:8080 or socks5h://127.0.0.1:9050)."
     ),
@@ -197,7 +245,7 @@ def _render_investigation_results(result: dict) -> None:
         console.print(
             Panel(
                 Markdown(stage3["verdict_markdown"]),
-                title="🏛️ [bold bright_yellow]KARPATHY 3-STAGE LLM-COUNCIL VERDICT (STAGE 1 OPINIONS → STAGE 2 ANONYMIZED PEER RANKING → STAGE 3 CHAIRMAN)[/bold bright_yellow]",
+                title="🏛️ [bold bright_yellow]KARPATHY 3-STAGE LLM-COUNCIL VERDICT (STAGE 1 OPINIONS → STAGE 2 DETERMINISTIC EVIDENCE RANKING (NOT PEER REVIEW) → STAGE 3 CHAIRMAN)[/bold bright_yellow]",
                 border_style="bright_yellow",
             )
         )
@@ -207,9 +255,9 @@ def _render_investigation_results(result: dict) -> None:
 def council_command(
     seed: str = typer.Argument(..., help="Seed trace to investigate and deliberate before the 5-Seat Karpathy LLM Council"),
     gear: GearMode = typer.Option(GearMode.FAST, "--gear", "-g", help="Execution profile: fast or deep"),
-    depth: int = typer.Option(1, "--depth", "-d", help="Recursive rabbit-hole depth (1-4)"),
+    depth: int = typer.Option(1, "--depth", "-d", min=DEPTH_MIN, max=DEPTH_MAX, help="Recursive rabbit-hole depth (1-4)"),
 ) -> None:
-    """Convene the 5-Seat Karpathy LLM Council (Stage 1 Specialist Briefs -> Stage 2 Anonymized Peer Review -> Stage 3 Chairman Verdict)."""
+    """Convene the 5-Seat Karpathy LLM Council (Stage 1 Specialist Briefs -> Stage 2 Deterministic evidence ranking (not peer review) -> Stage 3 Chairman Verdict)."""
     from rich.markdown import Markdown
 
     orch = BunnyholeOrchestrator(seed_query=seed, gear=gear, max_depth=depth, initial_breadth=4)
@@ -228,7 +276,7 @@ def council_command(
         console.print(
             Panel(
                 Markdown(s3["verdict_markdown"]),
-                title="🏛️ [bold bright_yellow]STAGE 2 & STAGE 3 — ANONYMIZED PEER RANKINGS & CHAIRMAN VERDICT[/bold bright_yellow]",
+                title="🏛️ [bold bright_yellow]STAGE 2 & STAGE 3 — DETERMINISTIC EVIDENCE RANKING (NOT PEER REVIEW) & CHAIRMAN VERDICT[/bold bright_yellow]",
                 border_style="bright_yellow",
             )
         )
@@ -238,11 +286,11 @@ def council_command(
 def intake_command(
     ctx: typer.Context,
     dump: Optional[str] = typer.Option(None, "--dump", help="Paste raw clipboard dump / free-text notes to auto-extract hypothesis & selectors"),
-    persona: Optional[str] = typer.Option(None, "--persona", help="Run through an investigator persona lens for this case (see `bunnyhole personas`)."),
+    persona: Optional[str] = typer.Option(None, "--persona", callback=_persona_option, help=PERSONA_HELP),
     hypothesis: Optional[str] = typer.Option(None, "--hypothesis", "-H", help="Working hypothesis or investigative question"),
     username: Optional[List[str]] = typer.Option(None, "--username", "-u", help="Known @username / handle (can pass multiple)"),
     email: Optional[List[str]] = typer.Option(None, "--email", "-e", help="Known email address (can pass multiple)"),
-    phone: Optional[List[str]] = typer.Option(None, "--phone", "-p", help="Known phone number in E.164 or international format"),
+    phone: Optional[List[str]] = typer.Option(None, "--phone", "-p", help="Known phone number in E.164 or international format (here -p is --phone; on `serve`, -p is --port)"),
     cred: Optional[List[str]] = typer.Option(None, "--cred", "-c", help="Known leaked credential combo email:password or hash"),
     wallet: Optional[List[str]] = typer.Option(None, "--wallet", "-w", help="Known crypto wallet, ENS (.eth), or BTC address"),
     domain: Optional[List[str]] = typer.Option(None, "--domain", help="Known domain or IPv4 address"),
@@ -255,8 +303,8 @@ def intake_command(
         help="convergence (prove IF/HOW clues connect) or locked_profile (confirmed same target entity)",
     ),
     gear: GearMode = typer.Option(GearMode.FAST, "--gear", "-g", help="Execution profile: fast or deep"),
-    depth: int = typer.Option(2, "--depth", "-d", help="Recursive rabbit-hole depth (1-4)"),
-    breadth: int = typer.Option(4, "--breadth", "-b", help="Parallel search breadth per depth level"),
+    depth: int = typer.Option(2, "--depth", "-d", min=DEPTH_MIN, max=DEPTH_MAX, help="Recursive rabbit-hole depth (1-4)"),
+    breadth: int = typer.Option(4, "--breadth", "-b", min=BREADTH_MIN, max=BREADTH_MAX, help="Parallel search breadth per depth level (2-8)"),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Export full Markdown Dossier to file path"),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Export full Universal Graph JSON to file path"),
     pi: bool = typer.Option(False, "--pi", help="Private-investigator engagement: vets --purpose, uses the PI persona, adds a PI block (labels, coverage, custodians)."),
@@ -279,7 +327,7 @@ def intake_command(
     engagement, persona = pi_commands.resolve_pi_flags(
         pi=pi, case_type=case_type, purpose=purpose, client=client, matter_ref=matter_ref,
         subject_type=subject_type, pi_jurisdiction=pi_jurisdiction, pi_report=pi_report, persona=persona,
-        cred=cred, confirm_entity=confirm_entity, seed=((org or [None])[0] or dump),
+        cred=cred, confirm_entity=confirm_entity, seed=((org[0] if org else None) or dump),
         orgs=list(org or []), emails=list(email or []), domains=list(domain or []),
         purpose_category=purpose_category,
         extra_texts=[
@@ -314,6 +362,14 @@ def intake_command(
         if dropped_credentials:
             packet = packet.model_copy(update={"credentials": [REDACTED_CREDENTIAL]})
     normalized = SmartIntakeParser.normalize_packet(packet)
+    if not normalized.all_seed_tuples() and not normalized.raw_omni_input.strip():
+        # Nothing to investigate: the orchestrator would run (and save) an empty case. A hypothesis or exclusions
+        # alone are not seeds.
+        console.print(
+            "[bold red]Error:[/bold red] intake needs at least one selector: --dump, --username, --email, --phone, "
+            "--cred, --wallet, --domain, --org or --doc (a --hypothesis or --exclude alone is not a seed)."
+        )
+        raise typer.Exit(2)
     orch = BunnyholeOrchestrator(
         seed_query=normalized.summary_seed_label(),
         gear=gear,
@@ -322,7 +378,7 @@ def intake_command(
         event_callback=_on_event,
         intake_packet=normalized,
         profile=prof,
-        **({"engagement": engagement} if engagement is not None else {}),
+        **_engagement_kwargs(engagement),
     )
     result = asyncio.run(orch.run_intake_investigation(normalized))
     _render_investigation_results(result)
@@ -343,17 +399,17 @@ def intake_command(
 def trace_command(
     ctx: typer.Context,
     seed: str = typer.Argument(..., help="Any seed trace: company, domain, EVM/BTC wallet, ENS (.eth), @handle, email, or tail number"),
-    persona: Optional[str] = typer.Option(None, "--persona", help="Run through an investigator persona lens for this case (see `bunnyhole personas`)."),
+    persona: Optional[str] = typer.Option(None, "--persona", callback=_persona_option, help=PERSONA_HELP),
     gear: GearMode = typer.Option(GearMode.FAST, "--gear", "-g", help="Execution profile: fast (Gear 1) or deep (Gear 2)"),
-    depth: int = typer.Option(2, "--depth", "-d", help="Recursive rabbit-hole depth (1-4)"),
-    breadth: int = typer.Option(4, "--breadth", "-b", help="Parallel search breadth per depth level (2-8)"),
+    depth: int = typer.Option(2, "--depth", "-d", min=DEPTH_MIN, max=DEPTH_MAX, help="Recursive rabbit-hole depth (1-4)"),
+    breadth: int = typer.Option(4, "--breadth", "-b", min=BREADTH_MIN, max=BREADTH_MAX, help="Parallel search breadth per depth level (2-8)"),
     hypothesis: Optional[str] = typer.Option(None, "--hypothesis", "-H", help="Optional working hypothesis to steer ACH and lead priority"),
-    username: Optional[List[str]] = typer.Option(None, "--username", "-u", help="Additional known @username"),
-    email: Optional[List[str]] = typer.Option(None, "--email", "-e", help="Additional known email"),
-    phone: Optional[List[str]] = typer.Option(None, "--phone", "-p", help="Additional known phone number"),
-    cred: Optional[List[str]] = typer.Option(None, "--cred", "-c", help="Additional known leaked credential (email:pass)"),
-    wallet: Optional[List[str]] = typer.Option(None, "--wallet", "-w", help="Additional known wallet/ENS"),
-    domain: Optional[List[str]] = typer.Option(None, "--domain", help="Additional known domain"),
+    username: Optional[List[str]] = typer.Option(None, "--username", "-u", help="Additional known @username (repeatable)"),
+    email: Optional[List[str]] = typer.Option(None, "--email", "-e", help="Additional known email (repeatable)"),
+    phone: Optional[List[str]] = typer.Option(None, "--phone", "-p", help="Additional known phone number (here -p is --phone; on `serve`, -p is --port)"),
+    cred: Optional[List[str]] = typer.Option(None, "--cred", "-c", help="Additional known leaked credential (email:pass) (repeatable)"),
+    wallet: Optional[List[str]] = typer.Option(None, "--wallet", "-w", help="Additional known wallet/ENS (repeatable)"),
+    domain: Optional[List[str]] = typer.Option(None, "--domain", help="Additional known domain (repeatable)"),
     doc: Optional[List[str]] = typer.Option(None, "--doc", help="Additional local .pdf/.docx evidence file"),
     exclude: Optional[List[str]] = typer.Option(None, "--exclude", "-x", help="Negative scope exclusion"),
     anchor_mode: AnchorMode = typer.Option(AnchorMode.CONVERGENCE, "--anchor-mode", help="convergence or locked_profile"),
@@ -370,7 +426,11 @@ def trace_command(
     pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
     confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
 ) -> None:
-    """Run an autonomous multi-domain Bunnyhole investigation down the rabbit hole."""
+    """Run an autonomous multi-domain Bunnyhole investigation down the rabbit hole.
+
+    Note: giving extra selectors (-u/-e/-p/-w/--domain/--doc/-x) or --hypothesis routes the run through `intake`,
+    with SEED treated as free text; for company work with several identifiers prefer `intake --org`.
+    """
     has_extra_intake = any([hypothesis, username, email, phone, cred, wallet, domain, doc, exclude])
     if has_extra_intake:
         intake_command(
@@ -425,7 +485,7 @@ def trace_command(
         initial_breadth=breadth,
         event_callback=_on_event,
         profile=prof,
-        **({"engagement": engagement} if engagement is not None else {}),
+        **_engagement_kwargs(engagement),
     )
     result = asyncio.run(orch.run_investigation())
     _render_investigation_results(result)
@@ -467,13 +527,44 @@ def link_command(
 
 @app.command("jet")
 def jet_command(
-    tail_or_hex: str = typer.Argument(..., help="US Tail Number (e.g., N628TS) or 24-bit ICAO Mode-S Hex"),
+    tail_or_hex: str = typer.Argument(..., help="US Tail Number (e.g., N628TS) or 24-bit ICAO Mode-S Hex (6 hex digits, e.g. a835af)"),
 ) -> None:
     """Convert FAA N-Number <-> 24-bit ICAO Hex and query unfiltered ADS-B telemetry (adsb.lol)."""
-    g = InvestigationGraph("jet_lookup", tail_or_hex)
+    parsed = parse_aircraft_selector(tail_or_hex)
+    if parsed is None:
+        console.print(
+            f"[bold red]Error:[/bold red] {_rich_escape(repr(tail_or_hex))} is neither a US N-number (e.g. N628TS) "
+            "nor a 6-hex-digit ICAO Mode-S address (e.g. a835af)."
+        )
+        raise typer.Exit(2)
+    query, icao_hex = parsed
+    g = InvestigationGraph("jet_lookup", query)
     acct = AccountantAgent(g)
-    info = asyncio.run(acct.investigate_aircraft_adsb(tail_or_hex, "seed:jet", hop_depth=1))
-    console.print(Panel(json.dumps(info, indent=2), title=f"✈️ ADS-B Forensics: {tail_or_hex} (ICAO Hex: {n_number_to_icao_hex(tail_or_hex)})"))
+    info = asyncio.run(acct.investigate_aircraft_adsb(query, "seed:jet", hop_depth=1))
+    console.print(
+        Panel(
+            _rich_escape(json.dumps(info, indent=2)),
+            title=f"✈️ ADS-B Forensics: {_rich_escape(query)} (ICAO Hex: {icao_hex})",
+        )
+    )
+
+
+_ICAO_HEX = re.compile(r"[0-9A-F]{6}")
+
+
+def parse_aircraft_selector(value: str) -> Optional[tuple[str, str]]:
+    """``(query, icao_hex)`` for a valid US N-number or 6-hex-digit ICAO address, else None.
+
+    ``query`` is the normalized (upper-case) input passed to the ADS-B lookup; ``icao_hex`` is lower-case.
+    """
+    q = (value or "").strip().upper()
+    if _ICAO_HEX.fullmatch(q):
+        return q, q.lower()
+    if q.startswith("N"):
+        icao = n_number_to_icao_hex(q)
+        if icao:
+            return q, icao.lower()
+    return None
 
 
 @app.command("darkweb")
@@ -560,11 +651,55 @@ def anonsurf_command(
 def doc_forensics_command(
     file_path: str = typer.Argument(..., help="Path to .docx or .pdf file to inspect for Word RSIDs or PDF XMP timezone leaks"),
 ) -> None:
-    """Extract binary Word RSID revision fingerprints (.docx) or PDF /Info & XMP timezone metadata (.pdf)."""
-    g = InvestigationGraph("doc_forensics", file_path)
+    """Extract binary Word RSID revision fingerprints (.docx) or PDF /Info & XMP timezone metadata (.pdf).
+
+    Exits 1 with a one-line message for a missing, unreadable, non-regular, unsupported or corrupt file.
+    """
+
+    def _fail(message: str) -> "typer.Exit":
+        console.print(f"[bold red]Error:[/bold red] {_rich_escape(message)}")
+        return typer.Exit(1)
+
+    raw = (file_path or "").strip()
+    if not raw:
+        raise _fail("doc-forensics needs the path of a .docx or .pdf file.")
+    path = Path(raw).expanduser()
+    if not path.exists():
+        raise _fail(f"File not found: {raw}")
+    if not path.is_file():
+        raise _fail(f"Not a regular file: {raw}")
+    kind = DOC_FORENSICS_TYPES.get(path.suffix.lower())
+    if kind is None:
+        raise _fail(f"Unsupported file type '{path.suffix or '(none)'}' for {raw}: doc-forensics reads .docx and .pdf.")
+    if not os.access(path, os.R_OK):
+        raise _fail(f"Permission denied: cannot read {raw}")
+
+    g = InvestigationGraph("doc_forensics", str(path))
     journo = JournalistAgent(g)
-    res = journo.inspect_document_binary_forensics(file_path)
-    console.print(Panel(json.dumps(res, indent=2), title=f"📄 Binary Document Forensics: {file_path}"))
+    with _quiet_document_libraries():
+        res = journo.inspect_document_binary_forensics(str(path))
+    if res.get("error"):
+        raise _fail(f"Could not parse {raw} as {kind}: {res['error']}")
+    console.print(Panel(_rich_escape(json.dumps(res, indent=2)), title=f"📄 Binary Document Forensics: {_rich_escape(raw)}"))
+
+
+DOC_FORENSICS_TYPES = {".docx": "a Word .docx (zip) file", ".pdf": "a PDF"}
+
+
+@contextlib.contextmanager
+def _quiet_document_libraries() -> Iterator[None]:
+    """Silence pypdf's logger and library warnings (e.g. 'incorrect startxref pointer') for one parse."""
+    loggers = [logging.getLogger(name) for name in ("pypdf", "PyPDF2")]
+    previous = [lg.level for lg in loggers]
+    try:
+        for lg in loggers:
+            lg.setLevel(logging.CRITICAL + 1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        for lg, level in zip(loggers, previous):
+            lg.setLevel(level)
 
 
 @app.command("doctor")
@@ -572,25 +707,32 @@ def doc_forensics_command(
 def doctor_command(
     install: Optional[str] = typer.Option(None, "--install", "-i", help="Install a missing tool by name (e.g. sherlock, maigret, subfinder) or 'all'"),
 ) -> None:
-    """Cross-Platform Arsenal Health Doctor & Tool Installer (Kali, Parrot OS, Debian, Arch, Fedora, macOS)."""
+    """Cross-Platform Arsenal Health Doctor & Tool Installer (Kali, Parrot OS, Debian, Arch, Fedora, macOS).
+
+    `--install all` installs every missing catalog tool (Python libraries go into the active environment via
+    `uv pip install`). Exits 1 when any requested install fails or the tool name is unknown.
+    """
     from bunnyhole.arsenal.manager import BUNNYHOLE_ENV_FILE, LEGACY_OSINT_ENV_FILE, ArsenalManager
 
     mgr = ArsenalManager()
     pinfo = mgr.platform_info
+    shown_platform = _rich_escape(pinfo["display_name"])  # e.g. "[arm64]" must not be read as Rich markup
 
+    failures = 0
     if install:
         tools_to_install = (
             [t["name"] for t in mgr.check_arsenal_status() if not t["installed"]]
-            if install.lower() == "all"
-            else [install]
+            if install.strip().lower() == "all"
+            else [install.strip()]
         )
         for tname in tools_to_install:
-            console.print(f"[bold cyan]⚙ Installing '{tname}' on {pinfo['display_name']}...[/bold cyan]")
+            console.print(f"[bold cyan]⚙ Installing '{_rich_escape(tname)}' on {shown_platform}...[/bold cyan]")
             res = mgr.install_tool(tname)
             if res.get("success"):
-                console.print(f"[bold green]✔ Installed {tname} via:[/bold green] {res.get('command')}")
+                console.print(f"[bold green]✔ Installed {_rich_escape(str(res.get('tool')))} via:[/bold green] {_rich_escape(str(res.get('command')))}")
             else:
-                console.print(f"[bold yellow]⚠ Could not auto-install {tname}:[/bold yellow] {res.get('error')}")
+                failures += 1
+                console.print(f"[bold yellow]⚠ Could not auto-install {_rich_escape(tname)}:[/bold yellow] {_rich_escape(str(res.get('error')))}")
 
     tools = mgr.check_arsenal_status()
     keys = mgr.get_api_keys_status()
@@ -599,12 +741,13 @@ def doctor_command(
 
     console.print(
         Panel(
-            f"[bold cyan]Detected OS:[/bold cyan] {pinfo['display_name']}  |  "
-            f"[bold magenta]Distro Profile:[/bold magenta] {pinfo['distro'].upper()}  |  "
-            f"[bold yellow]Package Manager:[/bold yellow] {pinfo['pkg_manager']}\n"
+            f"[bold cyan]Detected OS:[/bold cyan] {shown_platform}  |  "
+            f"[bold magenta]Distro Profile:[/bold magenta] {_rich_escape(pinfo['distro'].upper())}  |  "
+            f"[bold yellow]Package Manager:[/bold yellow] {_rich_escape(pinfo['pkg_manager'])}\n"
             f"[bold green]Tools Installed:[/bold green] {installed_cnt}/{len(tools)}  |  "
             f"[bold green]API Keys Configured:[/bold green] {configured_keys_cnt}/{len(keys)}\n"
-            f"[dim]Unified Vaults: {BUNNYHOLE_ENV_FILE}  <->  {LEGACY_OSINT_ENV_FILE}[/dim]",
+            f"[dim]Key vault: {_rich_escape(str(BUNNYHOLE_ENV_FILE))}  (legacy, read-only: "
+            f"{_rich_escape(str(LEGACY_OSINT_ENV_FILE))})[/dim]",
             title="🛠️ [bold white]BUNNYHOLE CROSS-PLATFORM ARSENAL DOCTOR[/bold white]",
             border_style="cyan",
         )
@@ -614,14 +757,16 @@ def doctor_command(
     t_table.add_column("Status", justify="center")
     t_table.add_column("Tool", style="bold white")
     t_table.add_column("Type", style="cyan")
-    t_table.add_column("Location / Binary", style="green")
-    t_table.add_column("Description / Install Hint", style="dim")
+    t_table.add_column("Location / Install hint", style="green", overflow="fold")
+    t_table.add_column("Description", style="dim", overflow="fold")
 
     for t in tools:
         badge = "[bold green]✔ READY[/bold green]" if t["installed"] else "[yellow]○ MISSING[/yellow]"
-        loc = t["location"] if t["installed"] else f"Hint: {t['install_hint']}"
-        t_table.add_row(badge, t["name"], t["type"], loc[:48], t["description"])
+        loc = t["location"] if t["installed"] else t["install_hint"]
+        t_table.add_row(badge, t["name"], t["type"], _rich_escape(loc), _rich_escape(t["description"]))
     console.print(t_table)
+    if failures:
+        raise typer.Exit(1)
 
 
 def _personalize(
@@ -691,7 +836,7 @@ def personas_command() -> None:
 
 @app.command("profile")
 def profile_command(
-    persona: Optional[str] = typer.Option(None, "--persona", help="Set the active investigator persona (see `bunnyhole personas`)."),
+    persona: Optional[str] = typer.Option(None, "--persona", callback=_persona_option, help="Set the active investigator persona (see `bunnyhole personas`)."),
     name: Optional[str] = typer.Option(None, "--name", help="Set your display name (attribution on dossiers)."),
     add_watch: Optional[List[str]] = typer.Option(None, "--watch", help="Add a recurring selector to your watchlist (repeatable)."),
     remove_watch: Optional[List[str]] = typer.Option(None, "--unwatch", help="Remove a selector from your watchlist (repeatable)."),
@@ -699,8 +844,8 @@ def profile_command(
     jurisdiction: Optional[List[str]] = typer.Option(None, "--jurisdiction", help="Set standing jurisdictions of interest (replaces; repeatable)."),
     exclude: Optional[List[str]] = typer.Option(None, "--exclude", "-x", help="Set standing default exclusions folded into every case (replaces; repeatable)."),
     gear: Optional[GearMode] = typer.Option(None, "--gear", "-g", help="Override the persona's default gear."),
-    depth: Optional[int] = typer.Option(None, "--depth", "-d", help="Override the persona's default depth (1-4)."),
-    breadth: Optional[int] = typer.Option(None, "--breadth", "-b", help="Override the persona's default breadth (2-8)."),
+    depth: Optional[int] = typer.Option(None, "--depth", "-d", min=DEPTH_MIN, max=DEPTH_MAX, help="Override the persona's default depth (1-4)."),
+    breadth: Optional[int] = typer.Option(None, "--breadth", "-b", min=BREADTH_MIN, max=BREADTH_MAX, help="Override the persona's default breadth (2-8)."),
     note: Optional[str] = typer.Option(None, "--note", help="Set a free-text note on your profile."),
 ) -> None:
     """View or edit your remembered investigator context (persona, watchlist, jurisdictions, defaults)."""
@@ -774,20 +919,20 @@ def profile_command(
 def keys_command(
     set_key: Optional[str] = typer.Option(None, "--set", "-s", help="Set an API key in KEY=VALUE format (e.g. SHODAN_API_KEY=xxx)"),
 ) -> None:
-    """View and configure API keys in the Unified Bunnyhole & OSINT Vault (~/.bunnyhole/api_keys.env)."""
-    from bunnyhole.arsenal.manager import BUNNYHOLE_ENV_FILE, LEGACY_OSINT_ENV_FILE, ArsenalManager
+    """View and configure API keys in the Bunnyhole vault ($BUNNYHOLE_HOME/api_keys.env, default ~/.bunnyhole).
 
-    mgr = ArsenalManager()
-    if set_key:
-        if "=" not in set_key:
-            console.print("[bold red]Error:[/bold red] Use --set KEY_NAME=VALUE")
-            raise typer.Exit(1)
-        k, v = set_key.split("=", 1)
-        mgr.set_api_key(k, v)
-        console.print(f"[bold green]✔ Saved {k.strip().upper()} to {BUNNYHOLE_ENV_FILE} and {LEGACY_OSINT_ENV_FILE}[/bold green]")
+    Exported shell variables always win over the vault. The legacy ~/.osint-apis/api_keys.env is read (merged
+    under the vault) but never written. Clear a key with --set NAME= (empty value).
+    """
+    from bunnyhole.arsenal import manager as arsenal
+
+    mgr = arsenal.ArsenalManager()
+    if set_key is not None:
+        if not _apply_key_assignment(mgr, set_key):
+            raise typer.Exit(2)
 
     keys = mgr.get_api_keys_status()
-    k_table = Table(title="🔑 Unified API Keys Vault (~/.bunnyhole/api_keys.env)", show_lines=False)
+    k_table = Table(title=f"🔑 API Keys Vault ({arsenal.BUNNYHOLE_ENV_FILE})", show_lines=False)
     k_table.add_column("State", justify="center")
     k_table.add_column("Environment Variable", style="bold white")
     k_table.add_column("Category", style="magenta")
@@ -795,10 +940,64 @@ def keys_command(
     k_table.add_column("Free Tier / Registration URL", style="dim")
 
     for item in keys:
-        badge = "[bold green]● SET[/bold green]" if item["configured"] else "[dim]○ EMPTY[/dim]"
+        if item["configured"]:
+            badge = f"[bold green]● SET ({item.get('source') or 'vault'})[/bold green]"
+        else:
+            badge = "[dim]○ EMPTY[/dim]"
         val = item["masked_value"] or "—"
-        k_table.add_row(badge, item["key"], item["category"], val, f"{item['url']} ({item['note']})")
+        info = f"{item['url']} ({item['note']})"
+        if item.get("reserved"):
+            info = f"({arsenal.RESERVED_LABEL}) {info}"
+        k_table.add_row(badge, item["key"], item["category"], val, _rich_escape(info))
     console.print(k_table)
+    console.print(
+        f"[dim]Shell exports win over the vault. Legacy file {_rich_escape(str(arsenal.LEGACY_OSINT_ENV_FILE))} "
+        "is read-only (merged under the vault, never written).[/dim]"
+    )
+
+
+def _print_allowed_key_names() -> None:
+    from bunnyhole.arsenal.manager import accepted_key_names
+
+    console.print("[bold]Allowed key names:[/bold]")
+    # One soft-wrapped line: Rich wraps it at the terminal width instead of truncating.
+    console.print(", ".join(accepted_key_names()), soft_wrap=False, overflow="fold")
+
+
+def _store_key(mgr: "ArsenalManager", name: str, value: str) -> bool:
+    """Save/clear one key through ``mgr.set_api_key`` and report it. Returns False (error printed) on bad input."""
+    from bunnyhole.arsenal.manager import UnknownKeyError
+
+    try:
+        result = mgr.set_api_key(name, value)
+    except UnknownKeyError:
+        console.print(f"[bold red]Error:[/bold red] unknown API key name {_rich_escape(repr(name.strip()))}.")
+        _print_allowed_key_names()
+        return False
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {_rich_escape(str(exc))}")
+        return False
+    path = _rich_escape(str(result["path"]))
+    if result["action"] == "cleared":
+        console.print(f"[bold green]✔ Cleared {result['key']} in {path}[/bold green]")
+    else:
+        console.print(f"[bold green]✔ Saved {result['key']} to {path}[/bold green]")
+    if result.get("shadowed_by_shell"):
+        console.print(
+            f"[bold yellow]⚠ {result['key']} is also exported in your shell; the shell value stays in effect "
+            "until you unset it.[/bold yellow]"
+        )
+    return True
+
+
+def _apply_key_assignment(mgr: "ArsenalManager", assignment: str) -> bool:
+    """Handle ``--set NAME=VALUE``. Returns False (error printed) on malformed input or an unknown name."""
+    if "=" not in assignment:
+        console.print("[bold red]Error:[/bold red] Use --set KEY_NAME=VALUE (an empty VALUE clears the key).")
+        _print_allowed_key_names()
+        return False
+    name, value = assignment.split("=", 1)
+    return _store_key(mgr, name, value)
 
 
 @app.command("cases")
@@ -806,9 +1005,15 @@ def cases_command(
     search: Optional[str] = typer.Option(None, "--search", "-q", help="Search across all historical entity sightings in ~/.bunnyhole/cases.db"),
     load: Optional[str] = typer.Option(None, "--load", "-l", help="Reload and display a saved case by Case ID"),
 ) -> None:
-    """Browse persistent SQLite investigations and search Cross-Case Entity Memory (~/.bunnyhole/cases.db)."""
+    """Browse persistent SQLite investigations and search Cross-Case Entity Memory ($BUNNYHOLE_HOME/cases.db, default ~/.bunnyhole)."""
     from bunnyhole.engine.storage import CASES_DB_PATH, CaseStore
 
+    if load is not None and not load.strip():
+        console.print("[bold red]Error:[/bold red] --load needs a case ID (see `bunnyhole cases`).")
+        raise typer.Exit(2)
+    if search is not None and not search.strip():
+        console.print("[bold red]Error:[/bold red] --search needs a non-empty entity substring.")
+        raise typer.Exit(2)
     store = CaseStore()
     if load:
         data = store.get_case(load.strip())
@@ -887,7 +1092,7 @@ def menu_command(ctx: typer.Context) -> None:
         console.print()
         console.print(
             Panel(
-                f"[bold white]Platform:[/bold white] {mgr.platform_info['display_name']} ({mgr.platform_info['distro'].upper()})\n\n"
+                f"[bold white]Platform:[/bold white] {_rich_escape(mgr.platform_info['display_name'])} ({_rich_escape(mgr.platform_info['distro'].upper())})\n\n"
                 "[bold cyan][1][/bold cyan] 🎯 Run Rabbit-Hole Trace (Journalism + Accounting + OSINT + On-Chain + Link Sleuth)\n"
                 "[bold cyan][2][/bold cyan] 🔗 Run Bidirectional Link Sleuth (Connect Entity A ↔ Entity B)\n"
                 "[bold cyan][3][/bold cyan] 🛠️  Arsenal Health Doctor & Tool Installer (Kali / Parrot / Debian / Arch / macOS)\n"
@@ -906,7 +1111,7 @@ def menu_command(ctx: typer.Context) -> None:
         elif choice == "1":
             seed = Prompt.ask("Enter seed trace (company, domain, wallet/ENS, @handle, email, or tail number)", default="vitalik.eth")
             gear_str = Prompt.ask("Select gear", choices=["fast", "deep"], default="fast")
-            depth = int(Prompt.ask("Select recursive depth", choices=["1", "2", "3"], default="2"))
+            depth = int(Prompt.ask("Select recursive depth", choices=[str(d) for d in range(DEPTH_MIN, DEPTH_MAX + 1)], default="2"))
             # Pass EVERY parameter explicitly: omitted Typer options would stay as truthy OptionInfo
             # objects and wrongly trigger the multi-selector intake path (TypeError on list(OptionInfo)).
             trace_command(
@@ -926,17 +1131,30 @@ def menu_command(ctx: typer.Context) -> None:
             doctor_command(install=None)
             to_inst = Prompt.ask("Enter tool name to install (or 'all', or press Enter to skip)", default="")
             if to_inst.strip():
-                doctor_command(install=to_inst.strip())
+                try:
+                    doctor_command(install=to_inst.strip())
+                except typer.Exit:
+                    pass  # the failure was already printed; stay in the menu
         elif choice == "4":
             keys_command(set_key=None)
             kname = Prompt.ask("Enter API Key variable name to set (or press Enter to return)", default="")
             if kname.strip():
-                kval = Prompt.ask(f"Enter value for {kname.strip().upper()}", password=True)
-                mgr.set_api_key(kname.strip(), kval.strip())
-                console.print(f"[bold green]✔ Updated {kname.strip().upper()}[/bold green]")
+                from bunnyhole.arsenal.manager import UnknownKeyError, canonical_key_name
+
+                try:
+                    canonical = canonical_key_name(kname)
+                except UnknownKeyError:
+                    console.print(f"[bold red]Error:[/bold red] unknown API key name {_rich_escape(repr(kname.strip()))}.")
+                    _print_allowed_key_names()
+                    continue
+                kval = Prompt.ask(f"Enter value for {canonical} (empty clears it)", password=True)
+                _store_key(mgr, canonical, kval)
         elif choice == "5":
             tail = Prompt.ask("Enter FAA Tail Number or ICAO Hex", default="N628TS")
-            jet_command(tail_or_hex=tail)
+            try:
+                jet_command(tail_or_hex=tail)
+            except typer.Exit:
+                pass  # the validation error was printed; back to the menu
         elif choice == "6":
             cases_command(search=None, load=None)
             q = Prompt.ask("Enter entity substring to search across cases (or press Enter to skip)", default="")
@@ -988,20 +1206,41 @@ def mcp_command(
 
 @app.command("serve")
 def serve_command(
-    host: str = typer.Option("127.0.0.1", "--host", help="Bind host"),
-    port: int = typer.Option(8000, "--port", "-p", help="Bind port"),
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="Bind host. A non-loopback host requires BUNNYHOLE_API_TOKEN in the environment."
+    ),
+    port: int = typer.Option(8000, "--port", "-p", min=1, max=65535, help="Bind port (here -p is --port; on trace/intake, -p is --phone)"),
 ) -> None:
-    """Launch the Bunnyhole Interactive Web War-Room & FastAPI Server."""
-    console.print(f"[bold bright_magenta]🐇🕳️ Launching Bunnyhole War-Room UI at http://{host}:{port}[/bold bright_magenta]")
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        console.print(
-            f"[bold yellow]⚠ WARNING:[/bold yellow] binding to a non-loopback host ([bold]{host}[/bold]) exposes the "
-            "War-Room API to your network. Set [bold]BUNNYHOLE_API_TOKEN[/bold] before doing so, and never expose it "
-            "to an untrusted network — the server stores API keys and case data."
-        )
+    """Launch the Bunnyhole Interactive Web War-Room & FastAPI Server.
+
+    Loopback hosts (127.0.0.1, localhost, ::1) start without a token. Any other host is refused (exit 2)
+    unless BUNNYHOLE_API_TOKEN is set, because the server stores API keys and case data.
+    """
+    if not is_loopback_host(host):
         if not os.environ.get("BUNNYHOLE_API_TOKEN", "").strip():
-            console.print("[bold red]  No BUNNYHOLE_API_TOKEN set: mutating endpoints will be unauthenticated.[/bold red]")
+            console.print(
+                f"[bold red]Refusing to bind to non-loopback host {_rich_escape(host)}:[/bold red] set "
+                "[bold]BUNNYHOLE_API_TOKEN[/bold] in the environment first (every client must then send it), or bind to "
+                "127.0.0.1. The server stores API keys and case data; never expose it to an untrusted network."
+            )
+            raise typer.Exit(2)
+        console.print(
+            f"[bold yellow]⚠ WARNING:[/bold yellow] binding to a non-loopback host ([bold]{_rich_escape(host)}[/bold]) "
+            "exposes the War-Room API to your network (BUNNYHOLE_API_TOKEN is set)."
+        )
+    console.print(f"[bold bright_magenta]🐇🕳️ Launching Bunnyhole War-Room UI at http://{_rich_escape(host)}:{port}[/bold bright_magenta]")
     uvicorn.run("bunnyhole.api.server:app", host=host, port=port, reload=False)
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for ``localhost`` and any loopback IP literal (127.0.0.0/8, ::1), with or without IPv6 brackets."""
+    h = (host or "").strip().strip("[]").lower()
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 if __name__ == "__main__":

@@ -134,8 +134,33 @@ _PERSONAS: Dict[Persona, PersonaProfile] = {
 }
 
 
+class UnknownPersonaError(ValueError):
+    """A persona key that is not one of :func:`persona_keys`. ``str()`` lists the valid keys."""
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+        super().__init__(f"Unknown persona {str(value)!r}. Valid personas: {', '.join(persona_keys())}")
+
+
+def parse_persona(value: "Persona | str") -> Persona:
+    """Strict: the :class:`Persona` for ``value`` (case-insensitive, surrounding spaces ignored).
+
+    Raises :class:`UnknownPersonaError` for anything else. Use this at user-facing boundaries (CLI flags, API
+    input); :func:`coerce_persona` stays lenient for stored/internal values.
+    """
+    if isinstance(value, Persona):
+        return value
+    try:
+        return Persona(str(value).strip().lower())
+    except ValueError:
+        raise UnknownPersonaError(value) from None
+
+
 def coerce_persona(value: "Persona | str | None") -> Persona:
-    """Best-effort: turn a string/enum/None into a :class:`Persona`, defaulting to GENERALIST."""
+    """Best-effort: turn a string/enum/None into a :class:`Persona`, defaulting to GENERALIST.
+
+    Lenient by design (stored profiles, internal callers). User input should go through :func:`parse_persona`.
+    """
     if value is None:
         return Persona.GENERALIST
     if isinstance(value, Persona):

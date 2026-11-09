@@ -87,8 +87,8 @@ uv run bunnyhole cases --search "BrightPeak"
 | --- | --- | --- |
 | `--gear fast` (default) | Quick scan of public APIs | First look at any lead |
 | `--gear deep` | Adds slower, heavier sources | A lead that looks worth the time |
-| `--depth 1–4` | How many hops it follows out | Higher = wider net, slower |
-| `--breadth 2–8` | How many leads per hop | Higher = more thorough |
+| `--depth 1–4` | How many hops it follows out (other values are refused) | Higher = wider net, slower |
+| `--breadth 2–8` | How many leads per hop (other values are refused) | Higher = more thorough |
 | `--out report.md` | Saves a Markdown report | Anything you want to keep/share |
 | `--hypothesis "..."` | A question to focus the scan | Qualifying a specific lead |
 
@@ -121,3 +121,9 @@ uv run bunnyhole --help
 ```bash
 uv run bunnyhole trace --help
 ```
+
+- **Optional API keys:** `uv run bunnyhole keys` shows them; `uv run bunnyhole keys --set NAME=VALUE` saves one
+  (`NAME=` clears it). A key exported in your shell wins over the saved one. Bunnyhole does not read `.env` files.
+- **Web dashboard:** `uv run bunnyhole serve` opens it on this computer only (http://127.0.0.1:8000). To serve it on
+  your network (`--host 0.0.0.0`) you must first `export BUNNYHOLE_API_TOKEN=<a long random string>`; without it
+  `serve` refuses to start.

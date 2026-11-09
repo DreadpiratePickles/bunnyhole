@@ -23,6 +23,7 @@ from bunnyhole.engine.models import (
     RelationType,
     SelectorStrength,
     TimelineItem,
+    selector_token_match,
 )
 
 # Known Commercial Registered Agents (Delaware, Wyoming, Nevada, Cayman, BVI) that create false-positive ownership links
@@ -81,11 +82,15 @@ class InvestigationGraph:
         self._event_listeners: List[Callable[[Dict[str, Any]], None]] = []
 
     def is_excluded(self, text_or_id: str) -> bool:
-        """Check if a selector, label, or node ID matches the user's negative scope exclusions."""
+        """Check if a selector, label, or node ID matches the user's negative scope exclusions.
+
+        Matches on token/label boundaries (domains by exact host or subdomain suffix, wallets/handles
+        exactly, names by whole word), so a short exclusion like 'ab' no longer blocks 'cabinet.com'.
+        """
         if not self.exclusions:
             return False
         low = text_or_id.lower().strip()
-        return any(ex in low for ex in self.exclusions)
+        return any(selector_token_match(ex, low) for ex in self.exclusions)
 
     def subscribe(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """Subscribe to real-time graph mutations and agent telemetry."""
@@ -167,29 +172,66 @@ class InvestigationGraph:
             self._emit("node_upsert", node.model_dump())
             return node
 
-    def upsert_edge(self, edge: GraphEdge) -> GraphEdge:
-        """Insert or merge an edge while applying Red-Cell Skeptic guardrails."""
+    @staticmethod
+    def _tier_for_confidence(confidence: float) -> ConfidenceTier:
+        """Map a confidence score onto its tier (same thresholds as GraphEdge.model_post_init)."""
+        if confidence >= 0.90:
+            return ConfidenceTier.VERIFIED
+        if confidence >= 0.65:
+            return ConfidenceTier.CORROBORATED
+        if confidence >= 0.35:
+            return ConfidenceTier.CIRCUMSTANTIAL
+        return ConfidenceTier.HYPOTHESIS
+
+    @staticmethod
+    def _append_note(existing: Optional[str], note: str) -> str:
+        """Append a skeptic note without overwriting or duplicating an existing one."""
+        if not existing:
+            return note
+        if note in existing:
+            return existing
+        return f"{existing} | {note}"
+
+    def _apply_edge_guardrails(self, edge: GraphEdge) -> GraphEdge:
+        """Apply the Red-Cell Skeptic guardrails to ``edge`` from the CURRENT node flags.
+
+        Caps are idempotent (``min`` on confidence, weakest tier wins) and notes append rather than
+        overwrite, so this runs both on insert and on a final normalisation pass — making the result
+        independent of the order edges and their nodes were inserted.
+        """
         target_node = self.nodes.get(edge.target_id)
         source_node = self.nodes.get(edge.source_id)
+        tier_rank = {
+            ConfidenceTier.VERIFIED: 3,
+            ConfidenceTier.CORROBORATED: 2,
+            ConfidenceTier.CIRCUMSTANTIAL: 1,
+            ConfidenceTier.HYPOTHESIS: 0,
+        }
+
+        def cap_tier(tier: ConfidenceTier) -> None:
+            if tier_rank[tier] < tier_rank[edge.tier]:
+                edge.tier = tier
 
         # Guardrail 1: Downgrade Registered Agent address links
         if target_node and "MASS_REGISTERED_AGENT_ADDRESS" in target_node.risk_flags:
             edge.confidence = min(edge.confidence, 0.30)
             edge.admiralty_code = "B5"
-            edge.tier = ConfidenceTier.HYPOTHESIS
-            edge.skeptic_notes = (
+            cap_tier(ConfidenceTier.HYPOTHESIS)
+            edge.skeptic_notes = self._append_note(
+                edge.skeptic_notes,
                 "Red-Cell Skeptic Filter: Target is a mass Registered Agent address. "
-                "Downgraded confidence to prevent false-positive shell clustering."
+                "Downgraded confidence to prevent false-positive shell clustering.",
             )
 
         # Guardrail 2: Downgrade Anycast CDN IP links
         if target_node and "SHARED_ANYCAST_CDN_IP" in target_node.risk_flags:
             edge.confidence = min(edge.confidence, 0.35)
             edge.admiralty_code = "A4"
-            edge.tier = ConfidenceTier.CIRCUMSTANTIAL
-            edge.skeptic_notes = (
+            cap_tier(ConfidenceTier.CIRCUMSTANTIAL)
+            edge.skeptic_notes = self._append_note(
+                edge.skeptic_notes,
                 "Red-Cell Skeptic Filter: Target IP is an Anycast CDN proxy (e.g., Cloudflare/Fastly). "
-                "Shared CDN IPs do not prove shared server ownership."
+                "Shared CDN IPs do not prove shared server ownership.",
             )
 
         # Guardrail 3: NSA Soft -> Soft Selector Chaining Warning
@@ -200,19 +242,76 @@ class InvestigationGraph:
             and target_node.selector_strength == SelectorStrength.SOFT
         ):
             edge.confidence = min(edge.confidence, 0.45)
-            edge.tier = ConfidenceTier.CIRCUMSTANTIAL
-            edge.skeptic_notes = (
-                "NSA Selector Rule: Soft-to-Soft selector link. Requires secondary Strong selector corroboration."
+            cap_tier(ConfidenceTier.CIRCUMSTANTIAL)
+            edge.skeptic_notes = self._append_note(
+                edge.skeptic_notes,
+                "NSA Selector Rule: Soft-to-Soft selector link. Requires secondary Strong selector corroboration.",
             )
+        return edge
+
+    def normalize_edges(self) -> None:
+        """Re-apply every guardrail to every edge against the final node state.
+
+        This makes edge confidences/tiers independent of insertion order: an edge inserted before
+        its target node was flagged (registered agent / CDN) is still downgraded here.
+        """
+        for edge in self.edges.values():
+            self._apply_edge_guardrails(edge)
+            if self.nx_graph.has_edge(edge.source_id, edge.target_id, key=edge.id):
+                self.nx_graph.edges[edge.source_id, edge.target_id, edge.id].update(edge.model_dump())
+
+    @staticmethod
+    def _min_date(*dates: Optional[str]) -> Optional[str]:
+        vals = [d for d in dates if d]
+        return min(vals) if vals else None
+
+    @staticmethod
+    def _max_date(*dates: Optional[str]) -> Optional[str]:
+        vals = [d for d in dates if d]
+        return max(vals) if vals else None
+
+    def upsert_edge(self, edge: GraphEdge) -> GraphEdge:
+        """Insert or merge an edge while applying Red-Cell Skeptic guardrails.
+
+        A merge KEEPS data instead of discarding it: amounts are summed, event dates widened to an
+        earliest/latest span, the strongest admiralty grade kept, distinct summaries concatenated,
+        and every contributor's receipts retained. Re-merging the SAME observation (no new receipts)
+        is idempotent and does not double-count the amount or the merged_count.
+        """
+        self._apply_edge_guardrails(edge)
+        if edge.event_date_earliest is None:
+            edge.event_date_earliest = edge.event_date
+        if edge.event_date_latest is None:
+            edge.event_date_latest = edge.event_date
 
         if edge.id in self.edges:
             existing = self.edges[edge.id]
-            existing.confidence = max(existing.confidence, edge.confidence)
             existing_rcpt_ids = {r.receipt_id for r in existing.receipts}
-            for rcpt in edge.receipts:
-                if rcpt.receipt_id not in existing_rcpt_ids:
-                    existing.receipts.append(rcpt)
-                    existing_rcpt_ids.add(rcpt.receipt_id)
+            new_receipts = [r for r in edge.receipts if r.receipt_id not in existing_rcpt_ids]
+            # A contribution counts only when it brings at least one receipt not already seen, OR the
+            # incoming edge carries no receipts at all (nothing to dedup on). Same-event re-merges
+            # (all receipts already present) are idempotent.
+            is_new_contribution = bool(new_receipts) or not edge.receipts
+            for rcpt in new_receipts:
+                existing.receipts.append(rcpt)
+                existing_rcpt_ids.add(rcpt.receipt_id)
+
+            existing.confidence = max(existing.confidence, edge.confidence)
+            # Strongest admiralty grade (A1 < B5 lexicographically = stronger) unless a guardrail pinned it.
+            existing.admiralty_code = min(existing.admiralty_code, edge.admiralty_code)
+            existing.tier = self._tier_for_confidence(existing.confidence)
+            self._apply_edge_guardrails(existing)  # re-cap after confidence/tier recompute
+            existing.event_date_earliest = self._min_date(existing.event_date_earliest, edge.event_date_earliest)
+            existing.event_date_latest = self._max_date(existing.event_date_latest, edge.event_date_latest)
+
+            if is_new_contribution:
+                existing.merged_count += 1
+                if edge.amount_usd is not None:
+                    existing.amount_usd = (existing.amount_usd or 0.0) + edge.amount_usd
+                if edge.summary and edge.summary not in existing.summary:
+                    merged_summary = f"{existing.summary} | {edge.summary}" if existing.summary else edge.summary
+                    existing.summary = merged_summary[:600]  # bounded
+
             if self.nx_graph.has_edge(existing.source_id, existing.target_id, key=existing.id):
                 self.nx_graph.edges[existing.source_id, existing.target_id, existing.id].update(existing.model_dump())
             self._emit("edge_upsert", existing.model_dump())
@@ -285,39 +384,68 @@ class InvestigationGraph:
         return selected
 
     @staticmethod
-    def normalize_iso_timestamp(raw_ts: str) -> str:
-        """Normalize RFC-2822 RSS dates, Unix epochs, YYYY-MM-DD, or bare YYYY years into sortable ISO-8601 UTC."""
+    def normalize_iso_timestamp_full(raw_ts: str) -> tuple[Optional[str], Optional[str]]:
+        """Normalize any supported timestamp into UTC ISO-8601 ``...Z``.
+
+        Returns ``(iso_or_None, anomaly_flag_or_None)``. Supported: bare year, ``YYYY-MM-DD``,
+        Unix epoch seconds (9-10 digits) and milliseconds (13 digits), full ISO-8601 with a ``Z`` or
+        numeric offset (converted to UTC), and RFC-2822 (``-0000`` / missing zone read as UTC, not
+        local). An empty string defaults to now (flagged); anything unparseable or an impossible date
+        (``2025-13-45``) returns ``(None, flag)`` and never raises.
+        """
+        from email.utils import parsedate_to_datetime
+
+        def to_utc_z(dt: datetime) -> str:
+            if dt.tzinfo is None:  # RFC-2822 '-0000' / naive: treat as UTC, never shift by local zone
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         s = (raw_ts or "").strip()
         if not s:
-            return datetime.now(timezone.utc).isoformat()
-        # Bare 4-digit year (e.g. "2024")
+            return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "EMPTY_TIMESTAMP_DEFAULTED_TO_NOW"
         if re.match(r"^\d{4}$", s):
-            return f"{s}-01-01T00:00:00Z"
-        # YYYY-MM-DD
+            return f"{s}-01-01T00:00:00Z", None
         if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-            return f"{s}T00:00:00Z"
-        # Unix epoch seconds
-        if re.match(r"^\d{9,10}$", s):
             try:
-                return datetime.fromtimestamp(int(s), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            except Exception:
-                pass
-        # Already ISO-8601 starting with YYYY-MM-DD
-        if re.match(r"^\d{4}-\d{2}-\d{2}[T\s]", s):
-            return s.replace(" ", "T")
-        # RFC-2822 (e.g., "Tue, 14 Oct 2025 12:30:00 GMT")
-        try:
-            from email.utils import parsedate_to_datetime
+                datetime.strptime(s, "%Y-%m-%d")  # reject impossible dates (2025-13-45)
+            except ValueError:
+                return None, "INVALID_TIMESTAMP"
+            return f"{s}T00:00:00Z", None
+        if re.match(r"^\d{13}$", s):  # epoch milliseconds
+            try:
+                return to_utc_z(datetime.fromtimestamp(int(s) / 1000, tz=timezone.utc)), None
+            except (ValueError, OverflowError, OSError):
+                return None, "INVALID_TIMESTAMP"
+        if re.match(r"^\d{9,10}$", s):  # epoch seconds
+            try:
+                return to_utc_z(datetime.fromtimestamp(int(s), tz=timezone.utc)), None
+            except (ValueError, OverflowError, OSError):
+                return None, "INVALID_TIMESTAMP"
+        if re.match(r"^\d{4}-\d{2}-\d{2}[T\s]", s):  # ISO-8601 with time (any offset incl. +02:00 / Z)
+            try:
+                iso = s.replace(" ", "T").replace("Z", "+00:00")
+                return to_utc_z(datetime.fromisoformat(iso)), None
+            except ValueError:
+                return None, "INVALID_TIMESTAMP"
+        try:  # RFC-2822 (e.g., "Tue, 14 Oct 2025 12:30:00 GMT" / "... -0000")
+            return to_utc_z(parsedate_to_datetime(s)), None
+        except (ValueError, TypeError):
+            return None, "UNPARSEABLE_TIMESTAMP"
 
-            dt = parsedate_to_datetime(s)
-            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        except Exception:
-            return s
+    @classmethod
+    def normalize_iso_timestamp(cls, raw_ts: str) -> str:
+        """Back-compatible string form: the normalized UTC ISO-8601 timestamp, or the raw input when
+        it could not be parsed (so a value is always returned and never crashes)."""
+        iso, _flag = cls.normalize_iso_timestamp_full(raw_ts)
+        return iso if iso is not None else (raw_ts or "").strip()
 
     def add_timeline_event(self, item: TimelineItem) -> None:
-        item.timestamp = self.normalize_iso_timestamp(item.timestamp)
+        iso, flag = self.normalize_iso_timestamp_full(item.timestamp)
+        item.timestamp = iso if iso is not None else ""
+        if flag and not item.anomaly_flag:
+            item.anomaly_flag = flag
         self.timeline.append(item)
-        self.timeline.sort(key=lambda x: x.timestamp)
+        self.timeline.sort(key=lambda x: x.timestamp or "")
         self._emit("timeline_event", item.model_dump())
 
     def run_skeptic_network_analytics(self) -> ACHAssessment:
@@ -327,6 +455,9 @@ class InvestigationGraph:
         2. Cross-Domain Timeline Contradiction Detection (Public Claims vs Insider Actions within +-14 days).
         3. CIA Analysis of Competing Hypotheses (ACH) Matrix evaluation.
         """
+        # Final guardrail normalisation: downgrade every edge from the final node state before the ACH
+        # reads it, so a downgraded (CDN / registered-agent / soft-soft) edge cannot score as HIGH.
+        self.normalize_edges()
         if len(self.nx_graph.nodes) > 2:
             simple_g = nx.Graph(self.nx_graph.to_undirected())
             centrality = nx.betweenness_centrality(simple_g, normalized=True)
@@ -379,6 +510,25 @@ class InvestigationGraph:
             if not edge.receipts:
                 continue
             rcpt = edge.receipts[0]
+            # A guardrail-downgraded edge (CDN / registered agent / soft-soft) has had its confidence
+            # capped below 0.5: read that downgrade FIRST, so a SHARES_FINGERPRINT_WITH edge to a CDN
+            # IP supports the coincidence hypothesis (H2), not coordinated control (H1).
+            if edge.confidence < 0.5:
+                diag = "LOW"
+                h1, h2, h3 = "0", "++", "0"
+                h2_score += 2.0
+                rows.append(
+                    ACHHypothesisRow(
+                        evidence_id=rcpt.receipt_id,
+                        evidence_summary=f"[{edge.relation.value}] {rcpt.extracted_fact[:120]}",
+                        admiralty_code=edge.admiralty_code,
+                        diagnosticity=diag,
+                        h1_coordinated_control=h1,
+                        h2_coincidence_shared_vendor=h2,
+                        h3_false_flag_spoofing=h3,
+                    )
+                )
+                continue
             # Evaluate diagnosticity based on relation & selector strength
             if edge.relation in (
                 RelationType.SHARED_CEX_DEPOSIT,
@@ -590,6 +740,11 @@ class InvestigationGraph:
             "logs": [lg.model_dump() for lg in self.logs[-100:]],
         }
 
+    @staticmethod
+    def _md_cell(text: Any) -> str:
+        """Escape a value for a Markdown table cell: pipes and newlines would otherwise break the row."""
+        return str(text).replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
     def export_markdown_dossier(self) -> str:
         """Compile a publication-ready Bellingcat / Hindenburg / ZachXBT style Markdown Dossier with SHA-256 Receipts."""
         data = self.to_dict()
@@ -664,10 +819,10 @@ class InvestigationGraph:
         ])
         sorted_nodes = sorted(self.nodes.values(), key=lambda x: (x.is_cutout_broker, x.smoke_score), reverse=True)
         for n in sorted_nodes[:25]:
-            flags = ", ".join(f"`{f}`" for f in n.risk_flags) if n.risk_flags else "—"
+            flags = ", ".join(f"`{self._md_cell(f)}`" for f in n.risk_flags) if n.risk_flags else "—"
             cutout = " 🔥 **[CUT-OUT BRIDGE]**" if n.is_cutout_broker else ""
             lines.append(
-                f"| **{n.label}**{cutout} | `{n.entity_type.value}` | `{n.domain.value}` | **{n.smoke_score:.0f}/100** | `{n.betweenness_centrality:.3f}` | {flags} |"
+                f"| **{self._md_cell(n.label)}**{cutout} | `{n.entity_type.value}` | `{n.domain.value}` | **{n.smoke_score:.0f}/100** | `{n.betweenness_centrality:.3f}` | {flags} |"
             )
 
         if self.timeline:
@@ -682,7 +837,8 @@ class InvestigationGraph:
             for t in self.timeline[:30]:
                 flag_str = f" ⚠️ **{t.anomaly_flag}**" if t.anomaly_flag else ""
                 lines.append(
-                    f"| `{t.timestamp[:19]}` | `{t.domain.value}` | `{t.admiralty_code}` | **{t.title}**{flag_str} | {t.description[:140]} |"
+                    f"| `{t.timestamp[:19]}` | `{t.domain.value}` | `{t.admiralty_code}` | "
+                    f"**{self._md_cell(t.title)}**{flag_str} | {self._md_cell(t.description[:140])} |"
                 )
 
         lines.extend([
@@ -692,18 +848,22 @@ class InvestigationGraph:
             "## 4. Cryptographic & URL Evidence Receipts Ledger",
         ])
         seen_rcpts: Set[str] = set()
-        for e in self.edges.values():
-            for r in e.receipts:
-                if r.receipt_id in seen_rcpts:
-                    continue
-                seen_rcpts.add(r.receipt_id)
-                lines.extend([
-                    f"### Receipt `{r.receipt_id}` — NATO Grade `{r.admiralty_code}` ({r.tool})",
-                    f"- **Fact Proven:** {r.extracted_fact}",
-                    f"- **Source URL:** {r.source_url}",
-                    f"- **SHA-256 Proof:** `{r.sha256_proof}`",
-                    f"- **Raw Excerpt:** `{r.raw_snippet[:240]}`",
-                    "",
-                ])
+        # Both edge AND node receipts belong in the ledger — node receipts (seed anchors, cross-case
+        # memory hits, sanctions screens) were previously omitted, so their proofs never appeared.
+        receipt_sources = [r for e in self.edges.values() for r in e.receipts] + [
+            r for n in self.nodes.values() for r in n.receipts
+        ]
+        for r in receipt_sources:
+            if r.receipt_id in seen_rcpts:
+                continue
+            seen_rcpts.add(r.receipt_id)
+            lines.extend([
+                f"### Receipt `{r.receipt_id}` — NATO Grade `{r.admiralty_code}` ({r.tool})",
+                f"- **Fact Proven:** {r.extracted_fact}",
+                f"- **Source URL:** {r.source_url}",
+                f"- **SHA-256 Proof:** `{r.sha256_proof}`",
+                f"- **Raw Excerpt:** `{r.raw_snippet[:240]}`",
+                "",
+            ])
 
         return "\n".join(lines)

@@ -304,7 +304,7 @@ def _build_findings(
                 finding_label=label_finding(count),
                 source_count=count,
                 freshness=freshness_class(as_of, kind, now_iso=now_iso) if as_of else "unknown",
-                relevance=rel,  # type: ignore[arg-type]
+                relevance=rel,
                 relevance_reason=reason,
             )
         )

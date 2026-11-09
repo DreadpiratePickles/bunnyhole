@@ -1,6 +1,6 @@
 [project]
 name = "bunnyhole"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Autonomous Multi-Domain Investigative AI: Journalism, Forensic Accounting, Red Team/SIGINT OSINT, Physical/Aviation/Maritime Recon, and On-Chain Crypto Forensics"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,22 +22,19 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Topic :: Internet",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "scrapling>=0.2.9",
-    "curl-cffi>=0.7.0",
-    "trafilatura>=1.12.0",
-    "waybackpy>=3.0.6",
-    "edgartools>=2.20.0",
-    "socid-extractor>=0.0.26",
-    "holehe>=1.61",
     "dnspython>=2.6.1",
     "mmh3>=4.1.0",
     "pypdf>=5.0.0",
-    "fastapi>=0.115.0",
+    # >=0.132: JSON bodies without an application/json Content-Type are rejected (CSRF hardening; text/plain
+    # has been rejected since 0.65.2).
+    "fastapi>=0.132.0",
     "uvicorn[standard]>=0.30.0",
     "httpx[socks]>=0.27.0",
     "networkx>=3.3",
@@ -45,13 +42,22 @@ dependencies = [
     "textual>=0.80",
     "typer>=0.12.5",
     "pydantic>=2.9.0",
-    "python-dotenv>=1.0.1",
-    "beautifulsoup4>=4.12.3",
-    "lxml>=5.3.0",
-    "mcp>=1.2.0",
+    # mcp.server.mcpserver.MCPServer (the v2 API) first ships in 2.0.0.
+    "mcp>=2.0.0",
 ]
 
 [project.optional-dependencies]
+# Optional local arsenal libraries. Bunnyhole never imports them: `bunnyhole arsenal` only probes for them
+# (importlib.util.find_spec / shutil.which) and reports "Not installed" with an install hint when absent.
+# Install with: uv sync --extra arsenal
+arsenal = [
+    "scrapling>=0.2.9",
+    "trafilatura>=1.12.0",
+    "waybackpy>=3.0.6",
+    "edgartools>=2.20.0",
+    "socid-extractor>=0.0.26",
+    "holehe>=1.61",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -61,9 +67,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/bunnyhole"
-Repository = "https://github.com/your-org/bunnyhole"
-Issues = "https://github.com/your-org/bunnyhole/issues"
+Homepage = "https://github.com/DreadpiratePickles/bunnyhole"
+Repository = "https://github.com/DreadpiratePickles/bunnyhole"
+Issues = "https://github.com/DreadpiratePickles/bunnyhole/issues"
 
 [project.scripts]
 bunnyhole = "bunnyhole.cli.main:app"
@@ -72,8 +78,19 @@ bunnyhole = "bunnyhole.cli.main:app"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "bunnyhole/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["bunnyhole"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "bunnyhole/",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -83,8 +100,6 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-# Quarantined legacy script (see its header): deprecated, gated off, scheduled for removal.
-extend-exclude = ["scripts/osint_orchestrator.py"]
 
 [tool.ruff.lint]
 # Focus on correctness-relevant rules. PEP585/604 annotation modernization (UP) is intentionally
@@ -98,5 +113,9 @@ python_version = "3.11"
 plugins = ["pydantic.mypy"]
 warn_unused_ignores = true
 warn_redundant_casts = true
-ignore_missing_imports = true
 check_untyped_defs = true
+
+# networkx ships no type hints (types-networkx is not a dependency); every other import is typed.
+[[tool.mypy.overrides]]
+module = ["networkx", "networkx.*"]
+ignore_missing_imports = true

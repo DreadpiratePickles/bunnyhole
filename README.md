@@ -95,19 +95,28 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).
 git clone https://github.com/DreadpiratePickles/bunnyhole.git && cd bunnyhole
 uv sync                 # runtime deps
 uv sync --extra dev     # + test/lint/type tooling
+uv sync --extra arsenal # + optional arsenal libraries: scrapling, trafilatura, waybackpy, edgartools, socid-extractor, holehe
 uv run bunnyhole --help # list every command
 ```
 
-Version 0.2.0. There is no install step beyond `uv sync`; every command below is run as
+`uv sync` removes extras you leave out, so name every extra you want in one command (for example
+`uv sync --extra dev --extra arsenal`). The arsenal libraries are optional: `bunnyhole arsenal` only reports them.
+
+`uv run bunnyhole --version` prints the version. There is no install step beyond `uv sync`; every command below is run as
 `uv run bunnyhole <command>` from the checkout. Nothing needs an API key to start (see
 [Configuration](#-configuration-api-keys)).
 
 Bunnyhole runs great on nothing but free public endpoints. Want the heavy DEEP-gear tools too?
 
 ```bash
-uv run bunnyhole doctor                       # health-check the arsenal + your API keys
-python scripts/install_osint_tools.py         # cross-platform installer (Kali / Parrot / macOS)
+uv run bunnyhole doctor                              # health-check the arsenal + your API keys
+uv run python scripts/install_osint_tools.py --check # non-destructive tool health check
+uv run python scripts/install_osint_tools.py         # cross-platform installer (macOS; Linux without root: user-space tools only)
+sudo python3 scripts/install_osint_tools.py          # Linux with root: adds apt / pacman / dnf packages
 ```
+
+The installer script needs only the Python standard library, so `sudo python3` works on Linux; on macOS use
+`uv run python` (there is no bare `python` there).
 
 ## 🎛️ Everyday commands
 
@@ -116,7 +125,8 @@ python scripts/install_osint_tools.py         # cross-platform installer (Kali /
 uv run bunnyhole trace vitalik.eth
 uv run bunnyhole trace example.com --gear deep --depth 3 --out dossier.md
 
-# Hypothesis-driven intake: paste a messy dump (selectors are auto-parsed) or pass selectors as flags
+# Hypothesis-driven intake: paste a messy dump (selectors are auto-parsed) or pass selectors as flags.
+# In a dump, -unrelated.com, exclude:unrelated.com, ignore:unrelated.com and -exclude:unrelated.com all exclude it.
 uv run bunnyhole intake --dump "acme.io founder@acme.io 0x1234... -exclude:unrelated.com" \
   --hypothesis "Is acme.io run by the same operator as its token?"
 uv run bunnyhole intake --domain acme.io --email founder@acme.io --wallet vitalik.eth --exclude unrelated.com
@@ -149,28 +159,34 @@ uv run bunnyhole mcp                      # the server itself (your client launc
 ```
 
 `--proxy` and `--tor` are **global** options: they go before the command
-(`uv run bunnyhole --tor trace acme.io`), not after it, and not on `uv run`.
+(`uv run bunnyhole --tor trace acme.io`), not after it, and not on `uv run`. `uv run bunnyhole --version`
+prints the version; `uv run bunnyhole` with no command prints the help.
+
+Input is validated, not clamped: `--depth` must be 1-4, `--breadth` 2-8, `--persona` one of the six keys
+below (case-insensitive), `serve --port` 1-65535, and `jet` takes a US N-number or 6 hex digits. A bad value
+exits 2 with the allowed range. `intake` with no selector at all (only `--hypothesis` or `--exclude`) exits 2
+instead of running an empty case. Note that `-p` is `--phone` on `trace`/`intake` but `--port` on `serve`.
 
 ### Every command
 
 | Command | What it does | Needs |
 | --- | --- | --- |
 | `trace <seed>` | Autonomous multi-domain investigation of one seed; Markdown dossier (`--out`) and graph JSON (`--json`). Also takes `--pi` (see below) | Network |
-| `intake` | Case intake: a hypothesis plus any known selectors (`--dump`, `--domain`, `--email`, `--wallet`, `--org`, `--username`, `--phone`, `--doc`, `--exclude`) and an anchor mode. Also takes `--pi` | Network |
+| `intake` | Case intake: a hypothesis plus at least one known selector (`--dump`, `--domain`, `--email`, `--wallet`, `--org`, `--username`, `--phone`, `--doc`), optional `--exclude`, and an anchor mode. Also takes `--pi` | Network |
 | `link <a> <b>` | Link Sleuth, bidirectional meet-in-the-middle: how do two entities connect? | Network |
 | `jet <tail_or_hex>` | FAA N-Number to ICAO hex and back, plus ADS-B telemetry from adsb.lol | Network |
-| `council <seed>` | 5-seat LLM Council (specialist briefs, anonymized peer review, chairman verdict) over a short trace | Network; an AI key for real model deliberation, deterministic council without one |
+| `council <seed>` | 5-seat council (specialist briefs, deterministic evidence ranking (not peer review), chairman verdict) over a short trace | Network; an AI key for real model deliberation, deterministic council without one |
 | `darkweb <query>` | Ahmia search of the Tor index for public mentions of a selector; `--fetch-onion` fetches titles | Network; `--fetch-onion` needs a Tor SOCKS listener |
 | `anonsurf [action]` | Install and drive Parrot/Kali's system-wide Tor proxy: `status`, `start`, `stop`, `restart`, `change`, `install` | Linux, root |
-| `doc-forensics <file>` | Word RSID revision fingerprints (`.docx`) or PDF `/Info` and XMP timezone metadata (`.pdf`) | Local file only |
-| `arsenal` / `doctor` | Health-check the external tool arsenal and API keys; `--install <tool\|all>` installs missing tools (`doctor` is an alias) | Local |
+| `doc-forensics <file>` | Word RSID revision fingerprints (`.docx`) or PDF `/Info` and XMP timezone metadata (`.pdf`); exits 1 on a missing, unreadable, unsupported or corrupt file | Local file only |
+| `arsenal` / `doctor` | Health-check the external tool arsenal and API keys; `--install <tool\|all>` installs missing tools and exits 1 if an install fails (`doctor` is an alias) | Local |
 | `personas` | List the investigator personas | Local |
 | `profile` | View or edit your remembered profile: persona, watchlist, jurisdictions, default gear/depth/breadth, exclusions | Local |
 | `cases` | List saved cases (`~/.bunnyhole/cases.db`), `--search` cross-case entity memory, `--load <case_id>` | Local |
-| `keys` | List API keys (masked) or `--set KEY=VALUE` into the vault (`~/.bunnyhole/api_keys.env`) | Local |
+| `keys` | List API keys (masked, with `SET (shell)` / `SET (vault)`) or `--set KEY=VALUE` into the vault (`~/.bunnyhole/api_keys.env`); `--set KEY=` clears it | Local |
 | `ui` / `tui` | Full-screen Textual War-Room (optional seed argument to prefill; `tui` is an alias) | Local; running a case needs network |
 | `menu` | Classic prompt-driven terminal command center | Local |
-| `serve` | FastAPI War-Room and API (`--host`, `--port`; defaults `127.0.0.1:8000`) | Local; running a case needs network |
+| `serve` | FastAPI War-Room and API (`--host`, `--port`; defaults `127.0.0.1:8000`). A non-loopback `--host` is refused unless `BUNNYHOLE_API_TOKEN` is set | Local; running a case needs network |
 | `mcp` | MCP server over stdio; `--print-config` prints the client config snippet, `--no-uv` for a plain `bunnyhole mcp` entry | Local; tools need network to investigate |
 | `pi guide \| sources \| legal \| playbook \| out-of-scope` | Offline private-investigator reference tables | Local |
 
@@ -181,7 +197,7 @@ One engine, four front doors. They share the same case vault, key vault and prof
 - **CLI** (`trace`, `intake`, `link`, ...): scriptable, writes dossiers and graph JSON. The only surface
   that runs a `--pi` engagement.
 - **TUI** (`ui` / `tui`): a seed/intake sidebar, live entity table, a tabbed inspector (Node, Links,
-  Council, ACH, Dossier) and a streaming agent log. Keys: `enter`/`r` run, `/` focus the seed box, `d`
+  Council, ACH, Dossier, Arsenal) and a streaming agent log. Keys: `enter`/`r` run, `/` focus the seed box, `d`
   dossier, `p` pivot, `ctrl+l` clear log, `q` quit. `textual serve` (browser delivery) is not installed
   by default; use `serve` for a browser.
 - **API / War-Room** (`serve`): FastAPI server plus a browser UI (see
@@ -303,18 +319,29 @@ Read the PI addendum in [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md) first.
 
 ## 🕵️ The Arsenal
 
-Bunnyhole ships adaptive scrapers and API clients in-process, and orchestrates **40+ external
-OSINT / forensics / red-team tools** when they're on your `PATH` — identity (`sherlock`, `maigret`,
+Bunnyhole ships adaptive scrapers and API clients in-process. Its arsenal catalog has **40 entries: 35
+external OSINT / forensics / red-team CLI tools and 5 Python libraries** — identity (`sherlock`, `maigret`,
 `tookie-osint`, `ghunt`), email & phone (`holehe`, `h8mail`, `phoneinfoga`, `ignorant`),
 infrastructure (`subfinder`, `amass`, `assetfinder`, `findomain`, `dnsx`, `dnsrecon`, `tlsx`,
 `katana`, `httpx`, `nuclei`), recon frameworks (`spiderfoot`, `bbot`), infra intel CLIs (`shodan`,
 `censys`), documents & metadata (`metagoofil`, `exiftool`), and the dark web (`tor`, `onionsearch`,
-`anonsurf`).
+`anonsurf`). The agents call five of them automatically when they are on your `PATH` (`whois`,
+`subfinder`, `sherlock`, `holehe`, `ignorant`); the rest are checked and installed by `doctor` for your
+own hands-on work.
 
 ```bash
-uv run bunnyhole doctor                 # what's installed, what's missing, how to get it
-uv run bunnyhole doctor --install all   # grab everything your platform can (non-root first)
+uv run bunnyhole doctor                   # what's installed, what's missing, the exact install command
+uv run bunnyhole doctor --install httpx   # one tool (httpx = ProjectDiscovery's httpx, catalog name httpx-pd)
+uv run bunnyhole doctor --install all     # everything your platform can install (non-root first)
+uv sync --extra arsenal                   # the optional Python libraries in one go (scrapling, trafilatura, ...)
 ```
+
+The install hint `doctor` shows is exactly the command chain `--install` runs (`a || b` = try `a`, then
+`b`): `uv tool install` / `pipx` for Python CLIs, `uv pip install` into the active environment for the
+Python libraries, `brew` on macOS, `sudo -n apt-get` on Kali/Parrot/Debian, `sudo -n pacman` on Arch and
+`sudo -n dnf` on Fedora for the packages they carry, and `go install` for Go tools. Where no installer
+applies, the hint says `install manually` or `not available on <platform>` instead of guessing a package
+name.
 
 Keyed sources light up automatically when a key is present and stay silent (keyless fallbacks) when
 it isn't: **Censys** host/cert recon, **SecurityTrails** historical DNS, **Hunter.io** company email
@@ -357,18 +384,38 @@ uv run bunnyhole anonsurf stop        # restore normal networking
 ## 🔑 Configuration (API keys)
 
 Every key is **optional**. Bunnyhole degrades gracefully to keyless public endpoints, and a keyed source
-that has no key is logged as skipped rather than failing the run. Copy [`.env.example`](.env.example) and
-set what you have, by exporting or via the vault:
+that has no key is logged as skipped rather than failing the run. [`.env.example`](.env.example) lists every
+name the vault accepts plus the env-only `BUNNYHOLE_*` settings. **`.env` files are not loaded
+automatically**: set a key with `keys --set` or export it in your shell.
 
 ```bash
-uv run bunnyhole keys --set SHODAN_API_KEY=xxxx    # stored in ~/.bunnyhole/api_keys.env (chmod 600)
-uv run bunnyhole keys                              # list configured keys (masked), with where to register
+uv run bunnyhole keys --set HUNTER_API_KEY=xxxx    # stored in ~/.bunnyhole/api_keys.env (chmod 600, atomic write)
+uv run bunnyhole keys --set HUNTER_API_KEY=        # clear it
+uv run bunnyhole keys                              # list keys (masked): SET (shell) / SET (vault) / EMPTY
 ```
+
+- **The shell wins.** A variable already exported in your shell is never overridden by the vault; `keys`
+  shows it as `SET (shell)`.
+- **When the vault is read.** It is loaded into the process whenever the arsenal manager is built: at the
+  start of every investigation (`trace`, `intake`, `link`, `council`, TUI / web / MCP runs), and by
+  `darkweb`, `keys`, `doctor`, `menu`, the TUI Arsenal tab and the API / MCP arsenal endpoints. `jet`,
+  `doc-forensics`, `cases`, `profile`, `personas` and `pi` do not read it.
+- **Legacy file.** `~/.osint-apis/api_keys.env` (from older OSINT toolkits) is read and merged *under* the
+  vault, but Bunnyhole never writes it. `keys --set` changes only the line for that key in the vault and
+  keeps every other line and comment; a value with spaces or ` #` is stored quoted and read back exactly.
+- **`$BUNNYHOLE_HOME`** relocates the vault, `cases.db` and `profile.json` (default `~/.bunnyhole`).
+- **Reserved keys.** 13 keys are accepted and stored but **not read by any agent yet** (`keys` marks them
+  `reserved: not used by any agent yet`): `HAVEIBEENPWNED_API_KEY`, `INTELX_API_KEY`,
+  `BREACHDIRECTORY_API_KEY`, `HUDSONROCK_API_KEY`, `SHODAN_API_KEY`, `VIRUSTOTAL_API_KEY`,
+  `ABUSEIPDB_API_KEY`, `IPINFO_TOKEN`, `TELEGRAM_BOT_TOKEN`, `FEC_API_KEY`, `OPENCORPORATES_API_KEY`,
+  `ETHERSCAN_API_KEY`, `HELIUS_API_KEY`. HudsonRock and Shodan are queried through their keyless endpoints.
+- `COMPANIES_HOUSE_API_KEY` is accepted as an alias of `UK_COMPANIES_HOUSE_API_KEY`; `OPENSANCTIONS_API_URL`
+  (a self-hosted yente base URL) can be stored in the vault too.
 
 Keys cover AI synthesis (OpenRouter / Anthropic / OpenAI / Gemini: any one enables narrative synthesis,
 OpenRouter powers the multi-model council), breach and infostealer intel, infrastructure recon, identity and
 email, corporate registries (Companies House PSC, OpenSanctions, CourtListener, FEC) and on-chain
-explorers. The registries matter for PI runs: without a Companies House key and a CourtListener token the
+explorers. (FEC, OpenCorporates and the on-chain explorer keys are reserved, above.) The registries matter for PI runs: without a Companies House key and a CourtListener token the
 `beneficial_ownership` and `court_dockets` source classes are logged as not searched.
 
 Which key unlocks what, where to register, and the free tiers: **[docs/QUICKSTART_CHEATSHEET.md](docs/QUICKSTART_CHEATSHEET.md)**.
@@ -379,17 +426,17 @@ The FastAPI server is built for **local use** and ships with loopback-only trust
 (blocks DNS rebinding), a strict Content-Security-Policy and security headers, output-escaping of all
 untrusted OSINT data, a bounded in-memory case store, and request-size / concurrency limits.
 
-Set a token to protect the mutating endpoints (it is also auto-injected into the first-party UI):
+Set a token to protect the API:
 
 ```bash
 export BUNNYHOLE_API_TOKEN="$(openssl rand -hex 24)"
 uv run bunnyhole serve
 ```
 
-Binding a non-loopback `--host` prints a warning and, with no token set, says that mutating endpoints are
-unauthenticated, but it still starts. The trusted-host allowlist is `localhost` / `127.0.0.1`, so keep it
-on loopback (or behind your own authenticated proxy). Never expose it to an untrusted network: it stores
-API keys and case data locally.
+`serve` on a loopback host (`127.0.0.1`, `localhost`, `::1`) starts without a token. **A non-loopback
+`--host` is refused (exit 2) unless `BUNNYHOLE_API_TOKEN` is set in the environment**, and even then it
+prints a warning. Keep it on loopback (or behind your own authenticated proxy). Never expose it to an
+untrusted network: it stores API keys and case data locally.
 
 ## ⚖️ Responsible use
 
@@ -403,7 +450,7 @@ purpose category is attested rather than verified, so lawful use stays your resp
 
 ```bash
 uv sync --extra dev
-uv run pytest -q -o addopts=""        # test suite (4054 tests, ~35 s, offline)
+uv run pytest -q -o addopts=""        # the full test suite (offline and hermetic, well under a minute)
 uv run ruff check bunnyhole tests     # lint
 uv run mypy bunnyhole                 # type check
 ```
@@ -421,7 +468,7 @@ bunnyhole/
 ├── tui/           # Textual War-Room (`ui` / `tui`)
 ├── api/           # FastAPI server + browser War-Room UI (`serve`)
 └── mcp/           # MCP server over stdio (`mcp`)
-tests/             # ~4000 offline tests (pytest, respx)
+tests/             # offline, hermetic tests (pytest, respx; no network, temp BUNNYHOLE_HOME)
 docs/              # MCP_SERVER.md, PERSONALIZATION.md, PI_STREAM.md, QUICKSTART_CHEATSHEET.md, superpowers/specs
 research/          # the tradecraft library (00_INDEX.md + 12 volumes)
 scripts/           # install_osint_tools.py (cross-platform arsenal installer)

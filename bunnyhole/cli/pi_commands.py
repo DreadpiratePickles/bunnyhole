@@ -59,6 +59,19 @@ def purpose_category_help() -> str:
 PURPOSE_CATEGORY_HELP = purpose_category_help()
 
 
+def _jurisdiction_hint() -> str:
+    """One jurisdiction hint for `pi sources` and `pi legal`, derived from the reference data (never hand-typed)."""
+    codes = sorted({s.jurisdiction for s in pi_reference.SOURCES} - {"intl"})
+    with_rules = [k for k in pi_reference.LEGAL_RULES if k != "general"]
+    return (
+        f"Jurisdiction code: {', '.join(codes)} (us-<state> and uk-/gb-<region> are accepted). "
+        f"Legal rule sets exist for {', '.join(with_rules)}; general rules and global sources always apply."
+    )
+
+
+PI_JURISDICTION_HINT = _jurisdiction_hint()
+
+
 def _person_like_selector(
     seed: Optional[str], orgs: List[str], emails: List[str], domains: List[str]
 ) -> Optional[str]:
@@ -302,10 +315,16 @@ def pi_guide_command() -> None:
 @pi_app.command("sources")
 def pi_sources_command(
     case_type: Optional[CaseType] = typer.Option(None, "--case-type", help=f"Only sources useful for: {_valid_case_types()}."),
-    jurisdiction: Optional[str] = typer.Option(None, "--jurisdiction", help="Keep this jurisdiction plus global sources (us, ca, ca-on, uk, au)."),
+    jurisdiction: Optional[str] = typer.Option(None, "--jurisdiction", help=PI_JURISDICTION_HINT),
     implemented: bool = typer.Option(False, "--implemented", help="Only sources Bunnyhole already queries."),
 ) -> None:
     """Free, lawful source catalog (what each gives a PI, access tier, and whether Bunnyhole queries it)."""
+    if jurisdiction and jurisdiction.strip():
+        # Known iff the jurisdiction filter keeps any non-global source (same scope rules as the filter itself).
+        if not any(s.jurisdiction != "intl" for s in pi_reference.sources_for(None, jurisdiction)):
+            console.print(
+                f"[yellow]No jurisdiction-specific sources for {_esc(jurisdiction.strip())}; showing global sources only.[/yellow]"
+            )
     rows = pi_reference.sources_for(case_type, jurisdiction, implemented_only=implemented)
     table = Table(title=f"🗂️ Free PI Sources ({len(rows)})", show_lines=False)
     table.add_column("Source", style="bold white")
@@ -329,7 +348,7 @@ def pi_sources_command(
 
 @pi_app.command("legal")
 def pi_legal_command(
-    jurisdiction: str = typer.Option("general", "--jurisdiction", help="us | ca-on | general (general rules always apply)."),
+    jurisdiction: str = typer.Option("general", "--jurisdiction", help=PI_JURISDICTION_HINT),
 ) -> None:
     """The legal frame for PI work in a jurisdiction (information, not legal advice)."""
     key = jurisdiction.strip().lower()

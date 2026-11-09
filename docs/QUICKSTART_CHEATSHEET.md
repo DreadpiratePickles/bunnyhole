@@ -1,7 +1,7 @@
 # Bunnyhole Quickstart Cheatsheet
 
 One page for setup, API keys, every command, and the PI stream. Verified against the code and `--help`
-output of this checkout (suite: 4,054 tests collected). Anything not verified is marked **unverified**.
+output of this checkout. Anything not verified is marked **unverified**.
 Lead and prospect research for companies has its own sheet: [`../CHEATSHEET.md`](../CHEATSHEET.md).
 Deeper docs: [`PI_STREAM.md`](PI_STREAM.md), [`PERSONALIZATION.md`](PERSONALIZATION.md), [`MCP_SERVER.md`](MCP_SERVER.md).
 
@@ -19,7 +19,7 @@ Deeper docs: [`PI_STREAM.md`](PI_STREAM.md), [`PERSONALIZATION.md`](PERSONALIZAT
 | A CLI (`bunnyhole`) that turns one clue (domain, email, @handle, wallet/ENS, company, tail number) into a graph of sourced findings | A people-search site, a contact scraper, or a consumer reporting agency |
 | Keyless by default: free public endpoints work with no API keys; keys only add coverage | Fully keyless: court dockets, UK ownership and sanctions via OpenSanctions need a free key (section 4) |
 | Surfaces: CLI, Textual TUI (`ui`), FastAPI web War-Room (`serve`), MCP server (`mcp`) | A licence, legal advice, or a verdict machine |
-| Tor-routable with `--tor` / `--proxy` (with caveats, section 6) | Guaranteed anonymous: some agents ignore the proxy |
+| Tor-routable with `--tor` / `--proxy` (with caveats, section 6) | Guaranteed anonymous: DNS lookups and local tools bypass the proxy |
 
 > **Legal and ethics box** (full text: [`../ACCEPTABLE_USE.md`](../ACCEPTABLE_USE.md))
 > - Only investigate what you are **authorised** to investigate. No harassing, doxxing, stalking or profiling for discrimination.
@@ -41,6 +41,7 @@ brew install uv git            # uv manages Python and the venv; git to clone
 git clone https://github.com/DreadpiratePickles/bunnyhole.git && cd bunnyhole
 uv sync                        # runtime deps (needs Python >= 3.11; uv fetches one if needed)
 uv sync --extra dev            # optional: pytest, ruff, mypy, respx
+uv sync --extra arsenal        # optional: scrapling, trafilatura, waybackpy, edgartools, socid-extractor, holehe
 uv run bunnyhole --help        # first-run check: lists all commands
 uv run bunnyhole arsenal       # read-only health check: tools found and keys set
 uv run pytest                  # optional; "-q" is already the default
@@ -48,7 +49,7 @@ uv run pytest                  # optional; "-q" is already the default
 
 - **Python:** `requires-python >= 3.11`; classifiers list 3.11 and 3.12. Pin one with `uv sync --python 3.12`.
 - **Every command below is run from the repo folder** as `uv run bunnyhole ...`. (Or `source .venv/bin/activate` and drop `uv run`.)
-- **SOCKS for Tor:** `httpx[socks]` is already a core dependency; `socksio` imports in the venv. There is **no separate SOCKS extra** (the only extra is `dev`).
+- **SOCKS for Tor:** `httpx[socks]` is already a core dependency; `socksio` imports in the venv. There is **no separate SOCKS extra** (the extras are `dev` and `arsenal`; `uv sync` drops extras you leave out, so combine them: `uv sync --extra dev --extra arsenal`).
 - **Tor on macOS:** `brew install tor && brew services start tor` (documentation only, not run). Listener must be `127.0.0.1:9050`.
 - **Optional arsenal tools** (deep scans; Bunnyhole degrades gracefully without them). On this Mac 9 of 40 catalog tools were detected:
 
@@ -58,8 +59,12 @@ uv run bunnyhole arsenal --install sherlock   # one tool by catalog name
 uv run bunnyhole arsenal --install all        # every missing tool (slow, many installs)
 ```
 
-`doctor` is an identical alias of `arsenal`. Installer order per tool (from `install_tool`): `uv tool install` / `pipx` / `pip`
-first, then `brew` (macOS) or `apt` (Debian family), then `go install` (needs `go`). Names must match the catalog (`arsenal` lists them).
+`doctor` is an identical alias of `arsenal`. The hint `arsenal` shows for a missing tool is exactly the command chain `--install`
+runs (`a || b`: try `a`, then `b`; one code path, `build_install_plan`): `uv tool install` / `pipx` for Python CLIs, `uv pip install`
+into the active environment for the 5 Python libraries, then `brew` (macOS) or `sudo -n apt-get` (Kali/Parrot/Debian) /
+`sudo -n pacman` (Arch) / `sudo -n dnf` (Fedora) where the catalog has a package, then `go install` (needs `go`). Where nothing
+applies it says `install manually` or `not available on <platform>`. Names match the catalog case-insensitively; `httpx` is an
+alias of `httpx-pd`. An unknown name or a failed install exits 1.
 
 **What "keyless" means:** DNS, certificate transparency, GLEIF, SEC EDGAR, Wayback, Blockscout, adsb.lol, OFAC/UN/UK/Canada
 sanctions lists, Ahmia and similar work with no account. **Still needs a key:** CourtListener dockets, UK Companies House
@@ -88,10 +93,10 @@ uv run bunnyhole arsenal                               # shows detected OS "Dist
   `uv python install 3.12 && uv sync --python 3.12`. (3.11 and 3.12 are the versions in the project classifiers; this repo's venv is 3.11.16.)
   Which Python each Kali/Parrot release ships: **unverified**; always check `python3 --version`.
 - **Run Bunnyhole as your normal user, not root.** Keys and cases live under the invoking user's `~/.bunnyhole`; Bunnyhole already
-  calls `sudo` itself only where needed (`anonsurf`, `apt-get` installs). Avoid `sudo python3 scripts/install_osint_tools.py`:
-  its docstring suggests it, but it then runs pipx/go installs as root and may create the vault under root's home
-  (**unverified**). Without root the script skips apt packages and installs user-space tools only (verified in its code).
-  Preferred: `sudo apt install ...` yourself, then `uv run bunnyhole arsenal --install <name>`.
+  calls `sudo` itself only where needed (`anonsurf`, `apt-get`/`pacman`/`dnf` installs). `sudo python3 scripts/install_osint_tools.py`
+  works (the script needs only the standard library) but runs pipx/go installs as root and may create the vault under root's home
+  (**unverified**). Without root (`uv run python scripts/install_osint_tools.py`) it skips system packages and installs user-space
+  tools only (verified in its code). Preferred: `sudo apt install ...` yourself, then `uv run bunnyhole arsenal --install <name>`.
 - Non-root `apt` installs use `sudo -n` (non-interactive): if sudo needs a password, the install fails. Run `sudo -v` first, or install the apt package by hand.
 
 ### 3.2 Which arsenal tools install how (from `ARSENAL_TOOLS_CATALOG`)
@@ -101,8 +106,9 @@ Kali/Parrot (verify with `which nmap whois dig`); treat everything else as "chec
 
 | Install route (as coded) | Catalog tools |
 |---|---|
-| Already in Bunnyhole's venv (`uv sync`) | scrapling, trafilatura, edgartools, waybackpy, socid-extractor, holehe |
+| Optional `arsenal` extra (`uv sync --extra arsenal`); `--install` uses `uv pip install --python <venv python>` | scrapling, trafilatura, edgartools, waybackpy, socid-extractor, holehe (the app runs without them; `arsenal` shows MISSING) |
 | `apt` package listed in catalog (tried after pipx where a pipx name also exists) | sherlock, theHarvester, dnstwist, subfinder, findomain, dnsrecon, metagoofil, amass, httpx-pd (`httpx-toolkit`), nuclei, whois, dig (`dnsutils`), nmap, exiftool (`libimage-exiftool-perl`), tor, anonsurf |
+| `pacman` (Arch) / `dnf` (Fedora) package listed | whois, dig (`bind` / `bind-utils`), nmap, exiftool (`perl-image-exiftool` / `perl-Image-ExifTool`), tor. Other tools on Arch/Fedora: pipx/go route or install manually |
 | `uv tool install` / `pipx` only | maigret, ignorant, h8mail, ghunt, phoneinfoga (**unverified** that a PyPI package of that name exists), tookie-osint, spiderfoot, bbot, shodan, censys, onionsearch |
 | `go install` only (needs `go`, e.g. `sudo apt install golang-go`; binaries land in `~/go/bin`) | assetfinder, dnsx, tlsx, katana, mosint, waybackurls, gau |
 | Hand-installed under `~/osint-tools/<tool-name>` | Counted as installed by `arsenal` if the folder exists. Bunnyhole **never clones into it** (verified by grep); you do that yourself. |
@@ -124,10 +130,7 @@ curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip   # sa
 - There is **no `bunnyhole tor` command** (`uv run bunnyhole tor` -> "No such command"). Tor is the `--tor` flag plus the `tor` daemon (arsenal tool name `tor`).
 - `--tor` = `--proxy socks5h://127.0.0.1:9050` (`socks5h` keeps DNS on Tor's side). Different port: `export BUNNYHOLE_TOR_PROXY=socks5h://127.0.0.1:9150`. Standing proxy with no flag: `export BUNNYHOLE_PROXY=...`.
 - `--tor` and `--proxy` are **global options placed before the subcommand**. `bunnyhole trace --proxy ...` is not valid (verified: `trace --help` has no `--proxy`).
-- **Honest caveat (verified in code):** only clients built with `netutil.new_async_client` honour the proxy. These do **not**: the journalist agent (all
-  HTTP calls), the on-chain agent, three of five accountant call sites, LLM council/synthesis calls, `dnspython` DNS lookups (system resolver),
-  Scrapling fetches (**unverified** whether it inherits a proxy; none is passed) and the local CLI tools Bunnyhole shells out to (`whois`, `subfinder`,
-  `dnstwist`, `sherlock`...). The PI-stream sources and most of the OSINT agent do honour it. Do not rely on `--tor` alone for anonymity.
+- **Honest caveat (verified in code and guarded by a test):** every Python HTTP client is built with `netutil.new_async_client`, so it honours `--proxy`/`--tor` (including the LLM calls). **Not covered:** `dnspython` DNS lookups (system resolver) and the local CLI tools Bunnyhole shells out to (`whois`, `subfinder`, `dnstwist`, `sherlock`, `holehe`...). Domain traces also fetch the subject's own website, so their server can see a request. Do not rely on `--tor` alone for anonymity.
 
 ### 3.4 AnonSurf vs Bunnyhole's `anonsurf` command
 
@@ -147,7 +150,7 @@ uv run bunnyhole anonsurf stop           # confirm, then restore clearnet; or ru
 |---|---|
 | Linux only; needs root via `sudo` (it prompts on the terminal) | On macOS it prints a pointer to `--tor` and exits 1 (verified by running `anonsurf status`) |
 | `start` and `stop` ask for confirmation unless `--yes`; `restart`, `change`, `install` do not | Unknown action -> exit 2 |
-| Nothing ever starts it automatically | The status/error text says `anonsurf --install`; the real syntax is `anonsurf install` (code oddity) |
+| Nothing ever starts it automatically | If the binary is missing, the error points you at `bunnyhole anonsurf install` |
 
 **It is a system-wide network change.** Every app (browser, SSH, updates, your logged-in accounts) goes through Tor until you stop it.
 **Do not use it** over a remote SSH session (you can lose the connection; **unverified**), when you need a normal connection,
@@ -161,9 +164,11 @@ in `/etc/proxychains4.conf` and `proxy_dns` enabled. Test for leaks before trust
 ### 3.5 VM, live boot, persistence, updates
 
 - **Snapshot the VM before** installing tools or starting AnonSurf so you can roll back.
-- Keys and cases are plain-text files in `~/.bunnyhole/` (dir `0700`, `api_keys.env` `0600`, **not encrypted**), plus a **mirror copy** at `~/.osint-apis/api_keys.env`.
+- Keys and cases are plain-text files in `~/.bunnyhole/` (dir `0700`, `api_keys.env` `0600`, **not encrypted**; `$BUNNYHOLE_HOME` moves them).
+  Bunnyhole also **reads** a legacy `~/.osint-apis/api_keys.env` if you have one, but never writes it.
   On a **non-persistent live session they vanish at reboot**. Back up only to encrypted storage, for example
-  `tar czf - ~/.bunnyhole ~/.osint-apis | gpg --symmetric -o bunnyhole_backup.tgz.gpg` (generic GnuPG usage, not a Bunnyhole feature). Wipe both files to remove a key everywhere.
+  `tar czf - ~/.bunnyhole | gpg --symmetric -o bunnyhole_backup.tgz.gpg` (generic GnuPG usage, not a Bunnyhole feature). To remove a key
+  everywhere, clear it with `keys --set NAME=` and delete it from the legacy file yourself if it is there.
 - **Updates:** `sudo apt update && sudo apt upgrade`; `uv tool upgrade --all` (or `pipx upgrade-all`) for uv/pipx tools; `cd bunnyhole && git pull && uv sync`.
   Sanctions-list XML caches refresh on their own (24 h TTL, per `docs/PI_STREAM.md`).
 - **Legal reminder:** Kali and Parrot ship offensive tools. Bunnyhole is **passive OSINT only**: no exploitation, no account access. The PI stream refuses eligibility
@@ -173,15 +178,16 @@ in `/etc/proxychains4.conf` and `proxy_dns` enabled. Test for leaks before trust
 
 ## 4. API keys
 
-Every key is optional. `keys` lists all 30 names in the catalog (`API_KEYS_REGISTRY`). **"Read by code"** is my grep of `os.environ` use outside the catalog:
-"no" means the key can be stored but **no agent currently reads it**.
+Every key is optional. `keys` lists all 31 names in the catalog (`API_KEYS_REGISTRY`). **"Read by code"** comes from a grep of `os.environ` use
+outside the catalog: "no" means the key is **reserved**: it can be stored but **no agent reads it yet** (`keys` marks it
+`reserved: not used by any agent yet`; `tests/test_keys_vault.py` fails if one becomes read without dropping the mark).
 
 ### 4.1 Set these first (free, biggest payoff)
 
 | Key | Unlocks | Sign up |
 |---|---|---|
 | `COURTLISTENER_API_TOKEN` | US federal dockets (RECAP). Without it the API returns 401 and `court_dockets` shows as not reached | https://www.courtlistener.com/help/api/rest/ |
-| `UK_COMPANIES_HOUSE_API_KEY` | UK persons-with-significant-control (beneficial ownership) lookup. `COMPANIES_HOUSE_API_KEY` also works but **only as an exported env var** | https://developer.company-information.service.gov.uk/ |
+| `UK_COMPANIES_HOUSE_API_KEY` | UK persons-with-significant-control (beneficial ownership) lookup. `COMPANIES_HOUSE_API_KEY` is an accepted alias (`keys --set` stores it under the `UK_` name) | https://developer.company-information.service.gov.uk/ |
 | `OPENSANCTIONS_API_KEY` (hosted free tier; non-commercial per the source catalog) **or** `OPENSANCTIONS_API_URL` (self-hosted yente, keyless) | Sanctions/PEP screening. Without either: logged skip, sanctions status stays `partial` | https://www.opensanctions.org/api/ |
 | `GITHUB_API_KEY` | GitHub rate limit 60 -> 5,000 req/hr | https://github.com/settings/tokens |
 
@@ -207,9 +213,10 @@ Every key is optional. `keys` lists all 30 names in the catalog (`API_KEYS_REGIS
 | `IPINFO_TOKEN` | Social | free 50,000/mo | no |
 | `NUMVERIFY_API_KEY` | Social | phone carrier/line type | yes |
 | `TELEGRAM_BOT_TOKEN` | Social | optional Telegram recon | no |
-| `FEC_API_KEY` | Corporate | free instant key (installer writes `DEMO_KEY`) | no |
+| `FEC_API_KEY` | Corporate | free instant key | no |
 | `OPENCORPORATES_API_KEY` | Corporate | registry search | no |
 | `OPENSANCTIONS_API_KEY` | Corporate | see 4.1 | yes |
+| `OPENSANCTIONS_API_URL` | Corporate | self-hosted yente base URL (a URL, not a secret) | yes |
 | `COURTLISTENER_API_TOKEN` | Corporate | see 4.1 | yes |
 | `UK_COMPANIES_HOUSE_API_KEY` | Corporate | see 4.1 | yes |
 | `ETHERSCAN_API_KEY` | On-chain | free 5 calls/sec; Blockscout keyless | no |
@@ -223,19 +230,25 @@ Every key is optional. `keys` lists all 30 names in the catalog (`API_KEYS_REGIS
 ### 4.3 How to set, check, remove
 
 ```bash
-uv run bunnyhole keys                                       # table: SET/EMPTY, masked value (verified)
-uv run bunnyhole keys --set COURTLISTENER_API_TOKEN=xxxx    # -s works too; name is upper-cased
-export COURTLISTENER_API_TOKEN=xxxx                         # alternative: shell env (current session only)
-uv run bunnyhole keys --set COURTLISTENER_API_TOKEN=        # remove: empty value clears it (verified; still prints "Saved")
-export OPENSANCTIONS_API_URL=http://localhost:9000          # env ONLY: not in the catalog, `keys --set` rejects it
+uv run bunnyhole keys                                       # table: SET (shell) / SET (vault) / SET (legacy) / EMPTY, masked value
+uv run bunnyhole keys --set COURTLISTENER_API_TOKEN=xxxx    # -s works too; name is case-insensitive
+export COURTLISTENER_API_TOKEN=xxxx                         # alternative: shell env (current session only; wins over the vault)
+uv run bunnyhole keys --set COURTLISTENER_API_TOKEN=        # remove: an empty value clears it (prints "Cleared")
+uv run bunnyhole keys --set OPENSANCTIONS_API_URL=http://localhost:9000   # self-hosted yente
 ```
 
-- **Vault:** `~/.bunnyhole/api_keys.env` (dir `0700`, file `0600`, verified) **and** a synced copy `~/.osint-apis/api_keys.env`. Loaded into the environment at startup by every command.
-- **Precedence:** a non-empty vault value overwrites the same variable exported in your shell.
-- Only catalog names are accepted; anything else (for example `OPENSANCTIONS_API_URL`, `BUNNYHOLE_API_TOKEN`) raises `ValueError: Unknown or illegal API key name` (a traceback, verified).
+- **Vault:** `~/.bunnyhole/api_keys.env` (dir `0700`, file `0600`; `$BUNNYHOLE_HOME` relocates it). Writes are atomic (temp file, fsync,
+  rename) and change only the key's own line: comments and unrelated lines are kept; a value with spaces or ` #` is written quoted.
+- **Legacy file:** `~/.osint-apis/api_keys.env` is read and merged *under* the vault (a name the vault lists, even blank, wins) and is **never written**.
+- **When it is read:** whenever the arsenal manager is built: at the start of every investigation (`trace`, `intake`, `link`, `council`,
+  TUI / web / MCP runs, all of which build the OSINT agent), and by `darkweb`, `keys`, `doctor`, `menu`, the TUI Arsenal tab and the
+  API / MCP arsenal endpoints. `jet`, `doc-forensics`, `cases`, `profile`, `personas` and `pi` do not read it.
+- **Precedence:** a variable exported in your shell always wins; the vault never overrides it (`keys` shows `SET (shell)`, and `--set` warns).
+- Only catalog names (and the alias `COMPANIES_HOUSE_API_KEY`) are accepted; anything else (for example `BUNNYHOLE_API_TOKEN`) exits 2 with the list of allowed names.
 - Yente on `localhost:8000` clashes with the default `serve` port 8000: use another port for one of them.
-- `.env` files are **not** auto-loaded (no `load_dotenv` in the code, although `python-dotenv` is a dependency). `.env.example` is a template only, and omits `COURTLISTENER_API_TOKEN` and `OPENSANCTIONS_API_KEY`.
-- Also settable from the `menu` (option 4) and the War-Room (`POST /api/keys`).
+- `.env` files are **not** auto-loaded (python-dotenv is not used). [`../.env.example`](../.env.example) lists every accepted name plus the
+  env-only `BUNNYHOLE_*` settings; it is a reference, not a file Bunnyhole reads.
+- Also settable from the `menu` (option 4; an unknown name prints the allowed list and returns to the prompt) and the War-Room (`POST /api/keys`).
 
 **What changes in a PI report once keys are set:** with the CourtListener token the `court_dockets` class is searched instead of "Tried, not reached"/`NOT SEARCHED`;
 with the Companies House key `beneficial_ownership` gets UK PSC data (UK entities only); with OpenSanctions (key or yente) the sanctions status can move from `partial`
@@ -245,44 +258,45 @@ toward `lists_run` (all five automated lists; the EU list is never automated, so
 
 ## 5. Command cheat table
 
-Global options (before the command): `--tor`, `--proxy URL` (schemes: http, https, socks5, socks5h, socks4; bad scheme -> exit 2).
+Global options (before the command): `--tor`, `--proxy URL` (schemes: http, https, socks5, socks5h, socks4; bad scheme -> exit 2), `--version`.
+`bunnyhole` with no command prints the help.
 
 | Command | Purpose | Flags that matter |
 |---|---|---|
 | `trace SEED` | Investigate one seed (company, domain, EVM/BTC wallet, ENS, @handle, email, tail number) | `-g fast\|deep`, `-d 1-4` (def 2), `-b 2-8` (def 4), `-H` hypothesis, `-u/-e/-p/-w/--domain/--doc/-x` extra selectors, `--persona`, `-o dossier.md`, `--json graph.json`, `--pi ...` |
 | `intake` | Multi-selector case + hypothesis. **No positional argument** | `--dump "text"` (auto-extract), `-H`, repeatable `-u -e -p -w --domain --org --doc -x`, `--anchor-mode`, plus the `trace` flags |
 | `link A B` | Meet-in-the-middle: how do two entities connect | `-g` |
-| `jet TAIL_OR_HEX` | FAA N-number <-> ICAO hex + ADS-B (adsb.lol) | none |
+| `jet TAIL_OR_HEX` | FAA N-number <-> ICAO hex + ADS-B (adsb.lol) | none; input must be a US N-number or 6 hex digits (else exit 2) |
 | `council SEED` | 5-seat LLM council (needs an AI key for LLM output) | `-g`, `-d` (default 1) |
 | `darkweb QUERY` | Ahmia dark-web index search; soft leads (C3) | `--fetch-onion` (needs Tor; pair with global `--tor`) |
-| `doc-forensics FILE` | Word RSID or PDF /Info + XMP timezone metadata, local file | none |
-| `arsenal` / `doctor` | Tool + key health; install tools | `-i NAME\|all` |
+| `doc-forensics FILE` | Word RSID or PDF /Info + XMP timezone metadata, local file | none; exits 1 on a missing, unreadable, non-`.docx`/`.pdf` or corrupt file |
+| `arsenal` / `doctor` | Tool + key health; install tools | `-i NAME\|all` (exit 1 if an install fails) |
 | `anonsurf [action]` | Parrot/Kali system Tor (Linux, sudo) | `status\|start\|stop\|restart\|change\|install`, `-y` |
 | `personas` | List personas (marks your active one) | none |
 | `profile` | View/edit remembered context | `--persona --name --watch --unwatch --clear-watch --jurisdiction -x -g -d -b --note` |
-| `keys` | Show/set API keys | `-s KEY=VALUE` |
-| `cases` | List last 25 cases / search / reload | `-q TEXT` search entity memory, `-l CASE_ID` re-display a case |
+| `keys` | Show/set API keys | `-s KEY=VALUE`, `-s KEY=` clears |
+| `cases` | List last 25 cases / search / reload | `-q TEXT` search entity memory, `-l CASE_ID` re-display a case (an empty value exits 2) |
 | `ui` / `tui` | Full-screen Textual War-Room (aliases) | optional `SEED` argument prefills |
 | `menu` | Prompt-driven classic menu | none |
-| `serve` | FastAPI web War-Room | `--host` (def 127.0.0.1), `-p/--port` (def 8000) |
+| `serve` | FastAPI web War-Room | `--host` (def 127.0.0.1; non-loopback refused without `BUNNYHOLE_API_TOKEN`), `-p/--port` (def 8000, 1-65535). `-p` is `--phone` on `trace`/`intake` |
 | `mcp` | MCP server over stdio | `-c/--print-config`, `--no-uv` |
-| `pi guide\|sources\|legal\|playbook\|out-of-scope` | Offline PI reference (no network, no keys) | `sources --case-type --jurisdiction --implemented`; `legal --jurisdiction us\|ca-on\|general`; `playbook CASE_TYPE` |
+| `pi guide\|sources\|legal\|playbook\|out-of-scope` | Offline PI reference (no network, no keys) | `sources --case-type --jurisdiction --implemented`; `legal --jurisdiction`; `playbook CASE_TYPE`. Both take the same codes: au, ca, ca-on, uk, us (plus `us-<state>`, `uk-`/`gb-<region>`); an unknown one warns |
 
 **Gear / depth / breadth in practice** (from `GearMode` and the orchestrator loop):
 
 | Setting | Means |
 |---|---|
-| `fast` | Rapid APIs, DNS/CT, Scrapling HTTP fetch, Blockscout, GLEIF, EDGAR, Cavalier. Start here |
-| `deep` | Adds Scrapling headless StealthyFetcher, Wayback diffing, PDF/DOCX RSID forensics, Holehe email sweep, 2-hop burner expansion. More requests, more noise, slower |
-| `--depth` 1-4 | Extra pivot hops: the loop runs hops `2..depth`, so **depth 1 = seed only, no follow-up hops**. Out-of-range values are clamped |
-| `--breadth` 2-8 | Leads pursued in parallel per hop. Higher = wider net, more requests against third parties |
+| `fast` | Rapid APIs, DNS/CT, HTTP site fetch, Blockscout, GLEIF, EDGAR, Cavalier. Start here |
+| `deep` | Adds Wayback diffing, PDF/DOCX RSID forensics, Holehe email sweep, 2-hop burner expansion. More requests, more noise, slower |
+| `--depth` 1-4 | Extra pivot hops: the loop runs hops `2..depth`, so **depth 1 = seed only, no follow-up hops**. Out-of-range values are rejected (exit 2) |
+| `--breadth` 2-8 | Leads pursued in parallel per hop. Higher = wider net, more requests against third parties. Out-of-range values are rejected (exit 2) |
 
 Run times were **not measured**; expect minutes at deep/depth 3+. Persona defaults fill any of gear/depth/breadth you do not pass; flags you pass always win.
 
 **Anchor modes** (`trace`/`intake --anchor-mode`): `convergence` (default) tests IF and HOW your clues connect; `locked_profile` treats them as one confirmed target.
 
 **Personas** (`bunnyhole personas`, verified): `generalist` fast/d2/b4; `journalist` fast/d2/b5; `compliance` deep/d3/b4 + sanctions; `threat_intel` fast/d2/b6;
-`crypto_tracer` deep/d3/b5 + sanctions; `pi` deep/d3/b4 + sanctions (auto-selected by `--pi`).
+`crypto_tracer` deep/d3/b5 + sanctions; `pi` deep/d3/b4 + sanctions (auto-selected by `--pi`). `--persona` is case-insensitive; an unknown key exits 2 with the six valid ones.
 
 ```bash
 uv run bunnyhole profile --persona compliance --watch acme.io --jurisdiction CA --exclude unrelated.com --name "Your Name"
@@ -353,10 +367,11 @@ uv run bunnyhole intake --org "Jane Q. Smith" --email jane@example.com --pi --ca
 Keys: `enter`/`r` run, `/` focus seed, `d` dossier tab, `p` pivot selected entity, `ctrl+l` clear log, `q` quit. Tabs: Node, Links, Council, ACH, Dossier, Arsenal.
 The TUI has **no PI or persona controls** (verified by grep): use the CLI for `--pi`. Browser mode: `textual serve "bunnyhole ui"` (from `--help`; **unverified** here).
 
-**Web War-Room / API:** `uv run bunnyhole serve` then open http://127.0.0.1:8000. Only loopback hostnames are served (Host-header check); CORS allows
-`127.0.0.1:8000` and `localhost:8000` only. Binding a non-loopback `--host` prints a warning; set `BUNNYHOLE_API_TOKEN` first (mutating POST endpoints then need
-`Authorization: Bearer ...` or `X-Bunnyhole-Token`; `GET /api/arsenal`, `/api/cases` stay open). Even so, a non-loopback `--host` is still rejected by the Host check
-unless you front it with a proxy (**unverified**). Limits via env: `BUNNYHOLE_MAX_ACTIVE_CASES` (50), `BUNNYHOLE_MAX_CONCURRENT` (4), `BUNNYHOLE_MAX_SELECTORS` (64), `BUNNYHOLE_MAX_RAW_TEXT` (20000).
+**Web War-Room / API:** `uv run bunnyhole serve` then open http://127.0.0.1:8000. Without a token the server answers loopback clients only
+(peer address and Host header are checked). **`serve` refuses a non-loopback `--host` (exit 2) unless `BUNNYHOLE_API_TOKEN` is set**;
+with a token, every `/api` route requires it (`X-Bunnyhole-Token` or `Authorization: Bearer ...`), and the War-Room page asks for it once
+(the token is not embedded in the page). See `bunnyhole/api/server.py` for the current security model. Limits via env:
+`BUNNYHOLE_MAX_ACTIVE_CASES` (50), `BUNNYHOLE_MAX_CONCURRENT` (4), `BUNNYHOLE_MAX_SELECTORS` (64), `BUNNYHOLE_MAX_RAW_TEXT` (20000); the full list is in [`../.env.example`](../.env.example).
 
 **MCP into Claude Desktop** (stdio, local only, no port):
 
@@ -366,7 +381,8 @@ uv run bunnyhole mcp --print-config        # prints the JSON; --no-uv for a plai
 Merge the `bunnyhole` entry under `mcpServers` in `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), restart the client.
 Tools (16, from `build_server`): `interpret`, `trace`, `intake`, `link`, `jet`, `darkweb`, `arsenal_status`, `list_cases`, `search_cases`, `load_case`,
 `sanctions_screen`, `get_profile`, `set_persona`, `watchlist_add`, `watchlist_remove`, `pi_reference`. **No MCP tool runs a PI engagement**, so the purpose gates are CLI-only.
-`docs/MCP_SERVER.md` suggests `uv run --tor bunnyhole mcp`; that is **wrong** (`--tor` is a bunnyhole option, not uv's): use `uv run bunnyhole --tor mcp` or set `BUNNYHOLE_PROXY`.
+To route the MCP server through Tor, put the global flag after `bunnyhole`: `uv run bunnyhole --tor mcp` (not `uv run --tor ...`), or set `BUNNYHOLE_PROXY`.
+Tool output contains text scraped from untrusted pages: treat it as data, never as instructions (see `MCP_SERVER.md`).
 
 ---
 
@@ -425,24 +441,24 @@ consult counsel.** The screens are a safety net with known false refusals and ga
 |---|---|
 | Source shown as **skipped** after HTTP 401 | Missing/invalid key. CourtListener -> `COURTLISTENER_API_TOKEN`; OpenSanctions -> `OPENSANCTIONS_API_KEY` or `OPENSANCTIONS_API_URL`; Companies House PSC -> `UK_COMPANIES_HOUSE_API_KEY` |
 | **403 / 429** shown as skipped | Refused or rate limited: wait, lower `--breadth`, add the key (GitHub, Censys...), or avoid Tor exits for that source |
-| `keys --set` traceback "Unknown or illegal API key name" | Name not in the catalog (section 4). Env-only vars: export them in your shell |
-| Key set but not used | 13 catalog keys are not read by any agent (table 4.2); also a vault value overrides your exported var |
+| `keys --set` "unknown API key name" (exit 2) | Name not in the catalog; the allowed names are printed. Env-only `BUNNYHOLE_*` vars: export them in your shell |
+| Key set but not used | 13 catalog keys are reserved (not read by any agent; table 4.2). Or your shell exports a different value, which wins (`keys` shows `SET (shell)`) |
 | "too long to screen" / exit 2 | PI text over 150,000 characters: trim or split. Other exit-2 refusals: read the red panel; reword **accurately** or consult counsel |
 | `--proxy` "No such option" after the subcommand | Global option: `bunnyhole --tor trace ...`, not `bunnyhole trace ... --tor` |
 | `Invalid --proxy` | Scheme must be http, https, socks5, socks5h or socks4 |
 | Tor not running / `.onion` fetch returns nothing | Start Tor, check `ss -ltn \| grep 9050` (Linux) or `lsof -iTCP:9050 -sTCP:LISTEN` (macOS); `--fetch-onion` silently degrades to no title when Tor or SOCKS is unavailable |
 | SOCKS errors | `httpx[socks]` is core; run `uv sync` and `.venv/bin/python -c "import socksio"` |
 | DNS leak while using `--tor` | `dnspython` uses the system resolver; use AnonSurf, a Tor-aware resolver setup, or accept the leak (section 3.3) |
-| `permission denied` on the keys file | Vault is `0600` owned by the user who created it; do not mix `sudo` and normal runs. Fix owner: `sudo chown -R "$USER" ~/.bunnyhole ~/.osint-apis` |
-| `arsenal --install` fails on apt | Needs non-interactive sudo (`sudo -n`): run `sudo -v` first or `sudo apt install <pkg>` by hand. Unknown name -> "Unknown tool" |
+| `permission denied` on the keys file | Vault is `0600` owned by the user who created it; do not mix `sudo` and normal runs. Fix owner: `sudo chown -R "$USER" ~/.bunnyhole` |
+| `arsenal --install` fails on apt/pacman/dnf | Needs non-interactive sudo (`sudo -n`): run `sudo -v` first or install the package by hand. Unknown name -> "Unknown tool" (exit 1) |
 | Tool installed but still "MISSING" | Must be on `PATH` or in `~/.local/bin`, `~/go/bin`, `~/bin`, `/usr/local/bin`, `/opt/homebrew/bin` |
 | Python version mismatch / build errors | `uv python install 3.12 && uv sync --python 3.12` |
 | `anonsurf` says Linux-only | Expected on macOS; use `--tor` |
 | Slow runs | Use `-g fast -d 1 -b 2`; deep gear and depth 3+ multiply requests |
-| `serve` unreachable from another machine | Host-header check only allows localhost names (section 6) |
+| `serve` refuses `--host 0.0.0.0` / unreachable from another machine | Set `BUNNYHOLE_API_TOKEN` first; without it only loopback clients are served (section 6) |
 | Where are logs? | Bunnyhole writes **no log files** (no file handlers in code); output is the terminal plus `cases.db` and any `--out/--json/--pi-report` files |
 | Reset profile | `rm ~/.bunnyhole/profile.json` (or `bunnyhole profile --persona generalist --clear-watch`); reset cases: delete `~/.bunnyhole/cases.db` |
-| Run tests | `uv sync --extra dev && uv run pytest` (4,054 collected) |
+| Run tests | `uv sync --extra dev && uv run pytest` (offline and hermetic) |
 
 ---
 
@@ -451,14 +467,14 @@ consult counsel.** The screens are a safety net with known false refusals and ga
 | Path | What |
 |---|---|
 | `~/.bunnyhole/api_keys.env` | Key vault (`0600`, dir `0700`, plain text) |
-| `~/.osint-apis/api_keys.env` | Synced legacy mirror of the vault |
+| `~/.osint-apis/api_keys.env` | Optional legacy key file: read (under the vault), never written |
 | `~/.bunnyhole/cases.db` | SQLite case store + cross-case entity memory |
 | `~/.bunnyhole/profile.json` | Persona, watchlist, jurisdictions, defaults, note |
 | `~/.bunnyhole/cache/sanctions/` | Downloaded OFAC/UN/UK sanctions XML (24 h TTL, stale fallback) |
 | `~/osint-tools/<name>` | Optional hand-installed tools detected by `arsenal` |
 | `docs/` | `PI_STREAM.md`, `PERSONALIZATION.md`, `MCP_SERVER.md`, `superpowers/specs/` design specs |
 | `research/00_INDEX.md` | Index of the 13 research notes (architecture, tradecraft, PI methodology in `12_...`) |
-| `CHEATSHEET.md`, `ACCEPTABLE_USE.md`, `README.md`, `.env.example` | Lead research sheet, use policy, overview, key template |
+| `CHEATSHEET.md`, `ACCEPTABLE_USE.md`, `README.md`, `.env.example` | Lead research sheet, use policy, overview, reference of every key and `BUNNYHOLE_*` setting (not auto-loaded) |
 
 | Term | Meaning |
 |---|---|

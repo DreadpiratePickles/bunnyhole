@@ -1,11 +1,12 @@
-"""Agent 2: The Forensic Accountant & Physical Asset Tracker (SEC EDGAR + Beneish M-Score, GLEIF Parent/Child Corporate Trees, ProPublica IRS 990s, FEC Donations, USAspending, Sanctions, and ADS-B Corporate Jet / Maritime AIS Tracking)."""
+"""Agent 2: The Forensic Accountant & Physical Asset Tracker (SEC EDGAR + Beneish M-Score, GLEIF Parent/Child Corporate Trees, ProPublica IRS 990s, OpenSanctions, and ADS-B Corporate Jet Tracking)."""
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import httpx
 
@@ -161,14 +162,92 @@ def icao_hex_to_n_number(icao_hex: str) -> Optional[str]:
 
 
 
+#: SEC asks automated clients to identify themselves (https://www.sec.gov/os/accessing-edgar-data).
+DEFAULT_SEC_USER_AGENT = "Bunnyhole research (+https://github.com/DreadpiratePickles/bunnyhole)"
+
+
+def sec_user_agent() -> str:
+    """The User-Agent sent to SEC EDGAR: ``BUNNYHOLE_SEC_USER_AGENT`` if set, else the project default."""
+    return os.environ.get("BUNNYHOLE_SEC_USER_AGENT", "").strip() or DEFAULT_SEC_USER_AGENT
+
+
+# Beneish (1999) 8-variable model: M = -4.84 + 0.920*DSRI + 0.528*GMI + 0.404*AQI + 0.892*SGI + 0.115*DEPI
+# - 0.172*SGAI + 4.679*TATA - 0.327*LVGI. M > -1.78 indicates a high probability of earnings manipulation.
+BENEISH_INTERCEPT = -4.84
+BENEISH_COEFFICIENTS: Dict[str, float] = {
+    "DSRI": 0.920,
+    "GMI": 0.528,
+    "AQI": 0.404,
+    "SGI": 0.892,
+    "DEPI": 0.115,
+    "SGAI": -0.172,
+    "TATA": 4.679,
+    "LVGI": -0.327,
+}
+BENEISH_THRESHOLD = -1.78
+
+#: Every input the model needs, for year t and the prior year t1. Ratios (gross margin, depreciation rate,
+#: SG&A/revenue, liabilities/assets) are passed pre-computed from filed values; nothing is ever imputed.
+BENEISH_REQUIRED_INPUTS: Tuple[str, ...] = (
+    "revenue_t",
+    "revenue_t1",
+    "receivables_t",
+    "receivables_t1",
+    "gross_margin_t",
+    "gross_margin_t1",
+    "current_assets_t",
+    "current_assets_t1",
+    "ppe_t",
+    "ppe_t1",
+    "total_assets_t",
+    "total_assets_t1",
+    "dep_rate_t",
+    "dep_rate_t1",
+    "sga_ratio_t",
+    "sga_ratio_t1",
+    "net_income_t",
+    "operating_cash_flow_t",
+    "leverage_t",
+    "leverage_t1",
+)
+
+# Inputs that are denominators somewhere in the model (must be > 0) and inputs that must not be negative.
+_BENEISH_POSITIVE = (
+    "revenue_t", "revenue_t1", "receivables_t1", "gross_margin_t", "total_assets_t", "total_assets_t1",
+    "dep_rate_t", "sga_ratio_t1", "leverage_t1",
+)
+_BENEISH_NON_NEGATIVE = (
+    "receivables_t", "gross_margin_t1", "current_assets_t", "current_assets_t1", "ppe_t", "ppe_t1",
+    "dep_rate_t1", "sga_ratio_t", "leverage_t",
+)
+
+
+def beneish_m_score_from_indices(indices: Dict[str, float]) -> float:
+    """Apply the Beneish (1999) coefficients to the eight indices (unrounded). Raises KeyError if one is missing."""
+    return BENEISH_INTERCEPT + sum(coef * float(indices[name]) for name, coef in BENEISH_COEFFICIENTS.items())
+
+
+def _beneish_not_computable(missing: List[str], invalid: List[str]) -> Dict[str, Any]:
+    return {
+        "status": "not_computable",
+        "m_score": None,
+        "threshold": BENEISH_THRESHOLD,
+        "is_flagged": False,
+        "components": {},
+        "flags": [],
+        "missing_inputs": missing,
+        "invalid_inputs": invalid,
+    }
+
+
 class AccountantAgent:
-    """Follows fiat money, corporate parents/subsidiaries, SEC filings, Beneish M-Score fraud math, nonprofit 990s, political donations, and corporate jets/vessels."""
+    """Follows fiat money, corporate parents/subsidiaries, SEC filings, Beneish M-Score fraud math, nonprofit 990s, sanctions screens, and corporate jets."""
 
     def __init__(self, graph: InvestigationGraph, gear: GearMode = GearMode.FAST) -> None:
         self.graph = graph
         self.gear = gear
         self.sec_headers = {
-            "User-Agent": "BunnyholeForensicResearch research@bunnyhole.local",
+            "User-Agent": sec_user_agent(),
             "Accept": "application/json",
         }
         self.std_headers = {
@@ -177,79 +256,69 @@ class AccountantAgent:
 
     @staticmethod
     def calculate_beneish_m_score(fin: Dict[str, float]) -> Dict[str, Any]:
-        """
-        Compute the 8-variable Beneish M-Score for earnings manipulation detection.
-        M = -4.84 + 0.920*DSRI + 0.528*GMI + 0.404*AQI + 0.892*SGI + 0.115*DEPI - 0.172*SGAI + 4.679*TATA - 0.327*LVGI
-        Threshold > -1.78 indicates high probability of accounting manipulation.
-        """
-        rev_t = max(1.0, fin.get("revenue_t", 100.0))
-        rev_t1 = max(1.0, fin.get("revenue_t1", 90.0))
-        rec_t = fin.get("receivables_t", 15.0)
-        rec_t1 = max(0.01, fin.get("receivables_t1", 12.0))
-        gm_t = fin.get("gross_margin_t", 0.45)
-        gm_t1 = max(0.01, fin.get("gross_margin_t1", 0.46))
-        ca_t = fin.get("current_assets_t", 80.0)
-        ppe_t = fin.get("ppe_t", 40.0)
-        ta_t = max(1.0, fin.get("total_assets_t", 200.0))
-        ca_t1 = fin.get("current_assets_t1", 75.0)
-        ppe_t1 = fin.get("ppe_t1", 38.0)
-        ta_t1 = max(1.0, fin.get("total_assets_t1", 180.0))
-        dep_t = fin.get("dep_rate_t", 0.08)
-        dep_t1 = fin.get("dep_rate_t1", 0.08)
-        sga_t = fin.get("sga_ratio_t", 0.20)
-        sga_t1 = max(0.01, fin.get("sga_ratio_t1", 0.20))
-        ni_t = fin.get("net_income_t", 12.0)
-        ocf_t = fin.get("operating_cash_flow_t", 10.0)
-        lev_t = fin.get("leverage_t", 0.40)
-        lev_t1 = max(0.01, fin.get("leverage_t1", 0.38))
+        """Compute the 8-variable Beneish M-Score, or report why it cannot be computed.
 
-        dsri = (rec_t / rev_t) / (rec_t1 / rev_t1)
-        gmi = gm_t1 / max(0.01, gm_t)
-        aq_t = max(0.001, 1.0 - (ca_t + ppe_t) / ta_t)
-        aq_t1 = max(0.001, 1.0 - (ca_t1 + ppe_t1) / ta_t1)
-        aqi = aq_t / aq_t1
-        sgi = rev_t / rev_t1
-        depi = dep_t1 / max(0.001, dep_t)
-        sgai = sga_t / sga_t1
-        tata = (ni_t - ocf_t) / ta_t
-        lvgi = lev_t / lev_t1
+        Returns ``status="computed"`` only when every one of :data:`BENEISH_REQUIRED_INPUTS` is present, a finite
+        real number, every denominator is > 0 and no balance is negative. Otherwise returns
+        ``status="not_computable"`` with ``missing_inputs`` / ``invalid_inputs``, ``m_score=None`` and
+        ``is_flagged=False``: a score is never produced from defaults or imputed ratios.
+        """
+        missing = [k for k in BENEISH_REQUIRED_INPUTS if k not in fin or fin[k] is None]
+        invalid: List[str] = []
+        vals: Dict[str, float] = {}
+        for key in BENEISH_REQUIRED_INPUTS:
+            if key in missing:
+                continue
+            raw = fin[key]
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+                invalid.append(key)
+                continue
+            vals[key] = float(raw)
+        invalid.extend(k for k in _BENEISH_POSITIVE if k in vals and vals[k] <= 0)
+        invalid.extend(k for k in _BENEISH_NON_NEGATIVE if k in vals and vals[k] < 0)
+        if missing or invalid:
+            return _beneish_not_computable(missing, sorted(set(invalid)))
 
-        m_score = (
-            -4.84
-            + 0.920 * dsri
-            + 0.528 * gmi
-            + 0.404 * aqi
-            + 0.892 * sgi
-            + 0.115 * depi
-            - 0.172 * sgai
-            + 4.679 * tata
-            - 0.327 * lvgi
-        )
+        aq_t = 1.0 - (vals["current_assets_t"] + vals["ppe_t"]) / vals["total_assets_t"]
+        aq_t1 = 1.0 - (vals["current_assets_t1"] + vals["ppe_t1"]) / vals["total_assets_t1"]
+        if aq_t1 <= 0:
+            return _beneish_not_computable([], ["asset_quality_t1"])
+        if aq_t < 0:
+            return _beneish_not_computable([], ["asset_quality_t"])
+
+        indices = {
+            "DSRI": (vals["receivables_t"] / vals["revenue_t"]) / (vals["receivables_t1"] / vals["revenue_t1"]),
+            "GMI": vals["gross_margin_t1"] / vals["gross_margin_t"],
+            "AQI": aq_t / aq_t1,
+            "SGI": vals["revenue_t"] / vals["revenue_t1"],
+            "DEPI": vals["dep_rate_t1"] / vals["dep_rate_t"],
+            "SGAI": vals["sga_ratio_t"] / vals["sga_ratio_t1"],
+            "TATA": (vals["net_income_t"] - vals["operating_cash_flow_t"]) / vals["total_assets_t"],
+            "LVGI": vals["leverage_t"] / vals["leverage_t1"],
+        }
+        m_score = beneish_m_score_from_indices(indices)
+        if not math.isfinite(m_score):
+            return _beneish_not_computable([], ["m_score"])
+
         flags: List[str] = []
-        if m_score > -1.78:
+        if m_score > BENEISH_THRESHOLD:
             flags.append("BENEISH_M_SCORE_MANIPULATION_ALERT")
-        if dsri > 1.25:
+        if indices["DSRI"] > 1.25:
             flags.append("CHANNEL_STUFFING_RECEIVABLES_SPIKE")
-        if tata > 0.06 or (ni_t > 0 and ocf_t < 0):
+        if indices["TATA"] > 0.06 or (vals["net_income_t"] > 0 and vals["operating_cash_flow_t"] < 0):
             flags.append("CASH_FLOW_VS_NET_INCOME_DIVERGENCE")
-        if aqi > 1.25:
+        if indices["AQI"] > 1.25:
             flags.append("ASSET_QUALITY_EXPENSE_CAPITALIZATION_RISK")
 
         return {
+            "status": "computed",
             "m_score": round(m_score, 3),
-            "threshold": -1.78,
-            "is_flagged": m_score > -1.78,
-            "components": {
-                "DSRI": round(dsri, 3),
-                "GMI": round(gmi, 3),
-                "AQI": round(aqi, 3),
-                "SGI": round(sgi, 3),
-                "DEPI": round(depi, 3),
-                "SGAI": round(sgai, 3),
-                "TATA": round(tata, 3),
-                "LVGI": round(lvgi, 3),
-            },
+            "threshold": BENEISH_THRESHOLD,
+            "is_flagged": m_score > BENEISH_THRESHOLD,
+            "components": {name: round(value, 3) for name, value in indices.items()},
             "flags": flags,
+            "missing_inputs": [],
+            "invalid_inputs": [],
         }
 
     async def _gleif_complete_record(self, client: httpx.AsyncClient, rec: Dict[str, Any], company_name: str) -> Dict[str, Any]:
@@ -673,7 +742,7 @@ class AccountantAgent:
         )
         efts_url = f"https://efts.sec.gov/LATEST/search-index?q={quote_plus(query)}&from=0&size=8"
         try:
-            async with httpx.AsyncClient(timeout=12.0, headers=self.sec_headers) as client:
+            async with new_async_client(timeout=12.0, headers=self.sec_headers) as client:
                 resp = await client.get(efts_url)
                 if resp.status_code != 200:
                     return
@@ -823,40 +892,58 @@ class AccountantAgent:
             ta = _latest_two_annual(["Assets"])
             ni = _latest_two_annual(["NetIncomeLoss", "ProfitLoss"])
             ocf = _latest_two_annual(["NetCashProvidedByUsedInOperatingActivities"])
-            if not rev or not ta or not ni or not ocf:
+            rec = _latest_two_annual(["AccountsReceivableNetCurrent", "ReceivablesNetCurrent"])
+            gp = _latest_two_annual(["GrossProfit"])
+            ca = _latest_two_annual(["AssetsCurrent"])
+            ppe = _latest_two_annual(["PropertyPlantAndEquipmentNet"])
+            dep = _latest_two_annual(["DepreciationDepletionAndAmortization", "Depreciation"])
+            sga = _latest_two_annual(["SellingGeneralAndAdministrativeExpense"])
+            liab = _latest_two_annual(["Liabilities"])
+
+            # Every input comes from the filing or is left out (and reported missing). No imputed ratios.
+            fin_inputs: Dict[str, float] = {}
+            if rev:
+                fin_inputs.update(revenue_t=rev[0], revenue_t1=rev[1])
+            if rec:
+                fin_inputs.update(receivables_t=rec[0], receivables_t1=rec[1])
+            if ca:
+                fin_inputs.update(current_assets_t=ca[0], current_assets_t1=ca[1])
+            if ppe:
+                fin_inputs.update(ppe_t=ppe[0], ppe_t1=ppe[1])
+            if ta:
+                fin_inputs.update(total_assets_t=ta[0], total_assets_t1=ta[1])
+            if ni:
+                fin_inputs["net_income_t"] = ni[0]
+            if ocf:
+                fin_inputs["operating_cash_flow_t"] = ocf[0]
+
+            def _ratio(num: float, den: float) -> float:
+                return num / den if den > 0 else math.nan  # an impossible ratio is rejected as invalid
+
+            if gp and rev:
+                fin_inputs.update(gross_margin_t=_ratio(gp[0], rev[0]), gross_margin_t1=_ratio(gp[1], rev[1]))
+            if dep and ppe:
+                fin_inputs.update(
+                    dep_rate_t=_ratio(dep[0], dep[0] + ppe[0]), dep_rate_t1=_ratio(dep[1], dep[1] + ppe[1])
+                )
+            if sga and rev:
+                fin_inputs.update(sga_ratio_t=_ratio(sga[0], rev[0]), sga_ratio_t1=_ratio(sga[1], rev[1]))
+            if liab and ta:
+                fin_inputs.update(leverage_t=_ratio(liab[0], ta[0]), leverage_t1=_ratio(liab[1], ta[1]))
+
+            m_res = self.calculate_beneish_m_score(fin_inputs)
+            b_node_id = f"beneish:cik:{padded_cik}"
+            if m_res["status"] != "computed":
+                gaps = m_res["missing_inputs"] + m_res["invalid_inputs"]
+                self.graph.log(
+                    DomainCategory.FIAT,
+                    "BENEISH_NOT_COMPUTABLE",
+                    entity_name,
+                    f"M-score not computable for CIK {padded_cik}: missing/invalid {', '.join(gaps)} "
+                    "(no value is imputed; the filing does not carry every required input)",
+                )
                 return
 
-            rec = _latest_two_annual(["AccountsReceivableNetCurrent", "ReceivablesNetCurrent"]) or (rev[0] * 0.12, rev[1] * 0.12)
-            gp = _latest_two_annual(["GrossProfit"])
-            ca = _latest_two_annual(["AssetsCurrent"]) or (ta[0] * 0.40, ta[1] * 0.40)
-            ppe = _latest_two_annual(["PropertyPlantAndEquipmentNet"]) or (ta[0] * 0.20, ta[1] * 0.20)
-            dep = _latest_two_annual(["DepreciationDepletionAndAmortization", "Depreciation"]) or (ppe[0] * 0.10, ppe[1] * 0.10)
-            sga = _latest_two_annual(["SellingGeneralAndAdministrativeExpense"]) or (rev[0] * 0.18, rev[1] * 0.18)
-            liab = _latest_two_annual(["Liabilities", "LiabilitiesCurrent"]) or (ta[0] * 0.45, ta[1] * 0.45)
-
-            fin_inputs = {
-                "revenue_t": max(1.0, rev[0]),
-                "revenue_t1": max(1.0, rev[1]),
-                "receivables_t": max(0.0, rec[0]),
-                "receivables_t1": max(1.0, rec[1]),
-                "gross_margin_t": (gp[0] / max(1.0, rev[0])) if gp else 0.45,
-                "gross_margin_t1": (gp[1] / max(1.0, rev[1])) if gp else 0.45,
-                "current_assets_t": max(0.0, ca[0]),
-                "current_assets_t1": max(0.0, ca[1]),
-                "ppe_t": max(0.0, ppe[0]),
-                "ppe_t1": max(0.0, ppe[1]),
-                "total_assets_t": max(1.0, ta[0]),
-                "total_assets_t1": max(1.0, ta[1]),
-                "dep_rate_t": dep[0] / max(1.0, dep[0] + ppe[0]),
-                "dep_rate_t1": dep[1] / max(1.0, dep[1] + ppe[1]),
-                "sga_ratio_t": sga[0] / max(1.0, rev[0]),
-                "sga_ratio_t1": sga[1] / max(1.0, rev[1]),
-                "net_income_t": ni[0],
-                "operating_cash_flow_t": ocf[0],
-                "leverage_t": liab[0] / max(1.0, ta[0]),
-                "leverage_t1": liab[1] / max(1.0, ta[1]),
-            }
-            m_res = self.calculate_beneish_m_score(fin_inputs)
             m_score = m_res["m_score"]
             is_flagged = m_res["is_flagged"]
             flags = ["SEC_XBRL_BENEISH_EVALUATED"] + m_res["flags"]
@@ -868,12 +955,12 @@ class AccountantAgent:
                 selector_strength=SelectorStrength.STRONG,
                 source_url=xbrl_url,
                 extracted_fact=(
-                    f"SEC XBRL Beneish M-Score for {entity_name} (CIK {padded_cik}): M={m_score} "
-                    f"(Threshold -1.78, Manipulation Flagged={is_flagged}, Components={m_res['components']})"
+                    f"SEC XBRL Beneish M-Score for {entity_name} (CIK {padded_cik}): M={m_score} computed from filed "
+                    f"10-K values only (Threshold {BENEISH_THRESHOLD}, above threshold={is_flagged}, "
+                    f"Components={m_res['components']}). A statistical screen, not proof of manipulation."
                 ),
                 raw_snippet=f"CIK={padded_cik} | M_Score={m_score} | flags={flags} | components={m_res['components']}",
             )
-            b_node_id = f"beneish:cik:{padded_cik}"
             self.graph.upsert_node(
                 GraphNode(
                     id=b_node_id,
@@ -901,8 +988,14 @@ class AccountantAgent:
                     receipts=[rcpt],
                 )
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.graph.log(
+                DomainCategory.FIAT,
+                "BENEISH_NOT_COMPUTABLE",
+                entity_name,
+                f"M-score not computed for CIK {padded_cik}: {type(exc).__name__} while reading XBRL facts",
+                level="warning",
+            )
 
     async def investigate_nonprofit_990s_and_usaspending(self, query: str, origin_node_id: str, hop_depth: int) -> None:
         """Query ProPublica IRS Form 990 Nonprofit Explorer API & USAspending.gov Federal Awards API."""
@@ -914,7 +1007,7 @@ class AccountantAgent:
         )
         pp_url = f"https://projects.propublica.org/nonprofits/api/v2/search.json?q={quote_plus(query)}"
         try:
-            async with httpx.AsyncClient(timeout=10.0, headers=self.std_headers) as client:
+            async with new_async_client(timeout=10.0, headers=self.std_headers) as client:
                 resp = await client.get(pp_url)
                 if resp.status_code == 200:
                     orgs = resp.json().get("organizations", [])[:3]
@@ -975,10 +1068,15 @@ class AccountantAgent:
             q,
             f"Querying unfiltered ADS-B transponder telemetry (adsb.lol) for '{q}' (ICAO Hex: {icao_hex})",
         )
-        endpoint = f"https://api.adsb.lol/v2/reg/{q}" if q.startswith("N") else f"https://api.adsb.lol/v2/hex/{q.lower()}"
+        # Path-quote the user/lead-supplied value so '/', '..', '?' or '#' cannot rewrite the API path or query.
+        endpoint = (
+            f"https://api.adsb.lol/v2/reg/{quote(q, safe='')}"
+            if q.startswith("N")
+            else f"https://api.adsb.lol/v2/hex/{quote(q.lower(), safe='')}"
+        )
         aircraft_info: Dict[str, Any] = {"query": q, "icao_hex": icao_hex, "live_aircraft": []}
         try:
-            async with httpx.AsyncClient(timeout=10.0, headers=self.std_headers) as client:
+            async with new_async_client(timeout=10.0, headers=self.std_headers) as client:
                 resp = await client.get(endpoint)
                 if resp.status_code == 200:
                     ac_list = resp.json().get("ac", [])
@@ -999,7 +1097,7 @@ class AccountantAgent:
             domain=DomainCategory.PHYSICAL,
             admiralty_code="A1",
             selector_strength=SelectorStrength.STRONG,
-            source_url=f"https://globe.adsb.lol/?icao={icao_hex or q}",
+            source_url=f"https://globe.adsb.lol/?icao={quote_plus(icao_hex or q)}",
             extracted_fact=f"Aircraft {q} -> Mode-S ICAO 24-bit Hex '{icao_hex}' (Type: {ac_type}, Callsign: {flight}, Pos: {lat},{lon}, Alt: {alt}, GS: {gs} kts)",
             raw_snippet=str(ac_data or {"tail": q, "computed_icao_hex": icao_hex})[:320],
         )

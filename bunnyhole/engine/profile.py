@@ -12,14 +12,19 @@ Nothing here reaches out to the network and nothing runs automatically — the p
 from __future__ import annotations
 
 import json
+import logging
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from bunnyhole.arsenal.manager import BUNNYHOLE_CONFIG_DIR
-from bunnyhole.engine.models import GearMode
+from bunnyhole.engine.models import GearMode, selector_token_match
 from bunnyhole.engine.personas import Persona, PersonaProfile, coerce_persona, get_persona
+
+logger = logging.getLogger(__name__)
 
 PROFILE_PATH: Path = BUNNYHOLE_CONFIG_DIR / "profile.json"
 
@@ -70,21 +75,21 @@ def resolve_run_params(
 def match_watchlist(nodes: List[Dict[str, Any]], watchlist: List[str]) -> List[Dict[str, Any]]:
     """Cross-reference finished-graph nodes against the watchlist.
 
-    A node hits when a watchlist term appears (case-insensitively) in its id or label — enough to
-    say "a recurring target of yours showed up here" without re-running anything. Returns one record
-    per (term, node) hit.
+    A node hits when a watchlist term matches its id or label on token/label boundaries (domains by
+    exact host or subdomain suffix, wallets/handles exactly, names by whole word) — so 'ab' does not
+    match 'cabinet.com'. Returns one record per (term, node) hit.
     """
-    terms = [t.strip().lower() for t in (watchlist or []) if t and t.strip()]
+    terms = [t.strip() for t in (watchlist or []) if t and t.strip()]
     if not terms:
         return []
     hits: List[Dict[str, Any]] = []
     for node in nodes or []:
-        hay = f"{node.get('id', '')} {node.get('label', '')}".lower()
+        hay = f"{node.get('id', '')} {node.get('label', '')}"
         for term in terms:
-            if term in hay:
+            if selector_token_match(term, hay):
                 hits.append(
                     {
-                        "term": term,
+                        "term": term.lower(),
                         "node_id": node.get("id", ""),
                         "label": node.get("label", ""),
                         "domain": node.get("domain", ""),
@@ -101,8 +106,16 @@ def load_profile(path: Path = PROFILE_PATH) -> InvestigatorProfile:
             return InvestigatorProfile()
         data = json.loads(path.read_text(encoding="utf-8"))
         return InvestigatorProfile.model_validate(data)
-    except Exception:
-        # A corrupt profile must never break an investigation — fall back to defaults.
+    except Exception as exc:
+        # A corrupt profile must never break an investigation. Back it up (never silently overwritten
+        # on the next save) and fall back to defaults.
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = path.with_name(f"{path.name}.bad-{ts}")
+            path.replace(backup)
+            logger.warning("Corrupt profile at %s backed up to %s: %s", path, backup, exc)
+        except OSError:  # pragma: no cover - best-effort; still fall back to defaults
+            pass
         return InvestigatorProfile()
 
 
@@ -113,7 +126,23 @@ def save_profile(profile: InvestigatorProfile, path: Path = PROFILE_PATH) -> Non
         path.parent.chmod(0o700)
     except OSError:  # pragma: no cover - best-effort on platforms without chmod semantics
         pass
-    path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
+    # Atomic write: a crash mid-write must never truncate the existing profile. Write a sibling temp
+    # file (0600 before any content lands), then os.replace onto the target.
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, profile.model_dump_json(indent=2).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:  # pragma: no cover
+                pass
+        raise
     try:
         path.chmod(0o600)
     except OSError:  # pragma: no cover

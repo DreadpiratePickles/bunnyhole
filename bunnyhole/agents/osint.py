@@ -1,9 +1,10 @@
-"""Agent 3: Red Team OSINT, SIGINT/CYBINT & Breach Intelligence (Scrapling Adaptive Scraper, crt.sh SANs, DNS SOA RNAME, Mnemonic Passive DNS, Shodan InternetDB, RIPEstat BGP, Favicon mmh3, .js.map Sourcemaps, Keybase Cryptographic Proofs, GitHub .patch & PoL Timezones, Socid-Extractor, Gravatar MD5, HudsonRock Cavalier Infostealer API, and Ransomware.live)."""
+"""Agent 3: Red Team OSINT, SIGINT/CYBINT & Breach Intelligence (SSRF-guarded DOM fingerprinting, crt.sh SANs, DNS SOA RNAME, Mnemonic Passive DNS, Shodan InternetDB, RIPEstat BGP, Favicon mmh3, .js.map Sourcemaps, Keybase Cryptographic Proofs, GitHub .patch & PoL Timezones, Socid-Extractor, Gravatar MD5, HudsonRock Cavalier Infostealer API, and Ransomware.live)."""
 
 from __future__ import annotations
 
 import asyncio
 import codecs
+import contextlib
 import hashlib
 import os
 import re
@@ -30,37 +31,39 @@ from bunnyhole.engine.models import (
     SelectorStrength,
 )
 from bunnyhole.engine.netutil import (
+    UnsafeHostError,
     fetch_onion,
+    fetch_public_url,
     get_tor_proxy,
-    host_is_public,
+    host_is_public_async,
     is_safe_selector,
     new_async_client,
+    normalize_domain_lead,
 )
 
 
 async def _communicate(proc: "asyncio.subprocess.Process", timeout: float) -> bytes:
     """Run a subprocess to completion with a timeout, killing and reaping the child if it overruns.
 
-    asyncio.wait_for only cancels the wait; without an explicit kill the child keeps running and
-    leaks. This returns stdout bytes (empty on timeout).
+    asyncio.wait_for only cancels the wait; without an explicit kill the child keeps running and leaks. The kill
+    and reap run in ``finally`` so a timeout AND a cancellation of the calling task (Ctrl-C, a cancelled
+    investigation) both stop the child. Returns stdout bytes (empty on timeout); cancellation is re-raised.
     """
     try:
         stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return stdout_b or b""
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await proc.wait()
-        except Exception:
-            pass
         return b""
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
 
 
 class OSINTAgent:
-    """Executes infrastructure recon, adaptive stealth scraping, passive DNS, Shodan InternetDB, Keybase cryptographic identity proofs, GitHub PoL timezone attribution, local CLI Arsenal subprocesses, and infostealer/ransomware telemetry."""
+    """Executes infrastructure recon, SSRF-guarded site fingerprinting, passive DNS, Shodan InternetDB, Keybase cryptographic identity proofs, GitHub PoL timezone attribution, local CLI Arsenal subprocesses, and infostealer/ransomware telemetry."""
 
     def __init__(self, graph: InvestigationGraph, gear: GearMode = GearMode.FAST) -> None:
         self.graph = graph
@@ -111,17 +114,29 @@ class OSINTAgent:
         1. Non-blocking DNS A/AAAA, TXT verification tokens, and SOA RNAME admin email decoding.
         2. Certificate Transparency (crt.sh) SAN co-hosted sister domains & staging subdomains.
         3. Mnemonic Passive DNS (historical IP resolutions before Cloudflare).
-        4. Scrapling DOM/Asset Fingerprinting (Google Analytics, GTM, AdSense, Favicon mmh3).
+        4. DOM/Asset Fingerprinting (Google Analytics, GTM, AdSense, Favicon mmh3).
         5. URLScan.io & AlienVault OTX Passive Domain Telemetry.
         6. Local CLI Arsenal Subprocess Sweep (WHOIS, Subfinder, dnstwist).
         7. HudsonRock Cavalier Infostealer domain compromise check.
         """
-        clean_domain = domain.lower().strip().replace("https://", "").replace("http://", "").split("/")[0]
+        normalized = normalize_domain_lead(domain)
+        if normalized is None:
+            # A domain lead is a registrable hostname: userinfo (a.com:b@127.0.0.1), ports and IP literals are refused
+            # before any DNS query, fetch or subprocess sees them.
+            self.graph.log(
+                DomainCategory.OSINT,
+                "DOMAIN_LEAD_REJECTED",
+                domain[:120],
+                "Refused domain lead: not a plain hostname (userinfo, port, IP literal or malformed name).",
+                level="warning",
+            )
+            return
+        clean_domain = normalized
         self.graph.log(
             DomainCategory.OSINT,
             "DOMAIN_INFRA_RECON",
             clean_domain,
-            f"Running DNS SOA/TXT, crt.sh SANs, Mnemonic Passive DNS, Scrapling fingerprint, CLI Arsenal & Cavalier check on '{clean_domain}'",
+            f"Running DNS SOA/TXT, crt.sh SANs, Mnemonic Passive DNS, DOM fingerprint, CLI Arsenal & Cavalier check on '{clean_domain}'",
         )
 
         # 1. Non-blocking DNS A, TXT, SOA RNAME
@@ -211,10 +226,10 @@ class OSINTAgent:
         # 3. Mnemonic Passive DNS (Defeats Cloudflare hiding by finding historical pre-CDN IPs!)
         await self._scan_mnemonic_pdns(clean_domain, origin_node_id, hop_depth)
 
-        # 4. Scrapling Adaptive Web Fingerprint & .js.map Sourcemap Extractor
+        # 4. Web DOM Fingerprint (trackers, embedded handles/wallets, favicon mmh3)
         await self._scrape_and_fingerprint_site(clean_domain, origin_node_id, hop_depth)
 
-        # 5. URLScan.io & AlienVault OTX Passive Domain Telemetry (from osint_orchestrator.py)
+        # 5. URLScan.io & AlienVault OTX Passive Domain Telemetry
         await self._scan_urlscan_and_otx(clean_domain, origin_node_id, hop_depth)
 
         # 6. Local CLI Arsenal Subprocess Sweep (WHOIS + Subfinder/dnstwist in DEEP gear)
@@ -491,21 +506,23 @@ class OSINTAgent:
 
     async def _scrape_and_fingerprint_site(self, clean_domain: str, origin_node_id: str, hop_depth: int) -> None:
         """
-        Use Scrapling to fetch the target site, extract:
+        Fetch the target site (httpx via netutil.fetch_public_url, so --proxy/--tor apply), extract:
         - Google Analytics (UA-/G-), GTM, AdSense (pub-), WalletConnect projectId, Sentry DSN
         - Favicon MurmurHash3 (mmh3) fingerprint for Shodan cross-matching
         - Exposed .js.map sourcemaps (local filesystem path extraction)
         - Hardcoded EVM wallets (0x...), GitHub orgs, Twitter/X, and Telegram handles
         """
-        # SSRF guard: the domain may originate from an untrusted seed or CT-log sister host. Refuse to
-        # fetch anything that resolves to a private, loopback, or cloud-metadata address.
-        host_only = clean_domain.split("/")[0].split(":")[0]
-        if not host_is_public(host_only):
+        # SSRF guard: the domain may originate from an untrusted seed or CT-log sister host. Only a plain hostname
+        # is accepted (no userinfo/port/IP literal), it must resolve only to public addresses, and every request
+        # (page and favicon) goes to that validated host via fetch_public_url, which pins the checked IP and
+        # re-validates each redirect hop. All requests use netutil's client, so --proxy/--tor is honoured.
+        host_only = normalize_domain_lead(clean_domain)
+        if host_only is None or not await host_is_public_async(host_only):
             self.graph.log(
                 DomainCategory.OSINT,
                 "SSRF_BLOCKED",
-                clean_domain,
-                "Refused to fetch site: host resolves to a non-public/internal address.",
+                clean_domain[:120],
+                "Refused to fetch site: not a plain public hostname, or it resolves to a non-public/internal address.",
                 level="warning",
             )
             return
@@ -513,22 +530,13 @@ class OSINTAgent:
         target_url = f"https://{host_only}"
         html_text = ""
         try:
-            # Try Scrapling Fetcher first, fallback to httpx. Scrapling is synchronous, so run it off
-            # the event loop; disable httpx auto-redirects so a 3xx can't bounce us to an internal host.
-            try:
-                from scrapling import Fetcher
-
-                def _fetch() -> str:
-                    fetcher = Fetcher(auto_match=False)
-                    page = fetcher.get(target_url, timeout=8)
-                    return page.html_content if hasattr(page, "html_content") else str(page.body or "")
-
-                html_text = await asyncio.to_thread(_fetch)
-            except Exception:
-                async with new_async_client(timeout=8.0, follow_redirects=False, headers=self.headers) as client:
-                    r = await client.get(target_url)
-                    html_text = r.text if r.status_code == 200 else ""
-        except Exception:
+            r = await fetch_public_url(target_url, timeout=8.0, headers=self.headers)
+            html_text = r.text if r.status_code == 200 else ""
+        except UnsafeHostError as exc:
+            self.graph.log(DomainCategory.OSINT, "SSRF_BLOCKED", host_only, f"Site fetch refused: {exc}", level="warning")
+            return
+        except httpx.HTTPError as exc:
+            self.graph.log(DomainCategory.OSINT, "SITE_FETCH_NOTE", host_only, f"Site fetch failed: {type(exc).__name__}")
             return
 
         if not html_text:
@@ -548,7 +556,7 @@ class OSINTAgent:
         for t_id, t_type in trackers[:4]:
             node_id = f"tracker:{t_id}"
             rcpt = EvidenceReceipt(
-                tool="scrapling_dom_fingerprint",
+                tool="httpx_dom_fingerprint",
                 domain=DomainCategory.OSINT,
                 admiralty_code="A1",
                 selector_strength=SelectorStrength.STRONG,
@@ -618,50 +626,51 @@ class OSINTAgent:
 
         # Compute Shodan-compatible Favicon MurmurHash3 (mmh3)
         try:
-            async with new_async_client(timeout=6.0, follow_redirects=True, headers=self.headers) as client:
-                fav_resp = await client.get(f"https://{clean_domain}/favicon.ico")
-                if fav_resp.status_code == 200 and len(fav_resp.content) > 64:
-                    b64_fav = codecs.encode(fav_resp.content, "base64")
-                    fav_hash = mmh3.hash(b64_fav)
-                    if fav_hash not in GENERIC_FAVICON_HASHES:
-                        fav_id = f"tracker:favicon:{fav_hash}"
-                        rcpt = EvidenceReceipt(
-                            tool="shodan_favicon_mmh3",
+            fav_resp = await fetch_public_url(f"https://{host_only}/favicon.ico", timeout=6.0, headers=self.headers)
+            if fav_resp.status_code == 200 and len(fav_resp.content) > 64:
+                b64_fav = codecs.encode(fav_resp.content, "base64")
+                fav_hash = mmh3.hash(b64_fav)
+                if fav_hash not in GENERIC_FAVICON_HASHES:
+                    fav_id = f"tracker:favicon:{fav_hash}"
+                    rcpt = EvidenceReceipt(
+                        tool="shodan_favicon_mmh3",
+                        domain=DomainCategory.OSINT,
+                        admiralty_code="A1",
+                        selector_strength=SelectorStrength.STRONG,
+                        source_url=f"https://www.shodan.io/search?query=http.favicon.hash%3A{fav_hash}",
+                        extracted_fact=f"Favicon MurmurHash3 (mmh3) for {clean_domain} is {fav_hash} (Shodan query: http.favicon.hash:{fav_hash})",
+                        raw_snippet=f"favicon_bytes={len(fav_resp.content)} | mmh3={fav_hash}",
+                    )
+                    self.graph.upsert_node(
+                        GraphNode(
+                            id=fav_id,
+                            label=f"🎯 Favicon mmh3: {fav_hash}",
+                            entity_type=EntityType.TRACKER_ID,
+                            domain=DomainCategory.OSINT,
+                            selector_strength=SelectorStrength.STRONG,
+                            smoke_score=50.0,
+                            risk_flags=["SHODAN_FAVICON_MMH3_FINGERPRINT"],
+                            attributes={"mmh3_hash": fav_hash, "shodan_dork": f"http.favicon.hash:{fav_hash}"},
+                            receipts=[rcpt],
+                            hop_depth=hop_depth,
+                        )
+                    )
+                    self.graph.upsert_edge(
+                        GraphEdge(
+                            source_id=origin_node_id,
+                            target_id=fav_id,
+                            relation=RelationType.SHARES_FINGERPRINT_WITH,
                             domain=DomainCategory.OSINT,
                             admiralty_code="A1",
-                            selector_strength=SelectorStrength.STRONG,
-                            source_url=f"https://www.shodan.io/search?query=http.favicon.hash%3A{fav_hash}",
-                            extracted_fact=f"Favicon MurmurHash3 (mmh3) for {clean_domain} is {fav_hash} (Shodan query: http.favicon.hash:{fav_hash})",
-                            raw_snippet=f"favicon_bytes={len(fav_resp.content)} | mmh3={fav_hash}",
+                            confidence=0.92,
+                            summary=f"Favicon mmh3={fav_hash}",
+                            receipts=[rcpt],
                         )
-                        self.graph.upsert_node(
-                            GraphNode(
-                                id=fav_id,
-                                label=f"🎯 Favicon mmh3: {fav_hash}",
-                                entity_type=EntityType.TRACKER_ID,
-                                domain=DomainCategory.OSINT,
-                                selector_strength=SelectorStrength.STRONG,
-                                smoke_score=50.0,
-                                risk_flags=["SHODAN_FAVICON_MMH3_FINGERPRINT"],
-                                attributes={"mmh3_hash": fav_hash, "shodan_dork": f"http.favicon.hash:{fav_hash}"},
-                                receipts=[rcpt],
-                                hop_depth=hop_depth,
-                            )
-                        )
-                        self.graph.upsert_edge(
-                            GraphEdge(
-                                source_id=origin_node_id,
-                                target_id=fav_id,
-                                relation=RelationType.SHARES_FINGERPRINT_WITH,
-                                domain=DomainCategory.OSINT,
-                                admiralty_code="A1",
-                                confidence=0.92,
-                                summary=f"Favicon mmh3={fav_hash}",
-                                receipts=[rcpt],
-                            )
-                        )
-        except Exception:
-            pass
+                    )
+        except UnsafeHostError as exc:
+            self.graph.log(DomainCategory.OSINT, "SSRF_BLOCKED", host_only, f"Favicon fetch refused: {exc}", level="warning")
+        except httpx.HTTPError as exc:
+            self.graph.log(DomainCategory.OSINT, "SITE_FETCH_NOTE", host_only, f"Favicon fetch failed: {type(exc).__name__}")
 
     async def investigate_identity_and_handle(self, handle: str, origin_node_id: str, hop_depth: int) -> None:
         """

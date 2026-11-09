@@ -1,22 +1,38 @@
 """Karpathy llm-council 3-Stage Adversarial Investigative Council for Bunnyhole.
 
 Adapts https://github.com/karpathy/llm-council (Stage 1 Parallel Independent Opinions ->
-Stage 2 Anonymized Peer Review & Forced Ranking -> Stage 3 Chairman Verdict)
-to multi-domain intelligence analysis with strict SHA-256 receipt verification.
+Stage 2 Forced Ranking -> Stage 3 Chairman Verdict) to multi-domain intelligence analysis with strict SHA-256
+receipt verification.
+
+Honesty note: Stage 2 here is a deterministic evidence-rubric ranking (see :func:`deterministic_rubric_score`), not
+an LLM peer review; it is labelled that way in the result (``stage2_method``/``stage2_label``) and in the report.
+Stage 1 seats and the Stage 3 chairman may add LLM text when a provider key is set (llm_providers); failures are
+logged and reported in ``llm_status`` and the deterministic text is kept.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-
 from bunnyhole.engine.graph import InvestigationGraph
+from bunnyhole.engine.llm_providers import PROVIDER_ORDER, complete_with_fallback, configured_providers
 from bunnyhole.engine.models import ConfidenceTier, DomainCategory, SelectorStrength
+
+STAGE2_METHOD = "deterministic_evidence_rubric"
+STAGE2_LABEL = "Deterministic evidence ranking (not peer review)"
+
+
+def deterministic_rubric_score(stage1_result: Dict[str, Any]) -> float:
+    """Stage 2 rule: evidentiary rigor score + 3 points per ``[R#]`` citation in the response, capped at +15.
+
+    The same rule applies whichever seat "casts" the ballot, so all ballots are identical by construction; ties
+    keep seat order (stable sort). There is no per-reviewer perspective term.
+    """
+    citation_cnt = len(re.findall(r"\[R\d+\]", stage1_result["response"]))
+    return float(stage1_result["evidentiary_rigor_score"]) + min(15.0, citation_cnt * 3.0)
 
 # 5 Specialized Investigative Council Seats (can be backed by distinct OpenRouter / API models or deterministic engines)
 COUNCIL_SEATS: List[Dict[str, str]] = [
@@ -136,14 +152,16 @@ def calculate_aggregate_rankings(
 
 class InvestigativeCouncil:
     """
-    Executes Karpathy's 3-Stage LLM Council protocol over Bunnyhole's Universal Investigation Graph:
+    Executes a Karpathy-style 3-stage council over Bunnyhole's Universal Investigation Graph:
     - Stage 1: 5 Specialized Investigative Personas produce independent citation-backed assessments.
-    - Stage 2: Responses are anonymized as Response A..E; each seat critiques and ranks all responses.
-    - Stage 3: The Chairman synthesizes the winning cross-examined thesis into the final Council Verdict.
+    - Stage 2: Responses are anonymized as Response A..E and ranked by a deterministic evidence rubric
+      (not peer review; see deterministic_rubric_score).
+    - Stage 3: The Chairman synthesizes the top-ranked thesis into the final Council Verdict.
     """
 
     def __init__(self, graph: InvestigationGraph) -> None:
         self.graph = graph
+        self._llm_failures: List[Dict[str, Any]] = []
 
     def _build_receipt_catalog(self) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         """Assign sequential citation tags [R1], [R2], ... to every unique SHA-256 EvidenceReceipt."""
@@ -248,88 +266,34 @@ class InvestigativeCouncil:
         rigor = 70.0 + min(28.0, len(strong_rcpts) * 7.5 + len(domain_rcpts) * 2.0 + (6.0 if paths else 0.0))
         return "\n".join(bullet_lines), rigor
 
-    async def _query_llm_if_configured(self, system_prompt: str, user_prompt: str, preferred_model: str) -> Optional[str]:
+    async def _query_llm_if_configured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        preferred_model: str,
+        *,
+        fast: bool = False,
+        purpose: str = "council",
+    ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+        """Query OpenRouter (``preferred_model``) then Gemini / Anthropic / OpenAI, whichever keys are set.
+
+        Returns ``(text or None, failures)``. No key: no request at all. Every failure is logged as an agent event
+        by llm_providers and kept for the result's ``llm_status``.
         """
-        Query OpenRouter (matching karpathy/llm-council) if OPENROUTER_API_KEY is set,
-        or fall back to GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY if configured.
-        """
-        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                if openrouter_key:
-                    resp = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {openrouter_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": preferred_model,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            "temperature": 0.2,
-                        },
-                    )
-                    if resp.status_code == 200:
-                        return resp.json()["choices"][0]["message"]["content"]
-
-                if gemini_key:
-                    resp = await client.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
-                        json={
-                            "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
-                            "generationConfig": {"temperature": 0.2},
-                        },
-                    )
-                    if resp.status_code == 200:
-                        cands = resp.json().get("candidates", [])
-                        if cands:
-                            return cands[0].get("content", {}).get("parts", [{}])[0].get("text")
-
-                if anthropic_key:
-                    resp = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key": anthropic_key,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": "claude-3-5-sonnet-latest",
-                            "max_tokens": 900,
-                            "system": system_prompt,
-                            "messages": [{"role": "user", "content": user_prompt}],
-                        },
-                    )
-                    if resp.status_code == 200:
-                        blocks = resp.json().get("content", [])
-                        if blocks:
-                            return blocks[0].get("text")
-
-                if openai_key:
-                    resp = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {openai_key}"},
-                        json={
-                            "model": "gpt-4o-mini",
-                            "temperature": 0.2,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                        },
-                    )
-                    if resp.status_code == 200:
-                        return resp.json()["choices"][0]["message"]["content"]
-        except Exception:
-            pass
-        return None
+        outcome = await complete_with_fallback(
+            system_prompt,
+            user_prompt,
+            providers=PROVIDER_ORDER,
+            openrouter_model=preferred_model,
+            fast=fast,
+            max_tokens=900,
+            timeout=20.0,
+            graph=self.graph,
+            purpose=purpose,
+        )
+        failures = outcome.failures()
+        self._llm_failures.extend(failures)
+        return outcome.text, failures
 
     async def stage1_collect_responses(
         self,
@@ -346,10 +310,12 @@ class InvestigativeCouncil:
 
         async def _eval_seat(seat: Dict[str, str]) -> Dict[str, Any]:
             det_text, det_rigor = self._generate_deterministic_seat_opinion(seat, catalog, interconnections)
-            llm_resp = await self._query_llm_if_configured(
+            llm_resp, failures = await self._query_llm_if_configured(
                 seat["role_prompt"],
                 f"Target Seed: {self.graph.seed_query}\n\nEvidence Receipts:\n{evidence_digest}\n\nProvide a concise 4-bullet forensic assessment citing [R#] tags.",
                 seat["default_model"],
+                fast=True,
+                purpose=f"council stage 1 ({seat['id']})",
             )
             return {
                 "member_id": seat["id"],
@@ -359,6 +325,7 @@ class InvestigativeCouncil:
                 "response": llm_resp or det_text,
                 "evidentiary_rigor_score": round(det_rigor, 1),
                 "mode": "llm_council_api" if llm_resp else "deterministic_specialist_seat",
+                "llm_failures": failures,
             }
 
         return list(await asyncio.gather(*[_eval_seat(s) for s in COUNCIL_SEATS]))
@@ -368,10 +335,9 @@ class InvestigativeCouncil:
         stage1_results: List[Dict[str, Any]],
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, str]]]:
         """
-        Stage 2 (karpathy/llm-council):
-        1. Anonymize Stage 1 responses as Response A, Response B, Response C, Response D, Response E.
-        2. Each Council Member critiques the anonymized responses on evidentiary rigor ([R#] citations,
-           A1/B1 Strong selectors vs uncorroborated C3 hypotheses) and outputs a 'FINAL RANKING:' ballot.
+        Stage 2: anonymize Stage 1 responses as Response A..E and rank them with the deterministic evidence rubric
+        (:func:`deterministic_rubric_score`). No LLM is consulted, so this is NOT a peer review: every seat's
+        ballot is the same ranking, kept one-per-seat only for result-schema compatibility.
         """
         labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, D, E
         label_to_member: Dict[str, Dict[str, str]] = {}
@@ -385,46 +351,35 @@ class InvestigativeCouncil:
             }
             labeled_items.append((f"Response {label}", s1))
 
-        stage2_results: List[Dict[str, Any]] = []
-        for idx, reviewer in enumerate(stage1_results):
-            # Score each response from the perspective of this reviewer (rewarding rigor, [R#] citations, and skepticism)
-            scored_ballot: List[Tuple[float, str, str]] = []
-            for resp_label, candidate in labeled_items:
-                citation_cnt = len(re.findall(r"\[R\d+\]", candidate["response"]))
-                base_score = candidate["evidentiary_rigor_score"] + min(15.0, citation_cnt * 3.0)
-                # Slight perspective weighting so seats with different priorities produce realistic peer deliberation
-                if reviewer["member_id"] == "red_cell_defense_skeptic" and candidate["member_id"] == "red_cell_defense_skeptic":
-                    base_score += 4.0
-                elif candidate["member_id"] == reviewer["member_id"]:
-                    # Anonymized evaluation slightly varies by domain depth
-                    base_score += (idx % 3) * 1.2
-                critique_note = (
-                    f"{resp_label}: Cites {citation_cnt} SHA-256 receipts (Rigor={candidate['evidentiary_rigor_score']:.0f}/100). "
-                    + (
-                        "Strong A1/B1 primary-source anchoring and explicit false-positive quarantine."
-                        if base_score >= 85.0
-                        else "Limited primary-source density in this domain; useful as secondary corroboration."
-                    )
-                )
-                scored_ballot.append((base_score, resp_label, critique_note))
-
-            scored_ballot.sort(key=lambda x: x[0], reverse=True)
-            eval_lines = [f"- {note}" for _, _, note in scored_ballot]
-            ranking_lines = [f"{pos}. {r_lbl}" for pos, (_, r_lbl, _) in enumerate(scored_ballot, start=1)]
-            full_ranking_text = (
-                "PEER EVALUATION OF ANONYMIZED RESPONSES:\n"
-                + "\n".join(eval_lines)
-                + "\n\nFINAL RANKING:\n"
-                + "\n".join(ranking_lines)
+        scored: List[Tuple[float, str, str]] = []
+        for resp_label, candidate in labeled_items:
+            score = deterministic_rubric_score(candidate)
+            citation_cnt = len(re.findall(r"\[R\d+\]", candidate["response"]))
+            note = (
+                f"{resp_label}: cites {citation_cnt} receipts, rigor {candidate['evidentiary_rigor_score']:.0f}/100, "
+                f"rubric score {score:.1f}."
             )
-            parsed = parse_ranking_from_text(full_ranking_text)
-            stage2_results.append({
+            scored.append((score, resp_label, note))
+        scored.sort(key=lambda x: x[0], reverse=True)  # stable: ties keep label order
+        ranking_text = (
+            "DETERMINISTIC EVIDENCE-RUBRIC RANKING (not an LLM peer review; score = rigor + min(15, 3 x [R#] cites)):\n"
+            + "\n".join(f"- {note}" for _, _, note in scored)
+            + "\n\nFINAL RANKING:\n"
+            + "\n".join(f"{pos}. {r_lbl}" for pos, (_, r_lbl, _) in enumerate(scored, start=1))
+        )
+        parsed = parse_ranking_from_text(ranking_text)
+
+        stage2_results: List[Dict[str, Any]] = [
+            {
                 "reviewer_id": reviewer["member_id"],
                 "reviewer_name": reviewer["member_name"],
                 "model": reviewer["model"],
-                "ranking": full_ranking_text,
-                "parsed_ranking": parsed,
-            })
+                "method": STAGE2_METHOD,
+                "ranking": ranking_text,
+                "parsed_ranking": list(parsed),
+            }
+            for reviewer in stage1_results
+        ]
 
         return stage2_results, label_to_member
 
@@ -439,7 +394,7 @@ class InvestigativeCouncil:
     ) -> Dict[str, Any]:
         """
         Stage 3 (karpathy/llm-council): The Chairman synthesizes all 5 Stage 1 specialist briefs +
-        Stage 2 peer rankings into the final authoritative Council Verdict.
+        the Stage 2 deterministic ranking into the final Council Verdict.
         """
         ach = self.graph.run_skeptic_network_analytics()
         top_ranked = aggregate_rankings[0] if aggregate_rankings else {"member_name": "Council Consensus", "average_rank": 1.0}
@@ -452,10 +407,11 @@ class InvestigativeCouncil:
 
         md_lines = [
             f"## 🏛️ KARPATHY LLM-COUNCIL DELIBERATION VERDICT: `{self.graph.seed_query}`",
-            f"**Top Peer-Ranked Council Seat:** **{top_ranked['member_name']}** (Avg Ballot Rank: `{top_ranked['average_rank']}`) | **CIA ACH Winner:** **{ach.winning_hypothesis}**",
+            f"**Top-Ranked Council Seat (deterministic rubric):** **{top_ranked['member_name']}** (Avg Rank: `{top_ranked['average_rank']}`) | **CIA ACH Winner:** **{ach.winning_hypothesis}**",
             "",
-            "### 1. Stage 2 Anonymized Peer-Review Leaderboard",
-            "| Rank | Council Seat | Anonymized Label | Avg Peer Rank | Ballots |",
+            f"### 1. Stage 2 {STAGE2_LABEL}",
+            "*Ranked by a fixed rule (rigor score + 3 per [R#] citation, max +15); no model reviewed the briefs.*",
+            "| Rank | Council Seat | Anonymized Label | Avg Rank | Ballots |",
             "| :---: | :--- | :---: | :---: | :---: |",
         ]
         for idx, item in enumerate(aggregate_rankings, start=1):
@@ -484,8 +440,8 @@ class InvestigativeCouncil:
         quarantined = hypothesis_edges + circumstantial_edges
         if quarantined:
             for e in quarantined[:6]:
-                rcpt = e.receipts[0] if e.receipts else None
-                tag = id_to_tag.get(rcpt.receipt_id, "R?") if rcpt else "R?"
+                first_receipt = e.receipts[0] if e.receipts else None
+                tag = id_to_tag.get(first_receipt.receipt_id, "R?") if first_receipt else "R?"
                 note = e.skeptic_notes or "Soft selector match; requires orthogonal Strong-selector corroboration."
                 md_lines.append(
                     f"- **[QUARANTINED `{e.tier.value.upper()}`] [{tag}] (`{e.admiralty_code}`):** {e.summary} — *{note}*"
@@ -510,12 +466,14 @@ class InvestigativeCouncil:
             f"#{i+1} {a['member_name']} ({a['anonymous_label']}) - Avg Rank {a['average_rank']}"
             for i, a in enumerate(aggregate_rankings)
         )
-        llm_chairman = await self._query_llm_if_configured(
+        llm_chairman, chairman_failures = await self._query_llm_if_configured(
             "You are the Chairman of the Bunnyhole Investigative Council (modeled on karpathy/llm-council). "
-            "Synthesize the 5 Stage-1 specialist briefs and Stage-2 peer rankings into a rigorous executive conclusion. "
-            "Always cite [R#] receipt tags and strictly distinguish VERIFIED A1/B1 facts from quarantined HYPOTHESIS leads.",
-            f"Target: {self.graph.seed_query}\n\nStage 1 Briefs:\n{s1_summary}\n\nStage 2 Peer Rankings:\n{s2_summary}",
+            "Synthesize the 5 Stage-1 specialist briefs and the Stage-2 deterministic evidence ranking into a rigorous "
+            "executive conclusion. Always cite [R#] receipt tags and strictly distinguish VERIFIED A1/B1 facts from "
+            "quarantined HYPOTHESIS leads.",
+            f"Target: {self.graph.seed_query}\n\nStage 1 Briefs:\n{s1_summary}\n\nStage 2 Deterministic Ranking:\n{s2_summary}",
             "google/gemini-2.5-pro",
+            purpose="council chairman",
         )
         if llm_chairman:
             chairman_markdown = llm_chairman.strip() + "\n\n---\n\n" + chairman_markdown
@@ -526,6 +484,7 @@ class InvestigativeCouncil:
             "verified_facts_count": len(verified_edges),
             "quarantined_hypotheses_count": len(quarantined),
             "verdict_markdown": chairman_markdown,
+            "llm_failures": chairman_failures,
         }
 
     async def run_full_council(
@@ -535,6 +494,7 @@ class InvestigativeCouncil:
     ) -> Dict[str, Any]:
         """Run all 3 stages of the Karpathy Investigative Council and return full structured telemetry."""
         catalog, _ = self._build_receipt_catalog()
+        self._llm_failures = []
         stage1 = await self.stage1_collect_responses(catalog, interconnections)
         stage2, label_to_member = await self.stage2_collect_rankings(stage1)
         aggregate_rankings = calculate_aggregate_rankings(stage2, label_to_member)
@@ -561,4 +521,10 @@ class InvestigativeCouncil:
             "label_to_member": label_to_member,
             "aggregate_rankings": aggregate_rankings,
             "stage3_chairman_verdict": stage3,
+            "stage2_method": STAGE2_METHOD,
+            "stage2_label": STAGE2_LABEL,
+            "llm_status": {
+                "configured_providers": configured_providers(PROVIDER_ORDER),
+                "failures": list(self._llm_failures),
+            },
         }

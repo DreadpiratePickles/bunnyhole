@@ -6,9 +6,8 @@ import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
-import httpx
-
 from bunnyhole.engine.graph import InvestigationGraph
+from bunnyhole.engine.ids import resolve_wallet_node_id
 from bunnyhole.engine.models import (
     ConfidenceTier,
     DomainCategory,
@@ -21,6 +20,7 @@ from bunnyhole.engine.models import (
     RelationType,
     SelectorStrength,
 )
+from bunnyhole.engine.netutil import new_async_client
 
 # Known CEX Omnibus Hot Wallets & Mixers for Deposit Sweep Clustering & Attribution
 KNOWN_EVM_LABELS: Dict[str, str] = {
@@ -37,7 +37,7 @@ KNOWN_EVM_LABELS: Dict[str, str] = {
 
 
 class OnChainAgent:
-    """Traces EVM, Bitcoin, and Solana wallets, Mother Wallet gas trees, CEX Deposit Sweep clusters, THORChain memos, and DeFi liquidity anomalies."""
+    """Traces EVM (Ethereum mainnet) and Bitcoin wallets, Mother Wallet gas trees, CEX Deposit Sweep clusters, THORChain memos, and DeFi liquidity anomalies."""
 
     def __init__(self, graph: InvestigationGraph, gear: GearMode = GearMode.FAST) -> None:
         self.graph = graph
@@ -93,7 +93,7 @@ class OnChainAgent:
 
         # 1. ENSData Unified Web3 Profile Resolution
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 ens_resp = await client.get(f"https://api.ensdata.net/{quote_plus(target)}")
                 if ens_resp.status_code == 200:
                     ens_data = ens_resp.json()
@@ -102,7 +102,7 @@ class OnChainAgent:
                     if ens_data.get("ens"):
                         ens_name = ens_data["ens"]
 
-                    wallet_id = f"wallet:eth:{(resolved_address or target).lower()}"
+                    wallet_id = resolve_wallet_node_id(self.graph, "eth", resolved_address or target)
                     rcpt = EvidenceReceipt(
                         tool="ensdata_web3_identity_resolver",
                         domain=DomainCategory.ONCHAIN,
@@ -165,14 +165,14 @@ class OnChainAgent:
                                     hop_depth=hop_depth + 1,
                                 )
                             )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.graph.log(DomainCategory.ONCHAIN, "ENSDATA_NOTE", target, f"ENSData lookup failed: {type(exc).__name__}")
 
         if not resolved_address or not resolved_address.startswith("0x"):
             return
 
         addr_low = resolved_address.lower()
-        wallet_id = f"wallet:eth:{addr_low}"
+        wallet_id = resolve_wallet_node_id(self.graph, "eth", addr_low)
 
         # 2. GoPlus Malicious Address Security Oracle
         await self._check_goplus_security(addr_low, wallet_id, hop_depth)
@@ -180,7 +180,7 @@ class OnChainAgent:
         # 3. Blockscout REST API v2 Address Info & Transactions
         bs_base = "https://eth.blockscout.com/api/v2"
         try:
-            async with httpx.AsyncClient(timeout=12.0, headers=self.headers) as client:
+            async with new_async_client(timeout=12.0, headers=self.headers) as client:
                 info_resp = await client.get(f"{bs_base}/addresses/{addr_low}")
                 if info_resp.status_code == 200:
                     info = info_resp.json()
@@ -222,7 +222,7 @@ class OnChainAgent:
 
                     # If it's a Smart Contract, link & pivot to the Deployer Wallet!
                     if is_contract and creator_addr:
-                        dep_id = f"wallet:eth:{creator_addr}"
+                        dep_id = resolve_wallet_node_id(self.graph, "eth", creator_addr)
                         self.graph.upsert_node(
                             GraphNode(
                                 id=dep_id,
@@ -284,7 +284,7 @@ class OnChainAgent:
                         thor_memo = self.decode_thorchain_memo_from_hex(raw_input)
                         if thor_memo:
                             dest_btc = thor_memo["destination_address"]
-                            btc_id = f"wallet:btc:{dest_btc}"
+                            btc_id = resolve_wallet_node_id(self.graph, "btc", dest_btc)
                             t_rcpt = EvidenceReceipt(
                                 tool="thorchain_calldata_memo_decoder",
                                 domain=DomainCategory.ONCHAIN,
@@ -340,7 +340,7 @@ class OnChainAgent:
 
                         # Track major outgoing flows or mixer/CEX interactions
                         if from_addr == addr_low and to_addr and (val_eth >= 0.1 or to_addr in KNOWN_EVM_LABELS):
-                            cp_id = f"wallet:eth:{to_addr}"
+                            cp_id = resolve_wallet_node_id(self.graph, "eth", to_addr)
                             label_str = to_name or f"{to_addr[:12]}..."
                             is_mixer = "tornado" in label_str.lower()
                             is_cex = any(k in label_str.lower() for k in ("binance", "coinbase", "okx", "kraken", "bybit"))
@@ -420,7 +420,7 @@ class OnChainAgent:
                     if first_f:
                         f_addr = first_f["from"]
                         f_name = first_f["name"] or f"{f_addr[:12]}..."
-                        f_id = f"wallet:eth:{f_addr}"
+                        f_id = resolve_wallet_node_id(self.graph, "eth", f_addr)
                         f_rcpt = EvidenceReceipt(
                             tool="first_funder_gas_lineage (sort=asc)",
                             domain=DomainCategory.ONCHAIN,
@@ -464,7 +464,7 @@ class OnChainAgent:
         """Query GoPlus Security Oracle for malicious address flags (cybercrime, money laundering, phishing, mixer, sanctions)."""
         url = f"https://api.gopluslabs.io/api/v1/address_security/{addr_low}?chain_id=1"
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
@@ -484,16 +484,27 @@ class OnChainAgent:
                         extracted_fact=f"GoPlus Security Alert on {addr_low}: Flagged for {triggered}",
                         raw_snippet=str(res)[:320],
                     )
-                    if wallet_id in self.graph.nodes:
-                        node = self.graph.nodes[wallet_id]
-                        node.smoke_score = max(node.smoke_score, 92.0)
-                        for f in triggered:
-                            flag = f"GOPLUS_{f}"
-                            if flag not in node.risk_flags:
-                                node.risk_flags.append(flag)
-                        node.receipts.append(rcpt)
-        except Exception:
-            pass
+                    # Upsert (create or merge): the wallet node may not exist yet when no earlier source
+                    # (ENSData, Blockscout) produced one, and a malicious-address hit must never be dropped.
+                    self.graph.upsert_node(
+                        GraphNode(
+                            id=wallet_id,
+                            label=f"⛓️ {addr_low[:14]}... (GoPlus flagged)",
+                            entity_type=EntityType.CRYPTO_WALLET,
+                            domain=DomainCategory.ONCHAIN,
+                            selector_strength=SelectorStrength.STRONG,
+                            ftm_schema="CryptoWallet",
+                            smoke_score=92.0,
+                            risk_flags=[f"GOPLUS_{f}" for f in triggered],
+                            attributes={"address": addr_low, "goplus_flags": triggered},
+                            receipts=[rcpt],
+                            hop_depth=hop_depth,
+                        )
+                    )
+        except Exception as exc:
+            self.graph.log(
+                DomainCategory.ONCHAIN, "GOPLUS_NOTE", addr_low, f"GoPlus lookup failed: {type(exc).__name__}", level="warning"
+            )
 
     async def investigate_dexscreener_tokens(self, query: str, origin_node_id: str, hop_depth: int) -> None:
         """
@@ -507,7 +518,7 @@ class OnChainAgent:
             return
         url = f"https://api.dexscreener.com/latest/dex/search?q={quote_plus(clean_q)}"
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self.headers) as client:
+            async with new_async_client(timeout=8.0, headers=self.headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
@@ -606,7 +617,7 @@ class OnChainAgent:
         )
         base_url = f"https://mempool.space/api/address/{addr}"
         try:
-            async with httpx.AsyncClient(timeout=10.0, headers=self.headers) as client:
+            async with new_async_client(timeout=10.0, headers=self.headers) as client:
                 resp = await client.get(base_url)
                 if resp.status_code != 200:
                     return
@@ -616,7 +627,7 @@ class OnChainAgent:
                 tx_count = stats.get("tx_count", 0)
                 bal_btc = (funded_sats - spent_sats) / 1e8
 
-                btc_id = f"wallet:btc:{addr}"
+                btc_id = resolve_wallet_node_id(self.graph, "btc", addr)
                 rcpt = EvidenceReceipt(
                     tool="mempool_space_utxo_forensics",
                     domain=DomainCategory.ONCHAIN,
@@ -659,7 +670,7 @@ class OnChainAgent:
                         if addr in in_addrs and len(set(in_addrs)) > 1 and len(set(in_addrs)) <= 8:
                             for co_addr in set(in_addrs):
                                 if co_addr and co_addr != addr:
-                                    co_id = f"wallet:btc:{co_addr}"
+                                    co_id = resolve_wallet_node_id(self.graph, "btc", co_addr)
                                     c_rcpt = EvidenceReceipt(
                                         tool="cioh_common_input_heuristic",
                                         domain=DomainCategory.ONCHAIN,
@@ -706,7 +717,7 @@ class OnChainAgent:
                                 ratio = larger.get("value", 0) / tot
                                 change_addr = larger.get("scriptpubkey_address")
                                 if ratio >= 0.80 and change_addr and change_addr != addr:
-                                    ch_id = f"wallet:btc:{change_addr}"
+                                    ch_id = resolve_wallet_node_id(self.graph, "btc", change_addr)
                                     p_rcpt = EvidenceReceipt(
                                         tool="bitcoin_peel_chain_detector",
                                         domain=DomainCategory.ONCHAIN,

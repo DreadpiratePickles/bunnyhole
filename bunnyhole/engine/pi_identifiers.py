@@ -149,7 +149,7 @@ def looks_like_person_email(email: str) -> bool:
 def is_free_mail_address(email: str) -> bool:
     """True when the address is at a consumer mailbox provider (gmail.com, outlook.com ...)."""
     match = _EMAIL_SHAPE_RE.match((email or "").strip())
-    return bool(match) and match.group(2).lower() in _FREE_MAIL_DOMAINS
+    return match is not None and match.group(2).lower() in _FREE_MAIL_DOMAINS
 
 
 _ANCHOR_KEYS = ("usernames", "emails", "phones", "wallets", "domains")

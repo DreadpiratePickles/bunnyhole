@@ -1,0 +1,12 @@
+# Secret-scan config for gitleaks (used by the CI `secrets` job and by a local `gitleaks git .`).
+# Starts from gitleaks' default rules; the only allowlisted paths hold deliberately FAKE sentinel values:
+# test fixtures that prove secrets are redacted, and the placeholder template.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake sentinel secrets in tests and the .env.example placeholder template"
+paths = [
+    '''^tests/''',
+    '''^\.env\.example$''',
+]
