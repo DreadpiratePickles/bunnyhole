@@ -8,7 +8,7 @@ is relayed into the UI as thread-safe messages so the log and stats update in re
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.text import Text
 from textual import on, work
@@ -29,6 +29,7 @@ from textual.widgets import (
     TabPane,
 )
 
+from bunnyhole.engine.intake import CaseIntakePacket, InterpretedCommand, interpret_command
 from bunnyhole.engine.models import GearMode
 from bunnyhole.engine.orchestrator import BunnyholeOrchestrator, classify_seed_type
 
@@ -121,8 +122,19 @@ class BunnyholeTUI(App):
         yield Static(self._stats_text(), id="statsbar")
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
-                yield Label("SEED")
-                yield Input(value=self._initial_seed, placeholder="domain / wallet / @handle / company", id="seed")
+                yield Label("ASK  (plain language)")
+                yield Input(
+                    value=self._initial_seed,
+                    placeholder="e.g. dig deep into acme.io, same operator as its token?",
+                    id="seed",
+                )
+                yield Static(
+                    "Type a seed or a whole question — I parse the selectors and read "
+                    '"go deep" / "quick" / "3 hops" / "wide net" / "same person" myself.',
+                    classes="hint",
+                )
+                yield Static("", id="understood", classes="hint")
+                yield Label("GEAR / DEPTH  (override — language wins if stated)")
                 yield Select(
                     [("FAST gear", "fast"), ("DEEP gear", "deep")],
                     value="fast",
@@ -140,7 +152,7 @@ class BunnyholeTUI(App):
                 for preset in PRESETS:
                     yield Button(preset, classes="preset")
                 yield Label("KEYS")
-                yield Static("enter run · tab panes\n/ seed · d dossier\np pivot · q quit", classes="hint")
+                yield Static("enter run · tab panes\n/ ask · d dossier\np pivot · q quit", classes="hint")
             with Vertical(id="center"):
                 table: DataTable = DataTable(id="entities", cursor_type="row", zebra_stripes=True)
                 table.add_columns("Entity", "Type", "Domain", "Smoke", "Flags")
@@ -208,33 +220,71 @@ class BunnyholeTUI(App):
             self.query_one("#nodedetail", Static).update(self._format_node(node))
 
     # ---- the investigation worker -------------------------------------------------------------
+    def _resolve_run(self, text: str) -> Optional[Tuple[CaseIntakePacket, GearMode, int, int]]:
+        """Interpret plain-language ``text``, reflect it in the UI, and return the resolved run.
+
+        Returns ``None`` (and explains why, in the log + a toast) when nothing actionable was found.
+        The gear/depth dropdowns act as overrides *only* when the language didn't state them, so a
+        bare seed still honors the dropdowns while "go deep" / "3 hops" always win.
+        """
+        log = self.query_one("#log", RichLog)
+        cmd: InterpretedCommand = interpret_command(text)
+        self.query_one("#understood", Static).update(cmd.understanding)
+        if not cmd.is_actionable:
+            log.write(f"[yellow]… {cmd.understanding}[/yellow]")
+            self.notify(cmd.understanding, severity="warning", title="Nothing to investigate")
+            return None
+
+        gear = cmd.packet.gear if cmd.gear_from_language else GearMode(self.query_one("#gear", Select).value)
+        depth = cmd.packet.depth if cmd.depth_from_language else int(self.query_one("#depth", Select).value)
+        breadth = cmd.packet.breadth
+        # reflect the resolved profile back into the controls + packet
+        self.query_one("#gear", Select).value = gear.value
+        self.query_one("#depth", Select).value = depth
+        cmd.packet.gear, cmd.packet.depth, cmd.packet.breadth = gear, depth, breadth
+
+        log.write(f"[bold cyan]▶[/bold cyan] {cmd.understanding}")
+        for note in cmd.notes:
+            log.write(f"   [dim]· {note}[/dim]")
+        return cmd.packet, gear, depth, breadth
+
     def _start_run(self) -> None:
         if self._running:
             self.notify("An investigation is already running.", severity="warning")
             return
-        seed = self.query_one("#seed", Input).value.strip()
-        if not seed:
-            self.notify("Enter a seed first.", severity="error")
+        text = self.query_one("#seed", Input).value.strip()
+        if not text:
+            self.notify("Type something to investigate first.", severity="error")
             self.query_one("#seed", Input).focus()
             return
-        gear = GearMode(self.query_one("#gear", Select).value)
-        depth = int(self.query_one("#depth", Select).value)
+        resolved = self._resolve_run(text)
+        if resolved is None:
+            self.query_one("#seed", Input).focus()
+            return
+        packet, gear, depth, breadth = resolved
         self._running = True
-        log = self.query_one("#log", RichLog)
-        log.write(f"[bold cyan]▶ Launching[/bold cyan] seed=[bold]{seed}[/bold] gear={gear.value} depth={depth}")
         self.query_one("#statsbar", Static).update(self._stats_text(status="running"))
-        self._run_worker(seed, gear, depth)
+        self._run_worker(packet, gear, depth, breadth)
 
     @work(exclusive=True)
-    async def _run_worker(self, seed: str, gear: GearMode, depth: int) -> None:
+    async def _run_worker(self, packet: CaseIntakePacket, gear: GearMode, depth: int, breadth: int) -> None:
         def callback(evt: Dict[str, Any]) -> None:
             self.post_message(EngineEvent(evt))
 
         try:
             orch = BunnyholeOrchestrator(
-                seed_query=seed, gear=gear, max_depth=depth, initial_breadth=4, event_callback=callback
+                seed_query=packet.summary_seed_label(),
+                gear=gear,
+                max_depth=depth,
+                initial_breadth=breadth,
+                event_callback=callback,
+                intake_packet=packet,
             )
-            result = await orch.run_investigation()
+            result = await orch.run_intake_investigation(packet)
+            try:
+                result["markdown_dossier"] = orch.graph.export_markdown_dossier()
+            except Exception:
+                pass
             self.post_message(RunFinished(result, orch))
         except Exception as exc:  # surface failure in the UI rather than crashing the app
             self.post_message(RunFailed(f"{type(exc).__name__}: {exc}"))

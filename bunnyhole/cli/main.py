@@ -18,10 +18,14 @@ from rich.table import Table
 from bunnyhole.agents.accountant import AccountantAgent, n_number_to_icao_hex
 from bunnyhole.agents.journalist import JournalistAgent
 from bunnyhole.agents.osint import OSINTAgent
+from bunnyhole.cli import pi_commands
+from bunnyhole.cli.pi_commands import SubjectType
 from bunnyhole.engine.graph import InvestigationGraph
 from bunnyhole.engine.intake import AnchorMode, CaseIntakePacket, SmartIntakeParser
 from bunnyhole.engine.models import GearMode
 from bunnyhole.engine.orchestrator import BunnyholeOrchestrator
+from bunnyhole.engine.pi import CaseType
+from bunnyhole.engine.pi_credentials import REDACTED_CREDENTIAL, strip_packet_credentials
 
 app = typer.Typer(
     name="bunnyhole",
@@ -29,6 +33,7 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+app.add_typer(pi_commands.pi_app, name="pi")
 
 
 @app.callback()
@@ -231,7 +236,9 @@ def council_command(
 
 @app.command("intake")
 def intake_command(
+    ctx: typer.Context,
     dump: Optional[str] = typer.Option(None, "--dump", help="Paste raw clipboard dump / free-text notes to auto-extract hypothesis & selectors"),
+    persona: Optional[str] = typer.Option(None, "--persona", help="Run through an investigator persona lens for this case (see `bunnyhole personas`)."),
     hypothesis: Optional[str] = typer.Option(None, "--hypothesis", "-H", help="Working hypothesis or investigative question"),
     username: Optional[List[str]] = typer.Option(None, "--username", "-u", help="Known @username / handle (can pass multiple)"),
     email: Optional[List[str]] = typer.Option(None, "--email", "-e", help="Known email address (can pass multiple)"),
@@ -252,12 +259,36 @@ def intake_command(
     breadth: int = typer.Option(4, "--breadth", "-b", help="Parallel search breadth per depth level"),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Export full Markdown Dossier to file path"),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Export full Universal Graph JSON to file path"),
+    pi: bool = typer.Option(False, "--pi", help="Private-investigator engagement: vets --purpose, uses the PI persona, adds a PI block (labels, coverage, custodians)."),
+    case_type: Optional[CaseType] = typer.Option(None, "--case-type", help="PI case type (default due_diligence): locate, background, asset_search, due_diligence, fraud_screen, missing_person. Needs --pi."),
+    purpose: Optional[str] = typer.Option(None, "--purpose", help="PI: the client's written purpose / the decision this serves (required with --pi). Employment, tenancy, credit and insurance decisions are refused."),
+    purpose_category: Optional[str] = typer.Option(None, "--purpose-category", help=pi_commands.PURPOSE_CATEGORY_HELP),
+    client: Optional[str] = typer.Option(None, "--client", help="PI: client name for the engagement record. Needs --pi."),
+    matter_ref: Optional[str] = typer.Option(None, "--matter-ref", help="PI: case no., contract or judgment reference. REQUIRED for every person subject (any category); optional for an entity, but checked if given. Format check only. Needs --pi."),
+    subject_type: Optional[SubjectType] = typer.Option(None, "--subject-type", help="PI: person or entity (default person). Needs --pi."),
+    pi_jurisdiction: Optional[str] = typer.Option(None, "--pi-jurisdiction", help="PI: jurisdiction for custodians and legal notes, e.g. us, ca-on, uk. Needs --pi."),
+    pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
+    confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
 ) -> None:
     """Run a Dual-Mode Case Intake investigation combining a Working Hypothesis with multiple known credentials/selectors."""
     def _on_event(evt: dict) -> None:
         if evt.get("type") == "agent_log":
             d = evt["data"]
             console.print(f"[dim][{d['agent'].upper()}][/dim] [bold]{_rich_escape(str(d['action']))}[/bold] ({_rich_escape(str(d['target']))}): {_rich_escape(str(d['detail']))}")
+
+    engagement, persona = pi_commands.resolve_pi_flags(
+        pi=pi, case_type=case_type, purpose=purpose, client=client, matter_ref=matter_ref,
+        subject_type=subject_type, pi_jurisdiction=pi_jurisdiction, pi_report=pi_report, persona=persona,
+        cred=cred, confirm_entity=confirm_entity, seed=((org or [None])[0] or dump),
+        orgs=list(org or []), emails=list(email or []), domains=list(domain or []),
+        purpose_category=purpose_category,
+        extra_texts=[
+            hypothesis or "", dump or "", *(username or []), *(phone or []), *(wallet or []),
+            *(exclude or []), *(doc or []),
+        ],
+    )
+    report_builder = pi_commands.load_report_builder(pi_report)
+    prof, gear, depth, breadth, exclusions = _personalize(ctx, gear, depth, breadth, list(exclude or []), persona)
 
     packet = CaseIntakePacket(
         hypothesis=hypothesis or "",
@@ -270,12 +301,18 @@ def intake_command(
         domains=list(domain or []),
         organizations=list(org or []),
         evidence_files=list(doc or []),
-        exclusions=list(exclude or []),
+        exclusions=exclusions,
         raw_omni_text=dump or "",
         gear=gear,
         depth=depth,
         breadth=breadth,
     )
+    if engagement is not None:
+        # PI mode: scrub credential shapes BEFORE the parser derives selectors from the raw text (a URL with userinfo
+        # would otherwise yield an "email" such as SECRET@acme.com); a marker keeps the dropped count visible.
+        packet, dropped_credentials, _ = strip_packet_credentials(packet)
+        if dropped_credentials:
+            packet = packet.model_copy(update={"credentials": [REDACTED_CREDENTIAL]})
     normalized = SmartIntakeParser.normalize_packet(packet)
     orch = BunnyholeOrchestrator(
         seed_query=normalized.summary_seed_label(),
@@ -284,9 +321,14 @@ def intake_command(
         initial_breadth=breadth,
         event_callback=_on_event,
         intake_packet=normalized,
+        profile=prof,
+        **({"engagement": engagement} if engagement is not None else {}),
     )
     result = asyncio.run(orch.run_intake_investigation(normalized))
     _render_investigation_results(result)
+    if engagement is not None:
+        pi_commands.render_pi_summary(result)
+        pi_commands.write_pi_report(report_builder, result, pi_report)
 
     if out:
         md = orch.graph.export_markdown_dossier()
@@ -299,7 +341,9 @@ def intake_command(
 
 @app.command("trace")
 def trace_command(
+    ctx: typer.Context,
     seed: str = typer.Argument(..., help="Any seed trace: company, domain, EVM/BTC wallet, ENS (.eth), @handle, email, or tail number"),
+    persona: Optional[str] = typer.Option(None, "--persona", help="Run through an investigator persona lens for this case (see `bunnyhole personas`)."),
     gear: GearMode = typer.Option(GearMode.FAST, "--gear", "-g", help="Execution profile: fast (Gear 1) or deep (Gear 2)"),
     depth: int = typer.Option(2, "--depth", "-d", help="Recursive rabbit-hole depth (1-4)"),
     breadth: int = typer.Option(4, "--breadth", "-b", help="Parallel search breadth per depth level (2-8)"),
@@ -315,12 +359,24 @@ def trace_command(
     anchor_mode: AnchorMode = typer.Option(AnchorMode.CONVERGENCE, "--anchor-mode", help="convergence or locked_profile"),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Export full Markdown Dossier to file path"),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Export full Universal Graph JSON to file path"),
+    pi: bool = typer.Option(False, "--pi", help="Private-investigator engagement: vets --purpose, uses the PI persona, adds a PI block (labels, coverage, custodians)."),
+    case_type: Optional[CaseType] = typer.Option(None, "--case-type", help="PI case type (default due_diligence): locate, background, asset_search, due_diligence, fraud_screen, missing_person. Needs --pi."),
+    purpose: Optional[str] = typer.Option(None, "--purpose", help="PI: the client's written purpose / the decision this serves (required with --pi). Employment, tenancy, credit and insurance decisions are refused."),
+    purpose_category: Optional[str] = typer.Option(None, "--purpose-category", help=pi_commands.PURPOSE_CATEGORY_HELP),
+    client: Optional[str] = typer.Option(None, "--client", help="PI: client name for the engagement record. Needs --pi."),
+    matter_ref: Optional[str] = typer.Option(None, "--matter-ref", help="PI: case no., contract or judgment reference. REQUIRED for every person subject (any category); optional for an entity, but checked if given. Format check only. Needs --pi."),
+    subject_type: Optional[SubjectType] = typer.Option(None, "--subject-type", help="PI: person or entity (default person). Needs --pi."),
+    pi_jurisdiction: Optional[str] = typer.Option(None, "--pi-jurisdiction", help="PI: jurisdiction for custodians and legal notes, e.g. us, ca-on, uk. Needs --pi."),
+    pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
+    confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
 ) -> None:
     """Run an autonomous multi-domain Bunnyhole investigation down the rabbit hole."""
     has_extra_intake = any([hypothesis, username, email, phone, cred, wallet, domain, doc, exclude])
     if has_extra_intake:
         intake_command(
+            ctx=ctx,
             dump=seed,
+            persona=persona,
             hypothesis=hypothesis,
             username=username,
             email=email,
@@ -337,6 +393,16 @@ def trace_command(
             breadth=breadth,
             out=out,
             json_out=json_out,
+            pi=pi,
+            case_type=case_type,
+            purpose=purpose,
+            purpose_category=purpose_category,
+            client=client,
+            matter_ref=matter_ref,
+            subject_type=subject_type,
+            pi_jurisdiction=pi_jurisdiction,
+            pi_report=pi_report,
+            confirm_entity=confirm_entity,
         )
         return
 
@@ -345,15 +411,27 @@ def trace_command(
             d = evt["data"]
             console.print(f"[dim][{d['agent'].upper()}][/dim] [bold]{_rich_escape(str(d['action']))}[/bold] ({_rich_escape(str(d['target']))}): {_rich_escape(str(d['detail']))}")
 
+    engagement, persona = pi_commands.resolve_pi_flags(
+        pi=pi, case_type=case_type, purpose=purpose, client=client, matter_ref=matter_ref,
+        subject_type=subject_type, pi_jurisdiction=pi_jurisdiction, pi_report=pi_report, persona=persona,
+        cred=cred, confirm_entity=confirm_entity, seed=seed, purpose_category=purpose_category,
+    )
+    report_builder = pi_commands.load_report_builder(pi_report)
+    prof, gear, depth, breadth, _exclusions = _personalize(ctx, gear, depth, breadth, list(exclude or []), persona)
     orch = BunnyholeOrchestrator(
         seed_query=seed,
         gear=gear,
         max_depth=depth,
         initial_breadth=breadth,
         event_callback=_on_event,
+        profile=prof,
+        **({"engagement": engagement} if engagement is not None else {}),
     )
     result = asyncio.run(orch.run_investigation())
     _render_investigation_results(result)
+    if engagement is not None:
+        pi_commands.render_pi_summary(result)
+        pi_commands.write_pi_report(report_builder, result, pi_report)
 
     if out:
         md = orch.graph.export_markdown_dossier()
@@ -546,6 +624,152 @@ def doctor_command(
     console.print(t_table)
 
 
+def _personalize(
+    ctx: typer.Context,
+    gear: GearMode,
+    depth: int,
+    breadth: int,
+    exclusions: List[str],
+    persona: Optional[str],
+):
+    """Resolve the investigator profile + run parameters for a CLI run.
+
+    The saved profile (or a one-off ``--persona`` override) supplies the persona lens that the
+    orchestrator uses for watchlist/framing/sanctions emphasis. Persona run-param *defaults* fill in
+    only the gear/depth/breadth flags the user did not pass on the command line; explicit flags win.
+    Standing profile exclusions are folded into the case's negative scope.
+    """
+    from bunnyhole.engine.personas import coerce_persona
+    from bunnyhole.engine.profile import load_profile, resolve_run_params
+
+    prof = load_profile()
+    if persona:
+        prof.persona = coerce_persona(persona)
+
+    def _explicit(name: str) -> bool:
+        try:
+            return ctx.get_parameter_source(name).name == "COMMANDLINE"  # type: ignore[union-attr]
+        except Exception:
+            return True  # when we can't tell, treat the passed value as intentional
+
+    g = gear if _explicit("gear") else None
+    d = depth if _explicit("depth") else None
+    b = breadth if _explicit("breadth") else None
+    rg, rd, rb = resolve_run_params(prof, gear=g, depth=d, breadth=b)
+
+    merged_exclusions = list(dict.fromkeys([*(exclusions or []), *prof.default_exclusions]))
+    return prof, rg, rd, rb, merged_exclusions
+
+
+@app.command("personas")
+def personas_command() -> None:
+    """List the investigator personas (lenses that tune gear/depth/breadth, sources & framing)."""
+    from bunnyhole.engine.personas import list_personas
+    from bunnyhole.engine.profile import load_profile
+
+    active = load_profile().persona
+    table = Table(title="🎭 Investigator Personas", show_lines=False)
+    table.add_column("", justify="center")
+    table.add_column("Key", style="bold cyan")
+    table.add_column("Persona", style="bold white")
+    table.add_column("Defaults", style="magenta")
+    table.add_column("Sanctions", justify="center")
+    table.add_column("Lens", style="dim")
+    for p in list_personas():
+        mark = "[bold green]●[/bold green]" if p.key == active else " "
+        table.add_row(
+            mark,
+            p.key.value,
+            p.display_name,
+            f"{p.default_gear.value}/d{p.default_depth}/b{p.default_breadth}",
+            "✔" if p.emphasize_sanctions else "—",
+            p.description,
+        )
+    console.print(table)
+    console.print("[dim]Set yours with:[/dim] [bold]bunnyhole profile --persona <key>[/bold]")
+
+
+@app.command("profile")
+def profile_command(
+    persona: Optional[str] = typer.Option(None, "--persona", help="Set the active investigator persona (see `bunnyhole personas`)."),
+    name: Optional[str] = typer.Option(None, "--name", help="Set your display name (attribution on dossiers)."),
+    add_watch: Optional[List[str]] = typer.Option(None, "--watch", help="Add a recurring selector to your watchlist (repeatable)."),
+    remove_watch: Optional[List[str]] = typer.Option(None, "--unwatch", help="Remove a selector from your watchlist (repeatable)."),
+    clear_watch: bool = typer.Option(False, "--clear-watch", help="Empty the watchlist."),
+    jurisdiction: Optional[List[str]] = typer.Option(None, "--jurisdiction", help="Set standing jurisdictions of interest (replaces; repeatable)."),
+    exclude: Optional[List[str]] = typer.Option(None, "--exclude", "-x", help="Set standing default exclusions folded into every case (replaces; repeatable)."),
+    gear: Optional[GearMode] = typer.Option(None, "--gear", "-g", help="Override the persona's default gear."),
+    depth: Optional[int] = typer.Option(None, "--depth", "-d", help="Override the persona's default depth (1-4)."),
+    breadth: Optional[int] = typer.Option(None, "--breadth", "-b", help="Override the persona's default breadth (2-8)."),
+    note: Optional[str] = typer.Option(None, "--note", help="Set a free-text note on your profile."),
+) -> None:
+    """View or edit your remembered investigator context (persona, watchlist, jurisdictions, defaults)."""
+    from bunnyhole.engine.personas import coerce_persona, get_persona
+    from bunnyhole.engine.profile import PROFILE_PATH, load_profile, save_profile
+    from bunnyhole.engine.profile import add_watch as _add
+    from bunnyhole.engine.profile import remove_watch as _rm
+
+    prof = load_profile()
+    mutated = False
+    if persona is not None:
+        prof.persona = coerce_persona(persona)
+        mutated = True
+    if name is not None:
+        prof.display_name = name
+        mutated = True
+    if clear_watch:
+        prof.watchlist = []
+        mutated = True
+    if add_watch:
+        _add(prof, list(add_watch))
+        mutated = True
+    if remove_watch:
+        _rm(prof, list(remove_watch))
+        mutated = True
+    if jurisdiction is not None:
+        prof.jurisdictions = [j.strip().upper() for j in jurisdiction if j.strip()]
+        mutated = True
+    if exclude is not None:
+        prof.default_exclusions = [e.strip() for e in exclude if e.strip()]
+        mutated = True
+    if gear is not None:
+        prof.gear_override = gear
+        mutated = True
+    if depth is not None:
+        prof.depth_override = depth
+        mutated = True
+    if breadth is not None:
+        prof.breadth_override = breadth
+        mutated = True
+    if note is not None:
+        prof.notes = note
+        mutated = True
+
+    if mutated:
+        save_profile(prof)
+        console.print(f"[bold green]✔ Saved profile to[/bold green] {PROFILE_PATH}")
+
+    pp = get_persona(prof.persona)
+    eg, ed, eb = prof.effective_run_params()
+    console.print(
+        Panel(
+            f"[bold cyan]Persona:[/bold cyan] {pp.display_name} ([bold]{prof.persona.value}[/bold])  |  "
+            f"[bold magenta]Name:[/bold magenta] {prof.display_name or '—'}\n"
+            f"[bold yellow]Effective run defaults:[/bold yellow] gear={eg.value}, depth={ed}, breadth={eb}  "
+            f"[dim](sanctions emphasis: {'on' if pp.emphasize_sanctions else 'off'})[/dim]\n"
+            f"[bold green]Watchlist:[/bold green] {', '.join(prof.watchlist) or '—'}\n"
+            f"[bold green]Jurisdictions:[/bold green] {', '.join(prof.jurisdictions) or '—'}  |  "
+            f"[bold green]Default exclusions:[/bold green] {', '.join(prof.default_exclusions) or '—'}\n"
+            f"[dim]Lens: {pp.analyst_framing}[/dim]"
+            + (f"\n[dim]Note: {prof.notes}[/dim]" if prof.notes else ""),
+            title="🧭 [bold white]YOUR BUNNYHOLE INVESTIGATOR PROFILE[/bold white]",
+            border_style="cyan",
+        )
+    )
+    if not mutated:
+        console.print("[dim]Edit with e.g.:[/dim] [bold]bunnyhole profile --persona compliance --watch acme.io[/bold]")
+
+
 @app.command("keys")
 def keys_command(
     set_key: Optional[str] = typer.Option(None, "--set", "-s", help="Set an API key in KEY=VALUE format (e.g. SHODAN_API_KEY=xxx)"),
@@ -639,7 +863,7 @@ def cases_command(
 
 @app.command("ui")
 def ui_command(seed: str = typer.Argument("", help="Optional seed to prefill the War-Room")) -> None:
-    """Launch the full-screen War-Room TUI (Textual). Also runs in a browser via `textual serve \"bunnyhole ui\"`."""
+    """Launch the full-screen War-Room TUI (Textual)."""
     from bunnyhole.tui.app import launch
 
     launch(seed=seed or None)
@@ -652,7 +876,7 @@ def tui_command(seed: str = typer.Argument("", help="Optional seed to prefill th
 
 
 @app.command("menu")
-def menu_command() -> None:
+def menu_command(ctx: typer.Context) -> None:
     """Classic prompt-driven terminal command center (Traces, Link Sleuth, Arsenal, Keys, Cases)."""
     from rich.prompt import Prompt
 
@@ -686,10 +910,12 @@ def menu_command() -> None:
             # Pass EVERY parameter explicitly: omitted Typer options would stay as truthy OptionInfo
             # objects and wrongly trigger the multi-selector intake path (TypeError on list(OptionInfo)).
             trace_command(
-                seed=seed, gear=GearMode(gear_str), depth=depth, breadth=4,
+                ctx=ctx, seed=seed, persona=None, gear=GearMode(gear_str), depth=depth, breadth=4,
                 hypothesis=None, username=None, email=None, phone=None, cred=None,
                 wallet=None, domain=None, doc=None, exclude=None,
                 anchor_mode=AnchorMode.CONVERGENCE, out=None, json_out=None,
+                pi=False, case_type=None, purpose=None, purpose_category=None, client=None, matter_ref=None,
+                subject_type=None, pi_jurisdiction=None, pi_report=None, confirm_entity=False,
             )
         elif choice == "2":
             ea = Prompt.ask("Enter Entity A", default="vitalik.eth")
@@ -718,6 +944,46 @@ def menu_command() -> None:
                 cases_command(search=q.strip(), load=None)
         elif choice == "7":
             serve_command(host="127.0.0.1", port=8000)
+
+
+@app.command("mcp")
+def mcp_command(
+    print_config: bool = typer.Option(
+        False,
+        "--print-config",
+        "-c",
+        help="Print an mcpServers config snippet for registering THIS instance with an MCP client (Claude Desktop, IDE copilots), then exit.",
+    ),
+    no_uv: bool = typer.Option(
+        False,
+        "--no-uv",
+        help="With --print-config, emit a plain `bunnyhole mcp` invocation instead of `uv run` (requires the bunnyhole entrypoint on PATH).",
+    ),
+) -> None:
+    """Run this Bunnyhole instance as a Model-Context-Protocol (MCP) server over stdio.
+
+    Exposes the investigation engine (trace / intake / link / jet / darkweb / interpret / cases /
+    arsenal) to any MCP client. Use --print-config to get the JSON snippet to paste into your
+    client, then run `bunnyhole mcp` as that client's configured command.
+    """
+    from bunnyhole.mcp.server import client_config, run_stdio
+
+    if print_config:
+        cfg = client_config(use_uv=not no_uv)
+        console.print_json(json.dumps(cfg))
+        console.print(
+            "\n[dim]Add this to your MCP client (e.g. Claude Desktop's claude_desktop_config.json), "
+            "then restart the client. See docs/MCP_SERVER.md.[/dim]"
+        )
+        return
+
+    # stdio transport talks MCP on stdin/stdout; keep the banner on stderr so it never corrupts the
+    # protocol stream.
+    Console(stderr=True).print(
+        "[bold bright_magenta]🐇🕳️ Bunnyhole MCP server[/bold bright_magenta] "
+        "[dim]running on stdio — connect an MCP client; Ctrl-C to stop.[/dim]"
+    )
+    run_stdio()
 
 
 @app.command("serve")

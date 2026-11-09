@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import List
+from typing import List, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
@@ -293,6 +293,12 @@ class SmartIntakeParser:
             exclusions=_dedup_list(exclusions),
         )
 
+    # -- natural-language command interpretation -------------------------------------------------
+    @classmethod
+    def interpret(cls, text: str) -> "InterpretedCommand":
+        """See module-level :func:`interpret_command`."""
+        return interpret_command(text)
+
     @classmethod
     def normalize_packet(cls, packet: CaseIntakePacket) -> CaseIntakePacket:
         """Merge raw_omni_input / raw_omni_text (if any) with explicit structured fields and normalize lists."""
@@ -350,3 +356,278 @@ class SmartIntakeParser:
         if not norm.title:
             norm.title = norm.summary_seed_label()
         return norm
+
+
+# =================================================================================================
+# Natural-language command interpretation
+# -------------------------------------------------------------------------------------------------
+# Lets a user type a plain-English instruction ("take a quick look at acme.io", "dig 3 levels into
+# example.com, same operator?") instead of flags. We reuse SmartIntakeParser for selector/hypothesis
+# extraction and add a thin layer that infers run parameters (gear / depth / breadth / anchor mode)
+# from the language, then scrubs the leftover command words so they don't become bogus selectors.
+# =================================================================================================
+
+_NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4}
+
+_DEEP_CUE = re.compile(
+    r"\b(deep(?:er)?|deep[\s-]?dive|thorough(?:ly)?|exhaustive|in[\s-]?depth|heavy|dig\s+in|"
+    r"full\s+send|leave\s+no\s+stone|no\s+stone\s+unturned|everything\s+you(?:'ve|\s+have)\s+got)\b",
+    re.IGNORECASE,
+)
+_FAST_CUE = re.compile(
+    r"\b(quick(?:ly)?|fast|rapid(?:ly)?|light(?:weight)?|brief(?:ly)?|glance|skim|triage|"
+    r"first\s+look|quick\s+scan|just\s+a\s+(?:quick\s+)?look)\b",
+    re.IGNORECASE,
+)
+_WIDE_CUE = re.compile(
+    r"\b(wider?|widen|broad(?:ly)?|broaden|wide\s+net|cast\s+a\s+wide\s+net|as\s+many\s+as\s+possible)\b",
+    re.IGNORECASE,
+)
+_NARROW_CUE = re.compile(r"\b(narrow(?:ly)?|focused|tight(?:ly)?|minimal|just\s+the\s+main)\b", re.IGNORECASE)
+
+_DEPTH_PATTERNS = [
+    re.compile(r"\bdepth\s*(?:of\s*)?(\d)\b", re.IGNORECASE),
+    re.compile(r"\b(\d)\s*hops?\b", re.IGNORECASE),
+    re.compile(r"\b(\d)\s*(?:levels?|layers?)\b", re.IGNORECASE),
+    re.compile(r"\bdig\s*(\d)\b", re.IGNORECASE),
+    re.compile(r"\bgo\s*(\d)\s*(?:deep|hops?|levels?|layers?)?\b", re.IGNORECASE),
+]
+_DEPTH_WORD = re.compile(r"\b(one|two|three|four)\s+(?:hops?|levels?|layers?|deep)\b", re.IGNORECASE)
+
+_BREADTH_PATTERNS = [
+    re.compile(r"\bbreadth\s*(?:of\s*)?(\d)\b", re.IGNORECASE),
+    re.compile(r"\b(\d)\s*(?:leads?|branches?)(?:\s*per(?:\s*hop)?)?\b", re.IGNORECASE),
+]
+
+_LOCKED_CUE = re.compile(
+    r"\b(same\s+(?:person|operator|entity|individual|guy|owner|actor)|one\s+and\s+the\s+same|"
+    r"all\s+the\s+same|confirmed\s+same|known\s+to\s+be\s+the\s+same|these\s+are\s+all|"
+    r"all\s+belong\s+to|belongs?\s+to\s+the\s+same|locked\s+profile|known\s+alias(?:es)?)\b",
+    re.IGNORECASE,
+)
+_QUESTION_START = re.compile(
+    r"^\s*(is|are|was|were|does|do|did|who|whose|whether|could|can|how|which|what|should|has|have)\b",
+    re.IGNORECASE,
+)
+
+# Words that are pure run-control / phrasing noise: an extracted "company/username" made only of
+# these (plus stopwords/numbers) is a parser artifact of the command phrasing, not a real selector.
+_CONTROL_WORDS = {
+    "go", "run", "dig", "dive", "deep", "deeper", "thorough", "thoroughly", "exhaustive", "indepth",
+    "heavy", "full", "send", "stone", "unturned", "leave", "everything", "quick", "quickly", "fast",
+    "rapid", "rapidly", "light", "lightweight", "brief", "briefly", "glance", "skim", "triage",
+    "scan", "look", "first", "wide", "wider", "widen", "broad", "broaden", "narrow", "focused",
+    "tight", "net", "cast", "minimal", "main", "many", "possible", "hops", "hop", "levels", "level",
+    "layers", "layer", "depth", "breadth", "leads", "branches", "branch", "per", "map", "footprint",
+    "take", "please", "check", "investigate", "trace", "find", "show", "me", "pull", "search",
+    "just", "one", "two", "three", "four",
+}
+_STOP_FOR_HYP = {
+    "a", "an", "the", "of", "on", "for", "into", "this", "that", "it", "please", "me", "my", "to",
+    "at", "in", "and", "with", "about", "as", "by", "from", "up", "out", "its",
+}
+
+
+class InterpretedCommand(BaseModel):
+    """Result of turning a plain-language instruction into a runnable investigation request."""
+
+    packet: CaseIntakePacket
+    understanding: str = ""  # one-line, human-readable "here's what I'll do"
+    notes: List[str] = Field(default_factory=list)  # inferences/assumptions worth surfacing
+    is_actionable: bool = False  # False when no selector or hypothesis could be extracted
+    # Whether each run parameter was driven by the language (vs. left at default). Lets a UI treat
+    # its gear/depth/breadth controls as overrides that apply only when the text didn't specify.
+    gear_from_language: bool = False
+    depth_from_language: bool = False
+    breadth_from_language: bool = False
+
+
+def _tokens(entry: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", entry.lower())
+
+
+def _is_pure_control(entry: str) -> bool:
+    toks = _tokens(entry)
+    if not toks:
+        return True
+    return all(t in _CONTROL_WORDS or t in _STOP_FOR_HYP or t.isdigit() for t in toks)
+
+
+def _clean_hypothesis(hyp: str, selector_values: Optional[set] = None) -> str:
+    """Trim leading/trailing command words and blank out hypotheses that are only phrasing + seeds.
+
+    ``selector_values`` are the already-extracted selectors; they're removed before judging whether
+    anything meaningful remains, so "take a quick look at acme.io" leaves no hypothesis while
+    "is acme.io the same operator as its token?" keeps one.
+    """
+    words = hyp.split()
+    drop = _CONTROL_WORDS | _STOP_FOR_HYP
+    while words and re.sub(r"[^a-z0-9]", "", words[0].lower()) in drop:
+        words.pop(0)
+    while words and re.sub(r"[^a-z0-9]", "", words[-1].lower()) in drop:
+        words.pop()
+    cleaned = " ".join(words).strip(" ,.;:?-")
+
+    probe = cleaned.lower()
+    for val in sorted(selector_values or set(), key=len, reverse=True):
+        if val:
+            probe = probe.replace(val.lower(), " ")
+    meaningful = [
+        w for w in re.findall(r"[a-zA-Z]{3,}", probe)
+        if w.lower() not in _CONTROL_WORDS and w.lower() not in _STOP_FOR_HYP
+    ]
+    return cleaned if len(meaningful) >= 2 else ""
+
+
+def interpret_command(text: str) -> InterpretedCommand:
+    """Turn a free-text instruction into an :class:`InterpretedCommand`.
+
+    Extracts selectors + hypothesis via :meth:`SmartIntakeParser.parse_omni_text`, then infers the
+    run profile (gear / depth / breadth / anchor mode) from natural-language cues like "go deep",
+    "quick look", "3 hops", "wide net", or "the same operator". Leftover command words are scrubbed
+    so phrases like "go deep" never leak in as a bogus company/username seed.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        packet = CaseIntakePacket()
+        return InterpretedCommand(
+            packet=packet,
+            understanding="Nothing entered — give me a domain, wallet, @handle, company, email, or a question.",
+            notes=[],
+            is_actionable=False,
+        )
+
+    packet = SmartIntakeParser.parse_omni_text(raw)
+    notes: List[str] = []
+
+    # -- infer depth ---------------------------------------------------------------------------
+    explicit_depth: Optional[int] = None
+    for pat in _DEPTH_PATTERNS:
+        m = pat.search(raw)
+        if m:
+            explicit_depth = int(m.group(1))
+            break
+    if explicit_depth is None:
+        m = _DEPTH_WORD.search(raw)
+        if m:
+            explicit_depth = _NUM_WORDS[m.group(1).lower()]
+    if explicit_depth is not None:
+        explicit_depth = max(1, min(4, explicit_depth))
+
+    deep = bool(_DEEP_CUE.search(raw))
+    fast = bool(_FAST_CUE.search(raw))
+
+    if explicit_depth is not None:
+        depth = explicit_depth
+    elif deep and not fast:
+        depth = 3
+        notes.append("“deep” with no explicit number → depth 3")
+    elif fast and not deep:
+        depth = 1
+        notes.append("“quick/fast” → shallow depth 1")
+    else:
+        depth = 2
+
+    # -- infer gear ----------------------------------------------------------------------------
+    if deep and fast:
+        gear = GearMode.DEEP
+        notes.append("conflicting speed cues — defaulted to deep gear")
+    elif deep:
+        gear = GearMode.DEEP
+    elif fast:
+        gear = GearMode.FAST
+    elif depth >= 3:
+        gear = GearMode.DEEP
+        notes.append(f"depth {depth} → deep gear")
+    else:
+        gear = GearMode.FAST
+
+    # -- infer breadth -------------------------------------------------------------------------
+    explicit_breadth: Optional[int] = None
+    for pat in _BREADTH_PATTERNS:
+        m = pat.search(raw)
+        if m:
+            explicit_breadth = int(m.group(1))
+            break
+    if explicit_breadth is not None:
+        breadth = max(2, min(8, explicit_breadth))
+    elif _WIDE_CUE.search(raw):
+        breadth = 6
+        notes.append("“wide net” → breadth 6")
+    elif _NARROW_CUE.search(raw):
+        breadth = 2
+        notes.append("“narrow/focused” → breadth 2")
+    else:
+        breadth = 4
+
+    # -- infer anchor mode ---------------------------------------------------------------------
+    is_question = ("?" in raw) or bool(_QUESTION_START.match(raw))
+    if _LOCKED_CUE.search(raw) and not is_question:
+        anchor = AnchorMode.LOCKED_PROFILE
+        notes.append("asserted same entity → locked-profile mode (link all selectors to one target)")
+    else:
+        anchor = AnchorMode.CONVERGENCE
+        if _LOCKED_CUE.search(raw) and is_question:
+            notes.append("phrased as a question → convergence mode (prove IF/HOW the clues connect)")
+
+    # -- scrub command-only selectors & hypothesis ---------------------------------------------
+    packet.orgs_or_names = [o for o in packet.orgs_or_names if not _is_pure_control(o)]
+    packet.organizations = [o for o in packet.organizations if not _is_pure_control(o)]
+    packet.usernames = [u for u in packet.usernames if not _is_pure_control(u.lstrip("@"))]
+    if packet.hypothesis:
+        selector_values = {
+            v.lower()
+            for v in (
+                packet.domains_or_ips
+                + packet.wallets
+                + packet.emails
+                + packet.phones
+                + packet.aircraft_tails
+                + packet.orgs_or_names
+                + [u.lstrip("@") for u in packet.usernames]
+            )
+        }
+        packet.hypothesis = _clean_hypothesis(packet.hypothesis, selector_values)
+
+    packet.gear = gear
+    packet.depth = depth
+    packet.breadth = breadth
+    packet.anchor_mode = anchor
+    if not packet.title:
+        packet.title = packet.summary_seed_label()
+
+    is_actionable = packet.total_selectors() > 0 or bool(packet.hypothesis.strip())
+
+    # -- build the human-readable "understanding" line -----------------------------------------
+    seeds = packet.all_seed_tuples()
+    if is_actionable:
+        if seeds:
+            shown = "; ".join(f"{lt}:{val}" for lt, val in seeds[:6])
+            if len(seeds) > 6:
+                shown += f"; +{len(seeds) - 6} more"
+            lead = f"Investigate {len(seeds)} selector(s) — {shown}"
+        else:
+            lead = "Investigate the stated question"
+        understanding = (
+            f"{lead}  ·  gear={gear.value} depth={depth} breadth={breadth} mode={anchor.value}"
+        )
+        if packet.hypothesis.strip():
+            understanding += f'  ·  hypothesis: "{packet.hypothesis.strip()}"'
+        if packet.exclusions:
+            understanding += f"  ·  excluding: {', '.join(packet.exclusions)}"
+    else:
+        understanding = (
+            "I couldn't find anything to investigate in that — give me a domain, wallet, @handle, "
+            "company, email, aircraft tail (N-number), a local .pdf/.docx, or a question to chase."
+        )
+        notes.append("no selector or hypothesis detected")
+
+    return InterpretedCommand(
+        packet=packet,
+        understanding=understanding,
+        notes=notes,
+        is_actionable=is_actionable,
+        gear_from_language=bool(deep or fast or explicit_depth is not None),
+        depth_from_language=bool(explicit_depth is not None or deep or fast),
+        breadth_from_language=bool(explicit_breadth is not None or _WIDE_CUE.search(raw) or _NARROW_CUE.search(raw)),
+    )

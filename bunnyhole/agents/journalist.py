@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import xml.etree.ElementTree as ET
 import zipfile
@@ -303,9 +304,25 @@ class JournalistAgent:
             f"Searching Federal Court Dockets (RECAP) for '{entity_name}'",
         )
         url = f"https://www.courtlistener.com/api/rest/v4/search/?q={quote_plus(entity_name)}&type=r"
+        # CourtListener answers HTTP 401 without a (free) account token; send one when the user has set it.
+        token = os.environ.get("COURTLISTENER_API_TOKEN", "").strip()
+        headers = {**self.headers, "Authorization": f"Token {token}"} if token else self.headers
         try:
-            async with httpx.AsyncClient(timeout=12.0, headers=self.headers) as client:
+            async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
                 resp = await client.get(url)
+                if resp.status_code in (401, 403):
+                    self.graph.log(
+                        DomainCategory.JOURNALISM,
+                        "COURTLISTENER_SKIP",
+                        entity_name,
+                        (
+                            f"CourtListener {'rejected the API token' if token else 'requires a token'} "
+                            f"(HTTP {resp.status_code}); court dockets not searched. Set COURTLISTENER_API_TOKEN "
+                            "(free account token: https://www.courtlistener.com/help/api/rest/)."
+                        ),
+                        level="warning",
+                    )
+                    return
                 if resp.status_code != 200:
                     return
                 data = resp.json()

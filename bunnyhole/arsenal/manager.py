@@ -46,6 +46,8 @@ API_KEYS_REGISTRY: List[Dict[str, str]] = [
     # Corporate, Fiat & On-Chain
     {"key": "FEC_API_KEY", "category": "Corporate & Fiat", "url": "https://api.open.fec.gov/developers/", "note": "Free instant key (DEMO_KEY used by default)"},
     {"key": "OPENCORPORATES_API_KEY", "category": "Corporate & Fiat", "url": "https://opencorporates.com/", "note": "Global company registry search"},
+    {"key": "OPENSANCTIONS_API_KEY", "category": "Corporate & Fiat", "url": "https://www.opensanctions.org/api/", "note": "Sanctions/PEP screening — keyless via self-hosted yente (OPENSANCTIONS_API_URL); hosted free tier needs a key"},
+    {"key": "COURTLISTENER_API_TOKEN", "category": "Corporate & Fiat", "url": "https://www.courtlistener.com/help/api/rest/", "note": "Free account token; unauthenticated API returns 401"},
     {"key": "UK_COMPANIES_HOUSE_API_KEY", "category": "Corporate & Fiat", "url": "https://developer.company-information.service.gov.uk/", "note": "Free UK PSC beneficial owner lookup"},
     {"key": "ETHERSCAN_API_KEY", "category": "On-Chain Crypto", "url": "https://etherscan.io/apis", "note": "Free 5 calls/sec (Blockscout v2 works keyless)"},
     {"key": "HELIUS_API_KEY", "category": "On-Chain Crypto", "url": "https://www.helius.dev/", "note": "Free Solana deep RPC & Jito bundle history"},

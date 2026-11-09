@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -21,6 +22,7 @@ from bunnyhole.engine.models import (
     SelectorStrength,
     TimelineItem,
 )
+from bunnyhole.engine.netutil import new_async_client
 
 # High-secrecy offshore jurisdictions flagged in Exhibit 21 & GLEIF hierarchies
 OFFSHORE_HAVEN_CODES = {
@@ -250,6 +252,100 @@ class AccountantAgent:
             "flags": flags,
         }
 
+    async def _gleif_complete_record(self, client: httpx.AsyncClient, rec: Dict[str, Any], company_name: str) -> Dict[str, Any]:
+        """Return the full LEI record when a search hit omits the entity status or the registration block.
+
+        GLEIF search hits normally carry both; one extra request is made only for a sparse hit. Any failure is a
+        logged skip and the hit is used as it came.
+        """
+        attrs = rec.get("attributes") or {}
+        lei = str(rec.get("id") or "")
+        if not lei or ((attrs.get("entity") or {}).get("status") and attrs.get("registration")):
+            return rec
+        try:
+            resp = await client.get(f"https://api.gleif.org/api/v1/lei-records/{lei}")
+            if resp.status_code != 200:
+                raise ValueError(f"HTTP {resp.status_code}")
+            full = resp.json().get("data")
+            if isinstance(full, dict) and isinstance(full.get("attributes"), dict):
+                return full
+            raise ValueError("no record in response")
+        except Exception as exc:
+            self.graph.log(DomainCategory.FIAT, "GLEIF_ENRICH_SKIP", company_name, f"GLEIF full record for {lei} skipped: {exc}")
+            return rec
+
+    @staticmethod
+    def _gleif_record_facts(attrs: Dict[str, Any]) -> Dict[str, str]:
+        """Registration status, legal form and a joined headquarters address from a LEI record's attributes."""
+        entity = attrs.get("entity") or {}
+        facts: Dict[str, str] = {}
+        registration_status = str((attrs.get("registration") or {}).get("status") or "").strip()
+        if registration_status:
+            facts["registration_status"] = registration_status
+        form = entity.get("legalForm") or {}
+        legal_form = str(form.get("other") or form.get("id") or "").strip()
+        if legal_form:
+            facts["legal_form"] = legal_form
+        hq = entity.get("headquartersAddress") or {}
+        parts = [*(hq.get("addressLines") or []), hq.get("city"), hq.get("country")]
+        hq_line = ", ".join(str(p).strip() for p in parts if p and str(p).strip())
+        if hq_line:
+            facts["headquarters_address"] = hq_line
+        return facts
+
+    @classmethod
+    def _gleif_parent_facts(cls, attrs: Dict[str, Any]) -> Dict[str, str]:
+        """Status, headquarters and registered address of a Level-2 parent record, only for fields it actually carries."""
+        entity = attrs.get("entity") or {}
+        facts: Dict[str, str] = {}
+        status = str(entity.get("status") or "").strip()
+        if status:
+            facts["status"] = status
+        for key, city_key, country_key, address_key in (
+            ("headquartersAddress", "hq_city", "hq_country", None),
+            ("legalAddress", None, None, "registered_address"),
+        ):
+            address = entity.get(key) or {}
+            city, country = str(address.get("city") or "").strip(), str(address.get("country") or "").strip()
+            if city_key and city:
+                facts[city_key] = city
+            if country_key and country:
+                facts[country_key] = country
+            parts = [*(address.get("addressLines") or []), city, country]
+            line = ", ".join(str(p).strip() for p in parts if p and str(p).strip())
+            if address_key and line:
+                facts[address_key] = line
+        facts.update(cls._gleif_record_facts(attrs))
+        return facts
+
+    async def _gleif_reporting_exceptions(self, client: httpx.AsyncClient, lei: str, company_name: str) -> Dict[str, str]:
+        """GLEIF Level-2 reporting exceptions (why the entity reports no parent), one plain reason string per level.
+
+        ``ultimate_parent_exception`` / ``direct_parent_exception`` hold the exception reason (for example
+        ``NO_KNOWN_PERSON``). The endpoints answer 404 when there is none; any other failure is a logged skip.
+        """
+        found: Dict[str, str] = {}
+        for level, key in (("ultimate-parent", "ultimate_parent_exception"), ("direct-parent", "direct_parent_exception")):
+            url = f"https://api.gleif.org/api/v1/lei-records/{lei}/{level}-reporting-exception"
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code != 200:
+                    raise ValueError(f"HTTP {resp.status_code}")
+                data = resp.json().get("data")
+                attrs = (data.get("attributes") if isinstance(data, dict) else None) or {}
+                reason = str(attrs.get("reason") or attrs.get("exceptionReason") or attrs.get("exceptionCategory") or "")
+                reason = reason.strip().upper().replace(" ", "_")
+                if not re.fullmatch(r"[A-Z][A-Z_]{2,}", reason):
+                    raise ValueError("no recognisable exception reason in response")
+                found[key] = reason
+            except Exception as exc:
+                self.graph.log(
+                    DomainCategory.FIAT, "GLEIF_ENRICH_SKIP", company_name, f"GLEIF {level} reporting exception for {lei} skipped: {exc}"
+                )
+        return found
+
     async def investigate_gleif_corporate_hierarchy(self, company_name: str, origin_node_id: str, hop_depth: int) -> None:
         """Query the zero-key GLEIF Level-1 & Level-2 REST API for global LEI records, direct-parent, ultimate-parent, and offshore jurisdictions."""
         self.graph.log(
@@ -260,13 +356,14 @@ class AccountantAgent:
         )
         url = f"https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]={quote_plus(company_name)}&page[size]=5"
         try:
-            async with httpx.AsyncClient(timeout=12.0, headers=self.std_headers) as client:
+            async with new_async_client(timeout=12.0, headers=self.std_headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return
                 records = resp.json().get("data", [])
                 for rec in records[:3]:
                     lei = rec.get("id", "")
+                    rec = await self._gleif_complete_record(client, rec, company_name)
                     attrs = rec.get("attributes", {})
                     entity = attrs.get("entity", {})
                     legal_name = entity.get("legalName", {}).get("name", company_name)
@@ -296,6 +393,8 @@ class AccountantAgent:
                         raw_snippet=f"LEI={lei} | legalName={legal_name} | jurisdiction={jurisdiction} | regAddress={reg_line}",
                     )
                     corp_id = f"lei:{lei}"
+                    enrichment = self._gleif_record_facts(attrs)
+                    enrichment.update(await self._gleif_reporting_exceptions(client, lei, company_name))
                     node = GraphNode(
                         id=corp_id,
                         label=f"🏛️ {legal_name} ({jurisdiction})",
@@ -313,6 +412,7 @@ class AccountantAgent:
                             "hq_city": hq_city,
                             "hq_country": hq_country,
                             "registered_address": reg_line,
+                            **enrichment,
                         },
                         receipts=[rcpt],
                         hop_depth=hop_depth,
@@ -391,7 +491,13 @@ class AccountantAgent:
                                     ftm_schema="Company",
                                     smoke_score=50.0,
                                     risk_flags=["GLEIF_ULTIMATE_PARENT"],
-                                    attributes={"lei": p_lei, "legal_name": p_name, "jurisdiction": p_jur},
+                                    attributes={
+                                        "lei": p_lei,
+                                        "legal_name": p_name,
+                                        "jurisdiction": p_jur,
+                                        **self._gleif_parent_facts(ult_data.get("attributes") or {}),
+                                        **await self._gleif_reporting_exceptions(client, p_lei, company_name),
+                                    },
                                     receipts=[p_rcpt],
                                     hop_depth=hop_depth + 1,
                                 )
@@ -422,6 +528,135 @@ class AccountantAgent:
                             )
         except Exception as exc:
             self.graph.log(DomainCategory.FIAT, "GLEIF_INFO", company_name, f"GLEIF check completed: {exc}")
+
+    async def investigate_opensanctions(self, query: str, origin_node_id: str, hop_depth: int) -> None:
+        """Screen a name/entity against OpenSanctions (consolidated OFAC/EU/UN/OFSI sanctions, PEP
+        lists, and watchlists) via its FollowTheMoney-native search API.
+
+        Keyless-first by design: point ``OPENSANCTIONS_API_URL`` at a self-hosted **yente** instance
+        (fully keyless, the recommended posture) or set ``OPENSANCTIONS_API_KEY`` for the hosted free
+        tier. With neither, the hosted API returns 401/403 and this degrades to a logged skip rather
+        than failing the case. A sanctions/PEP hit is an authoritative *listing* (Admiralty B2) but a
+        **soft name match** to our target — flagged for human verification, never auto-confirmed.
+        """
+        q = (query or "").strip()
+        if len(q) < 3:
+            return
+
+        base_url = os.environ.get("OPENSANCTIONS_API_URL", "https://api.opensanctions.org").strip().rstrip("/")
+        api_key = os.environ.get("OPENSANCTIONS_API_KEY", "").strip()
+        headers = dict(self.std_headers)
+        headers["Accept"] = "application/json"
+        if api_key:
+            headers["Authorization"] = f"ApiKey {api_key}"
+
+        self.graph.log(
+            DomainCategory.FIAT,
+            "SANCTIONS_PEP_SCAN",
+            q,
+            f"Screening OpenSanctions (OFAC/EU/UN/OFSI sanctions, PEP & watchlists) for '{q}'",
+        )
+        url = f"{base_url}/search/default?q={quote_plus(q)}&limit=5"
+        try:
+            async with new_async_client(timeout=10.0, headers=headers) as client:
+                resp = await client.get(url)
+                if resp.status_code in (401, 403):
+                    self.graph.log(
+                        DomainCategory.FIAT,
+                        "SANCTIONS_PEP_SKIP",
+                        q,
+                        "OpenSanctions needs access: set OPENSANCTIONS_API_KEY or point "
+                        "OPENSANCTIONS_API_URL at a self-hosted yente. Sanctions/PEP screening skipped.",
+                    )
+                    return
+                if resp.status_code != 200:
+                    return
+                results = resp.json().get("results", []) or []
+                for rec in results[:5]:
+                    props = rec.get("properties", {}) or {}
+                    topics = [str(t).lower() for t in (props.get("topics") or rec.get("topics") or [])]
+                    is_sanctioned = any(t == "sanction" or t.startswith("sanction.") for t in topics)
+                    is_pep = any(t == "role.pep" or t.startswith("role.pep") for t in topics)
+                    is_crime = any(t == "crime" or t.startswith("crime.") for t in topics)
+                    if not (is_sanctioned or is_pep or is_crime):
+                        continue  # only record meaningful risk hits, not every name collision
+
+                    caption = rec.get("caption") or q
+                    schema = rec.get("schema", "") or "LegalEntity"
+                    datasets = rec.get("datasets", []) or []
+                    countries = [str(c).upper() for c in (props.get("country") or [])]
+
+                    flags: List[str] = []
+                    smoke = 55.0
+                    badge = "🏛️"
+                    if is_sanctioned:
+                        flags.append("OFAC_EU_UN_SANCTIONS_LIST_MATCH")
+                        smoke = 90.0
+                        badge = "⛔"
+                    if is_pep:
+                        flags.append("POLITICALLY_EXPOSED_PERSON_PEP")
+                        smoke = max(smoke, 72.0)
+                        if badge == "🏛️":
+                            badge = "🏅"
+                    if is_crime:
+                        flags.append("ADVERSE_MEDIA_CRIME_TOPIC")
+                    flags.append("SOFT_NAME_MATCH_VERIFY")
+
+                    ent_id = rec.get("id", "") or re.sub(r"[^a-z0-9]+", "_", caption.lower())[:40]
+                    os_entity_url = f"https://www.opensanctions.org/entities/{ent_id}/"
+                    is_person = str(schema).lower() in ("person",)
+                    rcpt = EvidenceReceipt(
+                        tool="opensanctions_yente",
+                        domain=DomainCategory.FIAT,
+                        admiralty_code="B2",  # authoritative consolidated listing; the match to target is soft
+                        selector_strength=SelectorStrength.SOFT,
+                        source_url=os_entity_url,
+                        extracted_fact=(
+                            f"OpenSanctions lists '{caption}' ({schema}) on {', '.join(datasets[:4]) or 'a watchlist'}"
+                            f" — topics: {', '.join(topics) or 'n/a'}"
+                            + (f"; countries: {', '.join(countries)}" if countries else "")
+                        ),
+                        raw_snippet=f"id={ent_id} | caption={caption} | topics={topics} | datasets={datasets[:6]}",
+                    )
+                    node_id = f"sanction:{ent_id}"
+                    self.graph.upsert_node(
+                        GraphNode(
+                            id=node_id,
+                            label=f"{badge} {caption}",
+                            entity_type=EntityType.PERSON if is_person else EntityType.ORGANIZATION,
+                            domain=DomainCategory.FIAT,
+                            selector_strength=SelectorStrength.SOFT,
+                            ftm_schema=schema,
+                            smoke_score=smoke,
+                            risk_flags=flags,
+                            attributes={
+                                "caption": caption,
+                                "schema": schema,
+                                "datasets": datasets,
+                                "topics": topics,
+                                "countries": countries,
+                                "opensanctions_id": ent_id,
+                                "match_query": q,
+                            },
+                            receipts=[rcpt],
+                            hop_depth=hop_depth,
+                        )
+                    )
+                    if node_id != origin_node_id:
+                        self.graph.upsert_edge(
+                            GraphEdge(
+                                source_id=origin_node_id,
+                                target_id=node_id,
+                                relation=RelationType.LINKED_IDENTITY,
+                                domain=DomainCategory.FIAT,
+                                admiralty_code="B3",  # soft name match — possibly true, not corroborated
+                                confidence=0.55,
+                                summary="OpenSanctions name match (verify)",
+                                receipts=[rcpt],
+                            )
+                        )
+        except Exception as exc:
+            self.graph.log(DomainCategory.FIAT, "SANCTIONS_PEP_INFO", q, f"OpenSanctions screen completed: {exc}")
 
     async def investigate_sec_edgar(self, query: str, origin_node_id: str, hop_depth: int) -> None:
         """
