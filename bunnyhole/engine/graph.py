@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set
 
 import networkx as nx
 
@@ -25,6 +25,9 @@ from bunnyhole.engine.models import (
     TimelineItem,
     selector_token_match,
 )
+
+if TYPE_CHECKING:
+    from bunnyhole.engine.pi_anchoring import AnchorVerdict, SubjectAnchors
 
 # Known Commercial Registered Agents (Delaware, Wyoming, Nevada, Cayman, BVI) that create false-positive ownership links
 KNOWN_REGISTERED_AGENT_PATTERNS = [
@@ -80,6 +83,12 @@ class InvestigationGraph:
         self.logs: List[AgentLogEvent] = []
         self.explored_seeds: Set[str] = set()
         self._event_listeners: List[Callable[[Dict[str, Any]], None]] = []
+        # PI stream, person subject only (None everywhere else, which leaves every behaviour below unchanged):
+        # the investigator's anchors for the two-anchor rule, name-only candidates that were NOT linked, and the node
+        # ids the analytics tables (paths, keystone brokers, predicted links, cut-outs) must not run through.
+        self.pi_subject: Optional["SubjectAnchors"] = None
+        self.set_aside_candidates: List[Dict[str, Any]] = []
+        self.analytics_excluded_ids: Set[str] = set()
 
     def is_excluded(self, text_or_id: str) -> bool:
         """Check if a selector, label, or node ID matches the user's negative scope exclusions.
@@ -132,6 +141,35 @@ class InvestigationGraph:
     @staticmethod
     def is_shared_cdn_ip(ip_str: str) -> bool:
         return ip_str.strip().startswith(KNOWN_CDN_IP_PREFIXES)
+
+    def set_aside_candidate(
+        self,
+        agent: DomainCategory,
+        kind: str,
+        label: str,
+        tool: str,
+        source_url: str,
+        verdict: "AnchorVerdict",
+        receipts: Sequence[Any] = (),
+    ) -> None:
+        """Record a name-only candidate that was NOT linked to the subject (PI person subject).
+
+        It is not a node and not an edge, so no analytics table can run through it; it stays in the JSON result
+        (``set_aside_candidates``), is named in the identity notes, and is logged.
+        """
+        from bunnyhole.engine.pi_anchoring import candidate_record
+
+        record = candidate_record(kind, label, tool, source_url, verdict, receipts)
+        if any(r["tool"] == tool and r["label"] == label for r in self.set_aside_candidates):
+            return
+        self.set_aside_candidates.append(record)
+        self.log(agent, "NAME_ONLY_MATCH_SET_ASIDE", label, record["reason"])
+
+    def analysis_graph(self) -> "nx.Graph[Any]":
+        """Undirected simple graph for the analytics tables: ``analytics_excluded_ids`` are left out."""
+        simple_g = nx.Graph(self.nx_graph.to_undirected())
+        simple_g.remove_nodes_from([n for n in self.analytics_excluded_ids if n in simple_g])
+        return simple_g
 
     def upsert_node(self, node: GraphNode) -> GraphNode:
         """Insert or merge a node while preserving all EvidenceReceipts and risk flags."""
@@ -458,8 +496,11 @@ class InvestigationGraph:
         # Final guardrail normalisation: downgrade every edge from the final node state before the ACH
         # reads it, so a downgraded (CDN / registered-agent / soft-soft) edge cannot score as HIGH.
         self.normalize_edges()
+        for excluded_id in self.analytics_excluded_ids:  # a set-aside node is never a cut-out broker
+            if excluded_id in self.nodes:
+                self.nodes[excluded_id].is_cutout_broker = False
         if len(self.nx_graph.nodes) > 2:
-            simple_g = nx.Graph(self.nx_graph.to_undirected())
+            simple_g = self.analysis_graph()
             centrality = nx.betweenness_centrality(simple_g, normalized=True)
             try:
                 articulation_pts = set(nx.articulation_points(simple_g))
@@ -720,6 +761,12 @@ class InvestigationGraph:
 
     def to_dict(self) -> Dict[str, Any]:
         ach = self.run_skeptic_network_analytics()
+        out = self._to_dict(ach)
+        if self.set_aside_candidates:
+            out["set_aside_candidates"] = list(self.set_aside_candidates)
+        return out
+
+    def _to_dict(self, ach: ACHAssessment) -> Dict[str, Any]:
         return {
             "case_id": self.case_id,
             "seed_query": self.seed_query,

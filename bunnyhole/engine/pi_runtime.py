@@ -40,6 +40,7 @@ from bunnyhole.engine.pi_analysis import (
     find_gaps,
     freshness_class,
 )
+from bunnyhole.engine.pi_anchoring import is_generic_platform_account, set_aside_notes
 from bunnyhole.engine.pi_credentials import (
     REDACTED_CREDENTIAL,
     redact_value,
@@ -688,6 +689,58 @@ def _relevance_map(
     return out
 
 
+_NAME_SEED_TYPES = frozenset({"company", "person"})
+
+
+def analytics_exclusions(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+    ownership_links: Sequence[Mapping[str, Any]],
+    selectors: Mapping[str, Sequence[str]],
+    seed_query: str,
+    *,
+    subject_is_person: bool,
+) -> Set[str]:
+    """Node ids the analytics tables (paths, keystone brokers, predicted links, cut-outs) must not run through.
+
+    * A platform's own account (``@github``) in any PI run: a hub every profile touches, never evidence.
+    * With a person subject, every node the PI relevance scorer (``pi_relevance``) rates ``unrelated`` to the
+      subject's names: it matched on a name token and nothing else (the two-anchor rule). Exception: a node
+      joined directly to a seed the investigator gave as a non-name anchor (domain, email, username, phone,
+      wallet, IP) hangs off that anchor, not off the name, so it stays.
+
+    The graph and the JSON keep every node; this only decides what the derived tables may use. ``unknown`` nodes
+    (identifiers, nothing to compare) are never excluded.
+    """
+    excluded = {
+        str(n.get("id"))
+        for n in nodes
+        if is_generic_platform_account(
+            str(_val(n.get("entity_type"))), str(n.get("id")), str(n.get("label") or ""), n.get("attributes") or {}
+        )
+    }
+    if not subject_is_person:
+        return excluded
+    names = _subject_names("", selectors, {"seed_query": seed_query})
+    relevance = _relevance_map(nodes, edges, ownership_links, names)
+    anchor_ids = {
+        str(n.get("id"))
+        for n in nodes
+        if _is_anchor(n) and str((n.get("attributes") or {}).get("seed_type") or "") not in _NAME_SEED_TYPES
+    }
+    hanging: Set[str] = set()
+    for edge in edges:
+        source, target = str(edge.get("source_id")), str(edge.get("target_id"))
+        if source in anchor_ids:
+            hanging.add(target)
+        if target in anchor_ids:
+            hanging.add(source)
+    excluded |= {
+        node_id for node_id, (rel, _why) in relevance.items() if rel == "unrelated" and node_id not in hanging
+    }
+    return excluded
+
+
 def _collision_notes(relevance: Mapping[str, Tuple[str, str]]) -> List[str]:
     """Namesakes that were labelled unrelated: shown as a note so a possible name collision is never dropped silently."""
     notes = [f"Node {node_id}: {why}" for node_id, (rel, why) in relevance.items()
@@ -1008,8 +1061,12 @@ def assemble_pi_block(
 
     playbook = playbook_for(engagement.case_type)
     identity_notes = identity_notes_for(nodes, selectors_map, engagement.subject_is_person)
+    set_aside = [c for c in graph_dict.get("set_aside_candidates") or [] if isinstance(c, Mapping)]
     identity_notes = _merge_notes(
-        identity_notes, _collision_notes(relevance) + [soft_match_note(m) for m in soft_matches[:_MAX_SOFT_NOTES]]
+        identity_notes,
+        set_aside_notes(set_aside)  # weak name matches that were not linked (pi_anchoring): never dropped silently
+        + _collision_notes(relevance)
+        + [soft_match_note(m) for m in soft_matches[:_MAX_SOFT_NOTES]],
     )
     listed_ids = sorted(
         (
@@ -1068,6 +1125,7 @@ __all__ = [
     "SOURCE_CLASS_MAP",
     "SOURCE_RECEIPT_TOOLS",
     "SUBJECT_NOT_ANCHORED_NOTE",
+    "analytics_exclusions",
     "assemble_pi_block",
     "escalation_triggers_for",
     "identity_notes_for",

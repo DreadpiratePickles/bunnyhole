@@ -186,7 +186,10 @@ class LinkSleuthAgent:
         Excludes noise intermediaries (Registered Agents & Anycast CDNs).
         """
         simple_g = nx.Graph()
+        excluded = self.graph.analytics_excluded_ids  # PI: set-aside / unanchored nodes never enter a prediction
         for u, v, data in self.graph.nx_graph.edges(data=True):
+            if u in excluded or v in excluded:
+                continue
             u_node = self.graph.nodes.get(u)
             v_node = self.graph.nodes.get(v)
             if not u_node or not v_node:
@@ -344,14 +347,15 @@ class LinkSleuthAgent:
         Find and score multi-domain paths connecting entities in the graph ("Six Degrees of Bunnyhole").
         If source_query and target_query are omitted, automatically finds paths between the highest-smoke entities across different domains!
         """
-        simple_g = nx.Graph(self.graph.nx_graph.to_undirected())
+        simple_g = self.graph.analysis_graph()
         if len(simple_g.nodes) < 2:
             return []
+        excluded = self.graph.analytics_excluded_ids
 
         def _match_node(q: str) -> Optional[str]:
             ql = q.lower().strip()
             for nid, n in self.graph.nodes.items():
-                if ql in nid.lower() or ql in n.label.lower():
+                if nid not in excluded and (ql in nid.lower() or ql in n.label.lower()):
                     return nid
             return None
 
@@ -368,6 +372,7 @@ class LinkSleuthAgent:
                     n for n in self.graph.nodes.values()
                     if "MASS_REGISTERED_AGENT_ADDRESS" not in n.risk_flags
                     and "SHARED_ANYCAST_CDN_IP" not in n.risk_flags
+                    and n.id not in excluded
                 ],
                 key=lambda x: (x.is_cutout_broker, x.smoke_score, x.hop_depth),
                 reverse=True,
@@ -432,11 +437,11 @@ class LinkSleuthAgent:
         3. Adamic-Adar Predicted Missing Links
         4. Top Cross-Domain Interconnection Paths
         """
-        simple_g = nx.Graph(self.graph.nx_graph.to_undirected())
+        simple_g = self.graph.analysis_graph()
         keystone_brokers: List[Dict[str, Any]] = []
 
         for nid, node in self.graph.nodes.items():
-            if nid not in simple_g or simple_g.degree(nid) < 2:
+            if nid not in simple_g or simple_g.degree(nid) < 2:  # excluded nodes are not in simple_g
                 continue
             if "MASS_REGISTERED_AGENT_ADDRESS" in node.risk_flags or "SHARED_ANYCAST_CDN_IP" in node.risk_flags:
                 continue

@@ -323,6 +323,26 @@ def is_common_name(full_name: str) -> bool:
     return len(parsed.first) == 1 or parsed.first in COMMON_NAMES
 
 
+def full_names_compatible(a: str, b: str) -> bool:
+    """True when two names carry a surname each, the surnames agree and the given names are compatible.
+
+    Compatible given names are equal, a nickname of each other, a hyphen split, or an initial of the other
+    (``J. Roe`` for ``Jane Roe``). A name with no surname (``Jane``), a different surname or a different
+    spelling of it (``Roe`` and ``Rowe``) is not compatible. This is the "full name" half of the two-anchor rule:
+    it never says two records are the same person, only that the names do not rule it out.
+    """
+    parsed_a, parsed_b = _parse_name(a), _parse_name(b)
+    if parsed_a is None or parsed_b is None or not parsed_a.last or not parsed_b.last:
+        return False  # two lone given names ("Jane" and "Jane") are not a full-name match
+    return _compare_names(parsed_a, parsed_b) != "none"
+
+
+def surname_of(full_name: str) -> str:
+    """The surname of ``full_name`` as the scorer reads it (lowercase), or ``""`` for a single-word name."""
+    parsed = _parse_name(full_name)
+    return parsed.last if parsed is not None else ""
+
+
 # ----------------------------------------------------------------------------------------------
 # Records and scoring
 # ----------------------------------------------------------------------------------------------

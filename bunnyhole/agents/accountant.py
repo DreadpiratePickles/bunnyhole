@@ -24,6 +24,7 @@ from bunnyhole.engine.models import (
     TimelineItem,
 )
 from bunnyhole.engine.netutil import new_async_client
+from bunnyhole.engine.pi_anchoring import judge_listing
 
 # High-secrecy offshore jurisdictions flagged in Exhibit 21 & GLEIF hierarchies
 OFFSHORE_HAVEN_CODES = {
@@ -688,6 +689,18 @@ class AccountantAgent:
                         raw_snippet=f"id={ent_id} | caption={caption} | topics={topics} | datasets={datasets[:6]}",
                     )
                     node_id = f"sanction:{ent_id}"
+                    subject = self.graph.pi_subject  # PI person subject: a PEP/sanctions name hit needs the full name
+                    if subject is not None:
+                        listed_names = [caption] + [
+                            str(n) for key in ("name", "alias") for n in (props.get(key) or []) if isinstance(n, str)
+                        ]
+                        verdict = judge_listing(subject, listed_names, list_name="OpenSanctions")
+                        if not verdict.attach:
+                            self.graph.set_aside_candidate(
+                                DomainCategory.FIAT, "listing", f"{caption} (OpenSanctions)", rcpt.tool,
+                                os_entity_url, verdict, [rcpt],
+                            )
+                            continue
                     self.graph.upsert_node(
                         GraphNode(
                             id=node_id,
