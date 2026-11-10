@@ -162,11 +162,13 @@ def _graph_match_clause(sanctions: SanctionsScreening, labels: _Labels) -> str:
     )
 
 
-def _weak_match_clause(sanctions: SanctionsScreening) -> str:
+def _weak_match_clauses(sanctions: SanctionsScreening) -> Tuple[str, str]:
+    """The weak-name-match clause, long and short (``("", "")`` when there is none)."""
     count = len(_weak_matches(sanctions))
     if not count:
-        return ""
-    return f"{_plural(count, 'weak name match', 'weak name matches')}, not linked (verify on the primary list)"
+        return "", ""
+    short = f"{_plural(count, 'weak name match', 'weak name matches')}, not linked"
+    return f"{short} (verify on the primary list)", short
 
 
 def _flag_clause(block: PIBlock, labels: _Labels) -> str:
@@ -201,6 +203,30 @@ _HIT_DETAIL_LEVELS: Tuple[Tuple[int, int, int], ...] = (
 )
 
 
+_NOT_CLEARANCE = "No hit on a screened list is not clearance."
+_NOT_CLEARANCE_SHORT = "No hit is not clearance."
+
+
+def _weak_match_candidates(
+    sanctions: SanctionsScreening, missing: str, others: Sequence[str], weak_long: str, weak_short: str
+) -> List[str]:
+    """Bullet texts for a no-hit run with a weak name match, most informative first.
+
+    Every one keeps the not-clearance closing: when the 220-character cap bites, the weak clause is shortened, the
+    other clauses are dropped, then the not-screened list becomes a count, but the closing is never cut.
+    """
+    screened = ", ".join(_distinct(sanctions.screened)) or "none"
+    compact = f"{len(_distinct(sanctions.not_screened)) or 'all'} lists (see Sanctions screening)"
+    out: List[str] = []
+    for missing_text in (missing, compact):
+        base = f"{sanctions.status}; Screened: {screened}; NOT screened: {missing_text}."
+        for kept in range(len(others), -1, -1):
+            for weak in (weak_long, weak_short):
+                tail = _sentence("; ".join([weak, *others[:kept]]))
+                out += [f"{base} {tail} {_NOT_CLEARANCE}", f"{base} {tail} {_NOT_CLEARANCE_SHORT}"]
+    return out
+
+
 def _sanctions_bullet(block: PIBlock, labels: _Labels) -> str:
     """A hit always leads and is always a soft match; a partial run never reads as clear. Without a hit the lists that
     did not run (the EU list always) are named here; with a hit they are named in the Not covered bullet, which keeps this
@@ -210,11 +236,11 @@ def _sanctions_bullet(block: PIBlock, labels: _Labels) -> str:
     missing = _list_names_only(sanctions.not_screened)
     if not missing:
         missing = "all lists (screening did not run)" if sanctions.status == "not_run" else "none recorded"
-    extras = [
-        clause
-        for clause in (_weak_match_clause(sanctions), _flag_clause(block, labels), _graph_match_clause(sanctions, labels))
-        if clause
-    ]
+    weak_long, weak_short = _weak_match_clauses(sanctions)
+    others = [clause for clause in (_flag_clause(block, labels), _graph_match_clause(sanctions, labels)) if clause]
+    extras = ([weak_long] if weak_long else []) + others
+    if not hits and weak_long:
+        return _bullet("Sanctions", _first_fitting("Sanctions", _weak_match_candidates(sanctions, missing, others, weak_long, weak_short)))
     candidates: List[str] = []
     for kept in range(len(extras), -1, -1):
         tail = "; ".join(extras[:kept])
