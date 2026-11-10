@@ -284,6 +284,28 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _can_replace_atomically(target: Path) -> bool:
+    """True for a regular (or not yet existing) file in a writable directory: temp file plus ``os.replace`` is safe."""
+    if target.exists() and not (stat.S_ISREG(target.stat().st_mode) and os.access(target, os.W_OK)):
+        return False
+    return os.access(target.parent, os.W_OK | os.X_OK)
+
+
+def _write_report_text(path: Path, text: str) -> None:
+    """Write the report to ``path`` as ``Path.write_text`` always did, atomically where that is safe.
+
+    The path is resolved first (a symlink is followed, so the real file is written, not the link). A regular file in a
+    writable directory is replaced through a temp file. Anything else (a device such as ``/dev/null``, an existing
+    writable file in a read-only directory, a read-only file) is written directly, so this never fails where a plain
+    ``write_text`` would not have.
+    """
+    target = Path(os.path.realpath(path))
+    if _can_replace_atomically(target):
+        _atomic_write_text(target, text)
+    else:
+        path.write_text(text, encoding="utf-8")
+
+
 def _run_sync(make_coroutine: Callable[[], Coroutine[Any, Any, T]]) -> T:
     """Run a coroutine from sync code, also when an event loop is already running in this thread."""
     try:
@@ -326,12 +348,12 @@ def write_pi_report(
     if builder is None or pi_report is None:
         return
     report = builder(result)
-    _atomic_write_text(pi_report, report)  # the code-built report is on disk before any model call
+    _write_report_text(pi_report, report)  # the code-built report is on disk before any model call
     if ai_analysis:
         final, message = _report_with_ai_analysis(report, result)
         if final != report:
             try:
-                _atomic_write_text(pi_report, final)
+                _write_report_text(pi_report, final)
             except OSError as exc:
                 message = Text(
                     f"⚠ AI analysis could not be written ({type(exc).__name__}); the code-built report is intact.",

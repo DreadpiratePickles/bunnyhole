@@ -1,102 +1,97 @@
 """Deterministic validator of the AI analysis. A pure function: it decides, the model does not.
 
-``validate_analysis`` checks the model's text against the evidence it was given and the output contract in
-``pi_report_rules.md``. Any violation means the text is not written to the report. Order of work: the length cap
-first (nothing else runs on an oversized text), then the character screen, then layout, then one pass over sentences.
+The model writes ONE section, ``### Connections``: at most six bullets of the exact shape
+``- [F1,O1] one or two plain sentences``, tags first. Everything risky is code-built instead (the "What is not
+established" and "Suggested next steps" sections, the label next to every tag, the Bottom line, the sanctions text),
+so whole classes of misstatement cannot be written at all. ``validate_analysis`` checks the model's text; any
+violation means the text is not written to the report. Order of work: length cap first (nothing else runs on an
+oversized text), then the character allowlist, then the layout, then one pass over the bullets.
 
-Structural rules (allowlists) come first, blocklists are the second layer:
+What is enforced, allowlists first:
 
-- layout: exactly the four sections, in order, nothing before the first; no invisible, bidi or control characters;
-  no links, images, HTML, code or square brackets that are not citations;
-- citations: every sentence ends in tags such as ``[F3]`` / ``[F2,F5]`` and every id was supplied;
-- specifics: every digit-bearing token, month name, URL, email, hash, receipt id, non-Latin word and capitalised
-  word (names, acronyms, the first word of a sentence unless it is an allow-listed starter) must occur in the
-  evidence, or be on a short allowlist of legal frames and generic institutional words;
-- Timeline: each bullet carries a date from the evidence; next steps: each sentence starts with an allow-listed lawful
-  verb, and a verb that reaches a person needs an honest-identification phrase;
-- labels: wording may not exceed the label of any cited finding; a sentence citing a lead must hedge; a set-aside
-  weak match must read as set aside and never as the subject;
-- sanctions: a sentence about sanctions may restate the evidence but may not conclude clearance, risk level,
-  compliance or safety, and absence-of-hit wording needs a same-sentence not-screened or not-clearance qualifier;
-- second layer (keyword screens, run on every sentence, negated mentions rejected too): forbidden or deceptive
-  methods, accusation words that the cited evidence does not itself contain.
+- characters: ASCII letters, accented Latin letters, ASCII digits, the ASCII space and ``. , ; : ' " ( ) - / & % @ _``
+  only; square brackets only in the leading tag. Invisible, bidi and format characters, other scripts, look-alike and
+  fullwidth forms, backticks, ``#`` ``>`` ``*`` ``|`` ``<`` ``~`` and tabs are refused (typographic quotes and dashes
+  are first turned into ASCII);
+- layout: the heading line, then bullets only (or the single line ``None.``); at most 6 bullets of at most 400
+  characters and two sentences; each bullet starts with a tag of 1 to 4 ids, all of kind F or O that were in the
+  prompt; no other brackets;
+- specifics: every digit-bearing token, number word, month, hex string, IPv4/IPv6 address, URL, email, domain, @handle
+  and capitalised word (the first word of a sentence included; closed-class function words are the only exception)
+  must occur in the evidence the model was shown; a run of two or more evidence words must occur in that order;
+- English gate: a quarter of the words outside the evidence must be English function words;
+- second layer (word screens, no negation exceptions): sanctions, screening, list, hit, match, risk, clear, absence and
+  similar topics; label and certainty words; accusation words unless the cited evidence contains them.
 
-Limits, stated honestly: this is a token and keyword screen, not understanding. It cannot tell that a fluent, correctly
-cited sentence misreads a record, or that a cited statement is defamatory in context. A lowercase or uncased invented
-name ("robert smith"), a spelled-out number ("five") and a paraphrase of a forbidden method pass. The capitalised-name
-check compares tokens, so a real name in the evidence can be attached to the wrong record. Rejecting a sentence that
-only says "do not hack" is deliberate. A false rejection costs one retry; a false acceptance costs credibility.
+Limits, stated honestly: this is a token and word screen, not understanding. A fluent bullet that cites the wrong
+finding, misreads what a record means, or is defamatory without using a screened word passes. A lowercase invented
+name written as ordinary words ("robert smith"), a paraphrase of a screened topic, and a real name from the evidence
+attached to the wrong record are not caught. Language is not enforced beyond the Latin allowlist and the function-word
+gate. The validator has never run against a live model. A false rejection costs one retry; a false acceptance costs
+credibility.
 """
 
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, NamedTuple, Optional, Sequence, Tuple
 
 from bunnyhole.engine.pi_narrative_checks import (
-    ACCUSATION,
-    CLEARANCE,
-    FORBIDDEN,
-    INVENTED,
-    LABEL,
-    NEXT_STEP,
-    TIMELINE,
     EvidenceIndex,
     accusation,
+    advice_or_method,
     build_index,
-    clearance,
-    forbidden_method,
-    has_dated_token,
+    certainty_word,
+    disallowed_character,
+    excluded_topic,
     invented_specifics,
-    label_violation,
-    next_step_problem,
-    screen_text,
+    language_ok,
+    normalise_typography,
+    obfuscation,
+    too_short,
 )
 from bunnyhole.engine.pi_narrative_input import NarrativeEvidence
 
-SECTION_HEADINGS: Tuple[str, ...] = (
-    "Connections",
-    "Timeline",
-    "What is not established",
-    "Suggested next steps (lawful)",
-)
-TIMELINE_SECTION = SECTION_HEADINGS[1]
-NEXT_STEPS_SECTION = SECTION_HEADINGS[3]
-#: The only sentences allowed without a citation (an empty section).
-EXEMPT_SENTENCES: FrozenSet[str] = frozenset({"None.", "No dated facts were supplied."})
-MAX_CHARS = 8000
-_MAX_VIOLATIONS = 40
+SECTION_HEADING = "Connections"
+HEADING_LINE = f"### {SECTION_HEADING}"
+#: The single line that means "no connections between the findings".
+NO_CONNECTIONS = "None."
+MAX_CHARS = 3000
+MAX_BULLETS = 6
+MAX_BULLET_CHARS = 400
+MAX_SENTENCES = 2
+MAX_TAG_IDS = 4
+_MAX_VIOLATIONS = 30
 
 #: Note-level reasons (fixed wording; never quotes model text).
 REASON_TEXT: Dict[str, str] = {
-    "structure": "the sections were not exactly the four required, in order",
     "too_long": "it was too long",
-    "invisible": "it contained invisible or control characters",
-    "markup": "it used disallowed markup or square brackets that are not citations",
+    "characters": "it used characters outside the allowed set",
+    "structure": "it was not the Connections heading followed by tagged bullets",
+    "bullets": "it had too many bullets, a bullet that was too long or too short, or more than two sentences in a bullet",
+    "citation": "a bullet cited an id that is not allowed in Connections",
     "unknown_id": "a citation used an id that was not supplied",
-    "uncited": "a sentence did not end with a citation",
-    INVENTED: "it named a URL, email, number, date, hash, name or word that is not in the evidence",
-    FORBIDDEN: "it mentioned an unlawful or deceptive method or a contact without honest identification",
-    ACCUSATION: "it used an accusation word the evidence does not contain",
-    CLEARANCE: "it used clearance, risk-level or safety wording about sanctions",
-    LABEL: "it described a finding more strongly than its label allows",
-    TIMELINE: "a Timeline bullet had no date from the evidence",
-    NEXT_STEP: "a next step did not start with an allowed lawful verb",
-    "no_content": "the model produced no analysis",
+    "markup": "it used square brackets outside the leading citation tag",
+    "topic": "it discussed sanctions, screening, lists, hits, risk or absence, which the code-built report covers",
+    "certainty": "it used a label or certainty word",
+    "advice": "it gave advice, named a method or started with an instruction, which the code builds instead",
+    "accusation": "it used an accusation word the evidence does not contain",
+    "invented": "it named a number, month, address, handle or name that is not in the evidence",
+    "language": "it was not in English",
+    "no_connections": "the model found no connections between findings",
 }
-#: Per-sentence feedback for the retry prompt (fixed wording; ``{n}`` is the sentence number).
+#: Per-bullet feedback for the retry prompt (fixed wording; ``{n}`` is the bullet number).
 _FEEDBACK: Dict[str, str] = {
-    "uncited": "sentence {n} has no citation",
-    INVENTED: "sentence {n} names a URL, email, number, date, hash, name or word that is not in the evidence",
-    FORBIDDEN: "sentence {n} names an unlawful or deceptive method, or contacts a person without honest identification",
-    ACCUSATION: "sentence {n} uses an accusation word that the evidence does not contain",
-    CLEARANCE: "sentence {n} uses clearance, risk-level or safety wording, or states an absence of hits without a qualifier",
-    LABEL: "sentence {n} says more than the label allows, or states a lead or set-aside match without a hedge",
-    TIMELINE: "sentence {n} has no date that is in the evidence",
-    NEXT_STEP: "sentence {n} does not start with an allowed lawful verb",
-    "markup": "sentence {n} uses disallowed markup or brackets",
+    "bullets": "bullet {n} is too long, too short or has more than two sentences",
+    "citation": "bullet {n} cites an id that is not an F or O id from the prompt",
+    "markup": "bullet {n} uses square brackets outside its leading tag",
+    "topic": "bullet {n} discusses sanctions, screening, lists, hits, risk or absence",
+    "certainty": "bullet {n} uses a label or certainty word",
+    "advice": "bullet {n} gives advice, names a method or starts with an instruction",
+    "accusation": "bullet {n} uses an accusation word that the evidence does not contain",
+    "invented": "bullet {n} names a number, month, address, handle or capitalised word that is not in the evidence",
+    "language": "bullet {n} is not in English",
 }
 _UNSAFE_ID_TEXT = "an unknown citation id"
 
@@ -107,7 +102,12 @@ class Violation:
 
     code: str
     detail: str = ""
-    sentence: int = 0
+    bullet: int = 0
+
+
+class Bullet(NamedTuple):
+    ids: Tuple[str, ...]
+    text: str
 
 
 def reasons(violations: Sequence[Violation]) -> List[str]:
@@ -116,13 +116,13 @@ def reasons(violations: Sequence[Violation]) -> List[str]:
 
 
 def feedback_lines(violations: Sequence[Violation]) -> List[str]:
-    """Fixed-wording, per-sentence lines for the retry prompt. Only ids of the shape ``F9`` are ever echoed."""
+    """Fixed-wording lines for the retry prompt. Only ids of the shape ``F9`` are ever echoed."""
     lines: List[str] = []
     for v in violations:
         if v.code == "unknown_id":
-            text = f"unknown id {v.detail}" if re.fullmatch(r"[A-Za-z]\d{1,6}", v.detail) else _UNSAFE_ID_TEXT
-        elif v.code in _FEEDBACK and v.sentence:
-            text = _FEEDBACK[v.code].format(n=v.sentence)
+            text = f"unknown id {v.detail}" if _SAFE_ID_RE.match(v.detail) else _UNSAFE_ID_TEXT
+        elif v.code in _FEEDBACK and v.bullet:
+            text = _FEEDBACK[v.code].format(n=v.bullet)
         else:
             text = REASON_TEXT[v.code]
         if text not in lines:
@@ -137,166 +137,100 @@ def _clip(text: str, limit: int = 40) -> str:
 
 # --------------------------------------------------------------------------------------- parsing
 
-_TAG_RE = re.compile(r"\[\s*[A-Za-z]\d+(?:\s*,\s*[A-Za-z]\d+)*\s*\]")
-_BRACKET_RE = re.compile(r"\[[^\[\]]*+\]")
-_BULLET_RE = re.compile(r"^\s*+(?:[-*•]|\d{1,2}[.)])\s++")
-_BOUNDARY_RE = re.compile(
-    r"(?<![.!?])[.!?]++(?:\s*+\[[^\[\]]*+\])*+(?=\s++[A-Z0-9\[(\"'“]|\s*+$)"
-)
-_ABBREVIATIONS = frozenset({"ltd", "inc", "corp", "co", "llc", "plc", "gmbh", "mr", "mrs", "ms", "dr", "vs", "no",
-                            "st", "jr", "sr", "etc", "approx", "ref", "cf"})
-_ALLOWED_CONTROL = frozenset({"\n", "\r", "\t"})
-_BAD_CATEGORIES = frozenset({"Cf", "Cc", "Co", "Cs", "Cn", "Zl", "Zp"})
+_TAG_RE = re.compile(r"^- \[([A-Z]\d{1,3}(?:, ?[A-Z]\d{1,3}){0,3})\] (\S.*)$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z]\d{1,6}$")
+_ABBREVIATION_RE = re.compile(r"\b(?:Ltd|Inc|Corp|Co|Jr|Sr|St|vs|Mr|Mrs|Dr)\.")
+_SENTENCE_END_RE = re.compile(r"\.(?=\s|$)")
 
 
-def cited_ids(text: str) -> List[str]:
-    """Every id inside citation-shaped tags, in order of appearance (not de-duplicated)."""
-    ids: List[str] = []
-    for tag in _TAG_RE.finditer(text):
-        ids.extend(part.strip() for part in tag.group(0).strip("[] ").split(","))
-    return ids
+def _normalise(text: str) -> str:
+    return normalise_typography(text).replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _has_invisible(text: str) -> bool:
-    return any(ch not in _ALLOWED_CONTROL and unicodedata.category(ch) in _BAD_CATEGORIES for ch in text)
-
-
-def _heading(line: str) -> Optional[str]:
-    if not line.lstrip(" ").startswith("#") or len(line) - len(line.lstrip(" ")) > 3:
+def parse_bullets(text: str) -> Optional[List[Bullet]]:
+    """The bullets of a well-formed Connections section, ``[]`` for ``None.``, ``None`` when the layout is wrong."""
+    lines = [line.rstrip() for line in _normalise(text).split("\n") if line.strip()]
+    if not lines or lines[0] != HEADING_LINE:
         return None
-    return line.strip().lstrip("#").strip().rstrip("#").strip()
-
-
-def _section_title(raw: str) -> Optional[str]:
-    cleaned = raw.strip().rstrip(":").strip()
-    return next((title for title in SECTION_HEADINGS if cleaned.lower() == title.lower()), None)
-
-
-def _parse(text: str) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
-    """(preamble lines, [(canonical or raw heading, body lines)], raw headings)."""
-    preamble: List[str] = []
-    sections: List[Tuple[str, List[str]]] = []
-    headings: List[str] = []
-    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        raw = _heading(line)
-        if raw is not None:
-            headings.append(raw)
-            sections.append((_section_title(raw) or raw, []))
-        elif sections:
-            sections[-1][1].append(line)
-        else:
-            preamble.append(line)
-    return preamble, sections, headings
-
-
-def split_sentences(line: str) -> List[str]:
-    """Sentences of one line. A full stop after a legal-form abbreviation or an initial is not a boundary."""
-    sentences: List[str] = []
-    start = 0
-    stripped_end = len(line.rstrip())
-    for match in _BOUNDARY_RE.finditer(line):
-        before = re.search(r"([A-Za-z]++)$", line[max(0, start):match.start()])
-        single_dot = line[match.start():match.start() + 1] == "." and not match.group(0).startswith("..")
-        abbreviated = before is not None and (before.group(1).lower() in _ABBREVIATIONS or len(before.group(1)) == 1)
-        if abbreviated and single_dot and match.end() < stripped_end:
-            continue
-        sentences.append(line[start:match.end()].strip())
-        start = match.end()
-    tail = line[start:].strip()
-    if tail:
-        sentences.append(tail)
-    return [s for s in sentences if s]
-
-
-def _sentences_of(body: Sequence[str]) -> List[str]:
-    out: List[str] = []
+    body = lines[1:]
+    if body == [NO_CONNECTIONS]:
+        return []
+    bullets: List[Bullet] = []
     for line in body:
-        content = _BULLET_RE.sub("", line).strip()
-        if content:
-            out.extend(split_sentences(content))
-    return out
+        match = _TAG_RE.match(line)
+        if match is None:
+            return None
+        bullets.append(Bullet(tuple(part.strip() for part in match.group(1).split(",")), match.group(2)))
+    return bullets or None
 
 
-def _is_exempt(sentence: str) -> bool:
-    return sentence.rstrip(" ") in EXEMPT_SENTENCES
+def _sentence_count(text: str) -> int:
+    return len(_SENTENCE_END_RE.findall(_ABBREVIATION_RE.sub("Abbr", text))) or 1
 
 
-def has_content(text: str) -> bool:
-    """True when ``text`` has at least one sentence that is not an exempt empty-section line."""
-    preamble, sections, _headings = _parse(text)
-    lines = list(preamble) + [line for _title, body in sections for line in body]
-    return any(not _is_exempt(s) for s in _sentences_of(lines))
+# --------------------------------------------------------------------------------------- rendering
+
+_MARKDOWN_SPECIALS = "\\*_`[]()<>#|!~&"
 
 
-def canonical_markdown(text: str) -> str:
-    """The analysis with canonical ``###`` headings and no blank lines inside a section. Call only after validation."""
-    _preamble, sections, _headings = _parse(text)
-    blocks = []
-    for title, body in sections:
-        lines = [line.rstrip() for line in body if line.strip()]
-        blocks.append("\n".join([f"### {title}", *lines]))
-    return "\n\n".join(blocks)
+def escape_markdown(text: str) -> str:
+    """Backslash-escape every Markdown-special character of ``text`` (belt and braces: the allowlist already
+    refuses most of them)."""
+    return "".join("\\" + ch if ch in _MARKDOWN_SPECIALS else ch for ch in text)
+
+
+def render_connections(text: str, labels: Dict[str, str]) -> str:
+    """The Connections section as plain list items, each tag showing the label the CODE holds for its finding.
+
+    ``[F1,O1]`` is written ``[F1 · confirmed, O1]``. Call only on text that passed :func:`validate_analysis`.
+    """
+    bullets = parse_bullets(text) or []
+    lines = []
+    for bullet in bullets:
+        tags = ", ".join(f"{i} · {labels[i]}" if i in labels else i for i in bullet.ids)
+        lines.append(f"- [{tags}] {escape_markdown(bullet.text)}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------------------- validation
 
 
-def _structure(preamble: Sequence[str], sections: Sequence[Tuple[str, List[str]]], headings: Sequence[str]) -> List[Violation]:
-    if [title for title, _body in sections] != list(SECTION_HEADINGS) or any(line.strip() for line in preamble):
-        return [Violation("structure", _clip(", ".join(headings) or "no headings"))]
-    return []
-
-
-def _markup(text: str) -> List[Violation]:
-    problems = []
-    if ("`" in text or "](" in text or "![" in text or re.search(r"<\s*/?\s*[A-Za-z!]", text)
-            or re.search(r"(?i)\b(?:javascript|vbscript|data|file):", text)):
-        problems.append(Violation("markup", "link, image, code or HTML"))
-    problems += [Violation("markup", "bracket") for b in _BRACKET_RE.findall(text) if not _TAG_RE.fullmatch(b)][:3]
-    return problems
-
-
-def _ends_with_tag(sentence: str) -> bool:
-    body = sentence.rstrip(" \t.!?")
-    start = body.rfind("[")
-    return start >= 0 and body.endswith("]") and _TAG_RE.fullmatch(body[start:]) is not None
-
-
-def _check_sentence(
-    raw: str, number: int, section: Optional[str], idx: EvidenceIndex
+def _check_bullet(
+    number: int, bullet: Bullet, line_length: int, idx: EvidenceIndex, known: FrozenSet[str]
 ) -> List[Violation]:
-    sentence = screen_text(raw)
     found: List[Violation] = []
 
     def flag(code: str, detail: str = "") -> None:
         found.append(Violation(code, _clip(detail), number))
 
-    if not _ends_with_tag(sentence):
-        flag("uncited")
-    ids = cited_ids(sentence)
-    for item_id in dict.fromkeys(ids):
-        if item_id not in idx.known_ids:
-            found.append(Violation("unknown_id", item_id, number))
-    for item in invented_specifics(sentence, idx):
-        flag(INVENTED, item)
-    method = forbidden_method(sentence)
-    if method:
-        flag(FORBIDDEN, method)
-    word = accusation(sentence, ids, idx)
+    text = bullet.text
+    if line_length > MAX_BULLET_CHARS or _sentence_count(text) > MAX_SENTENCES or too_short(text):
+        flag("bullets")
+    for item_id in dict.fromkeys(bullet.ids):
+        if item_id in idx.model_ids:
+            continue
+        found.append(Violation("citation" if item_id in known else "unknown_id", item_id, number))
+    if "[" in text or "]" in text:
+        flag("markup")
+    word = obfuscation(text)
     if word:
-        flag(ACCUSATION, word)
-    word = clearance(sentence, ids)
+        flag("invented", word)
+    word = excluded_topic(text)
     if word:
-        flag(CLEARANCE, word)
-    word = label_violation(sentence, ids, idx, hedge_required=section != NEXT_STEPS_SECTION)
+        flag("topic", word)
+    word = certainty_word(text)
     if word:
-        flag(LABEL, word)
-    if section == TIMELINE_SECTION and not has_dated_token(sentence, idx):
-        flag(TIMELINE)
-    if section == NEXT_STEPS_SECTION:
-        problem = next_step_problem(sentence)
-        if problem:
-            flag(problem)
+        flag("certainty", word)
+    word = advice_or_method(text)
+    if word:
+        flag("advice", word)
+    word = accusation(text, list(bullet.ids), idx)
+    if word:
+        flag("accusation", word)
+    if not language_ok(text, idx):
+        flag("language")
+    for item in invented_specifics(text, idx):
+        flag("invented", item)
     return found
 
 
@@ -304,23 +238,22 @@ def validate_analysis(text: str, evidence: NarrativeEvidence) -> List[Violation]
     """Every violation of the output contract in ``text`` (empty list means the text may be written)."""
     if len(text) > MAX_CHARS:  # first, before any regex: an oversized text is never scanned
         return [Violation("too_long", f"{len(text)} characters")]
-    if _has_invisible(text):
-        return [Violation("invisible")]
+    normalised = _normalise(text)
+    character = disallowed_character(normalised.replace(HEADING_LINE, "", 1))
+    if character is not None:
+        return [Violation("characters", repr(character))]
+    bullets = parse_bullets(normalised)
+    if bullets is None:
+        return [Violation("structure")]
+    if not bullets:
+        return [Violation("no_connections")]
     violations: List[Violation] = []
-    preamble, sections, headings = _parse(text)
-    violations += _structure(preamble, sections, headings)
-    violations += _markup(text)
-    if not violations and not has_content(text):
-        return [Violation("no_content")]
+    if len(bullets) > MAX_BULLETS:
+        violations.append(Violation("bullets", f"{len(bullets)} bullets"))
     idx = build_index(evidence)
-    number = 0
-    for title, body in [("", list(preamble))] + [(t, b) for t, b in sections]:
-        section: Optional[str] = title if title in SECTION_HEADINGS else None
-        for sentence in _sentences_of(body):
-            number += 1
-            if _is_exempt(sentence):
-                continue
-            violations += _check_sentence(sentence, number, section, idx)
-            if len(violations) >= _MAX_VIOLATIONS:
-                return violations
+    raw_lines = [line.rstrip() for line in normalised.split("\n") if line.strip()][1:]
+    for number, (bullet, line) in enumerate(zip(bullets, raw_lines), start=1):
+        violations += _check_bullet(number, bullet, len(line), idx, evidence.known_ids)
+        if len(violations) >= _MAX_VIOLATIONS:
+            break
     return violations

@@ -118,28 +118,14 @@ def narrative_result(*, bio: str = INJECTION, subject_is_person: bool = False) -
 
 
 GOOD_ANALYSIS = """### Connections
-- Acme Holdings Ltd is supported by three independent sources [F1].
-- Jane Q Example is a related party at the probable level [F2].
-
-### Timeline
-- On 2021-03-04 Acme Holdings Ltd was incorporated [F1].
-
-### What is not established
-- The GitHub account is a lead only and its link to the subject is unconfirmed [F3].
-- The EU consolidated list was not screened, so a no-hit result is not clearance [S1].
-- Licensed databases and field work were not used [G1].
-
-### Suggested next steps (lawful)
-- Obtain the corporate registry extract to confirm the ownership chain [O1].
-- Verify any list match on the primary list [S1].
+- [F1,F2,O1] Jane Q Example is recorded as the owner of Acme Holdings Ltd at 60% according to companies_house.
+- [F3] The GitHub account @janex on GitHub rests on a single source and may be unrelated to the other findings.
 """
 
 
-def wrap(conn: str = "- Acme Holdings Ltd has three sources [F1].", tl: str = "No dated facts were supplied.",
-         ne: str = "- The EU list was not screened [S1].", ns: str = "- Obtain the corporate registry extract [O1].") -> str:
-    """A full analysis whose four sections can be swapped one at a time."""
-    return (f"### Connections\n{conn}\n\n### Timeline\n{tl}\n\n### What is not established\n{ne}\n\n"
-            f"### Suggested next steps (lawful)\n{ns}\n")
+def wrap(*bullets: str) -> str:
+    """A Connections-only answer made of ``bullets`` (each a full ``- [F1] text`` line)."""
+    return "### Connections\n" + "\n".join(bullets) + "\n"
 
 
 def outcome(text: Optional[str], *, provider: str = "gemini", model: str = "fake-model-1",

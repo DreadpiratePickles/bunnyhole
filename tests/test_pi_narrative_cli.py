@@ -91,7 +91,7 @@ def test_without_a_provider_key_the_report_is_unchanged_and_no_call_is_made(
 def test_failed_analysis_leaves_the_report_and_adds_the_note(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    bad = FakeLLM(outcome(GOOD_ANALYSIS.replace("[F1].", "[F9].", 1)))
+    bad = FakeLLM(outcome(GOOD_ANALYSIS.replace("[F1,F2,O1]", "[F9]", 1)))
     monkeypatch.setattr(pi_narrative, "complete_with_fallback", bad)
     out = tmp_path / "r.md"
     res = _run("trace", "acme.io", *PI_ARGS, "--pi-report", str(out))

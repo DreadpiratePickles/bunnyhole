@@ -1,22 +1,21 @@
-"""Evidence input of the PI report's AI analysis: one deterministic, minimal, id-tagged text block.
+"""Evidence input of the PI report's AI analysis: a minimal, id-tagged text block, plus structured gap data.
 
 The rule: send ONLY what the code-built report itself prints, in the same words and fields. Nothing is read from a
-receipt's ``extracted_fact`` or ``raw_snippet`` and nothing from node attributes or timeline titles, because the
-report does not print those and they carry third-party data (names, birth years, emails, display names). Each
-evidence line carries a stable id so the model can cite it and the validator can check the citation:
+receipt's ``extracted_fact`` or ``raw_snippet``, nor from node attributes or timeline items (no titles, no dates):
+the report does not print those and they carry third-party data. The model writes connection bullets only, so the
+prompt carries only what a connection needs:
 
 - ``F1..`` findings, in the report's own ranking (confirmed first), with the label the CODE computed, and for each
   its receipts as the *Chain of custody* table prints them (receipt id, tool, URL, SHA-256);
-- ``S1..`` sanctions screening (status, lists screened, lists NOT screened, possible hits);
-- ``W1..`` weak name matches that were set aside (name and URL, as the Sanctions section prints them);
-- ``G1..`` coverage and gaps (standing limits, source classes searched or not, identity notes, contradictions);
-- ``O1..`` ownership edges and where the walk stopped;
-- dated events: the date and the finding ids it belongs to, never the event's title.
+- ``O1..`` ownership edges as the *Ownership chain* table prints them.
 
-Not sent: the client name, matter reference, purpose text, receipt extracts, raw snippets, node attributes, event
-titles, unrelated records, API keys. Every value is collapsed to one line and stripped of control characters, so a
-hostile string cannot open a new evidence line or forge an id. ``NarrativeEvidence.values`` lists every data string
-that was sent, so a test can prove each one is printed by the report. Pure: no network, no model.
+Everything else (sanctions screening ``S``, set-aside matches ``W``, coverage and gaps ``G``, where the ownership walk
+stopped) is NOT in the prompt. It is kept as structured :class:`GapItem` records and rendered by code
+(``pi_narrative_sections``) in fixed wording. Not sent: the client name, matter reference, purpose text, receipt
+extracts, raw snippets, node attributes, timeline items, sanctions or coverage data, unrelated records, API keys.
+Every value is collapsed to one line and stripped of control characters, so a hostile string cannot open a new
+evidence line or forge an id. ``NarrativeEvidence.values`` lists every data string that was sent, so a test can prove
+each one is printed by the report. Pure: no network, no model.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from typing import Any, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Se
 
 from pydantic import ValidationError
 
-from bunnyhole.engine.pi import CoverageRow, PIBlock
+from bunnyhole.engine.pi import PIBlock
 from bunnyhole.engine.pi_graph_access import _is_external, _receipts
 from bunnyhole.engine.pi_narrative_lexicon import JURISDICTION_WORDS
 from bunnyhole.engine.pi_report_common import (
@@ -49,18 +48,24 @@ MAX_RECEIPTS_PER_FINDING = 3
 MAX_LIST_ENTRIES = 12
 MAX_ITEMS_PER_KIND = 8
 MAX_WEAK_MATCHES = 3  # the Sanctions section prints three, then "+N more"
-MAX_DATED_EVENTS = 15
 MAX_OWNERSHIP_EDGES = 15
 MAX_COVERAGE_ROWS = 12
 MAX_NOTES = 5
 _NAME_CHARS = 120
 _URL_CHARS = 200
 
-STANDING_LIMITS = (
-    "standing limits of this tool: free public passive sources only. NOT checked: licensed or paid investigator "
-    "databases, paid records, field work and interviews. Court dockets and registries were consulted only as the "
-    "coverage lines below say."
-)
+# Gap kinds: what a code-rendered "not established" line and its next step are keyed by.
+STANDING_LIMITS = "standing_limits"
+SANCTIONS_STATUS = "sanctions_status"
+SANCTIONS_POSSIBLE = "sanctions_possible"
+SET_ASIDE = "set_aside"
+NOT_SEARCHED = "not_searched"
+SEARCHED = "searched"
+IDENTITY_NOTE = "identity_note"
+CONTRADICTION = "contradiction"
+CHRONOLOGY_GAP = "chronology_gap"
+OWNERSHIP_WALK = "ownership_walk"
+LEAD_ONLY = "lead_only"
 
 
 class KeyEntry(NamedTuple):
@@ -70,16 +75,26 @@ class KeyEntry(NamedTuple):
     receipt_ids: Tuple[str, ...]
 
 
+class GapItem(NamedTuple):
+    """One thing the report does not establish, as structured data. ``names`` are printed-report strings."""
+
+    item_id: str
+    kind: str
+    label: str
+    names: Tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class NarrativeEvidence:
-    """The evidence text sent to the model plus everything the validator, the audit tests and the key need."""
+    """The evidence text sent to the model plus everything the validator, the audit tests and the report need."""
 
-    text: str
-    key: Mapping[str, KeyEntry]
+    text: str  # the prompt data block: case header, findings (F), ownership edges (O)
+    key: Mapping[str, KeyEntry]  # every id (F, O, S, W, G) -> description, for the citation key
     finding_labels: Mapping[str, str]  # F id -> confirmed | probable | lead, as computed by the code
-    lines: Mapping[str, str]  # id -> its evidence line(s), for the per-id checks of the validator
+    lines: Mapping[str, str]  # id -> its prompt line(s), for the per-id checks of the validator
+    model_ids: FrozenSet[str]  # the ids the model may cite: the F and O ids that are in the prompt
+    gaps: Tuple[GapItem, ...]  # structured gaps, rendered by code
     values: Tuple[str, ...]  # every data string sent; each must be printed by the report
-    date_values: Tuple[str, ...]  # event dates (the one thing sent that the report does not print)
     extra_words: FrozenSet[str]  # vocabulary the validator accepts that is not itself sent (jurisdiction words)
 
     @property
@@ -123,25 +138,32 @@ def _unique(items: Sequence[Any], limit: int, chars: int = 100) -> List[str]:
 
 
 class _Builder:
-    """Collects evidence lines, the key and the audit values, handing out ids per family in order."""
+    """Collects prompt lines, the key, the structured gaps and the audit values, handing out ids per family."""
 
     def __init__(self) -> None:
         self.lines: List[str] = []
         self.key: Dict[str, KeyEntry] = {}
         self.by_id: Dict[str, str] = {}
+        self.model_ids: List[str] = []
+        self.gaps: List[GapItem] = []
         self.values: List[str] = []
         self._counts: Dict[str, int] = {}
 
     def heading(self, title: str) -> None:
         self.lines += ["", f"-- {title} --"]
 
+    def _next(self, family: str) -> str:
+        self._counts[family] = self._counts.get(family, 0) + 1
+        return f"{family}{self._counts[family]}"
+
     def add(
         self, family: str, line: str, description: str, receipt_ids: Tuple[str, ...] = (), values: Sequence[str] = ()
     ) -> str:
-        self._counts[family] = self._counts.get(family, 0) + 1
-        item_id = f"{family}{self._counts[family]}"
+        """An id that is in the prompt (the model may cite it)."""
+        item_id = self._next(family)
         self.lines.append(f"[{item_id}] {line}")
         self.by_id[item_id] = line
+        self.model_ids.append(item_id)
         self.key[item_id] = KeyEntry(clean(description, 160), receipt_ids)
         self.values += [v for v in values if v]
         return item_id
@@ -154,6 +176,13 @@ class _Builder:
     def raw(self, line: str, values: Sequence[str] = ()) -> None:
         self.lines.append(line)
         self.values += [v for v in values if v]
+
+    def gap(self, family: str, kind: str, label: str, description: str, names: Sequence[str] = ()) -> str:
+        """An id that is NOT in the prompt: a structured gap that code renders."""
+        item_id = self._next(family)
+        self.key[item_id] = KeyEntry(clean(description, 160), ())
+        self.gaps.append(GapItem(item_id, kind, clean(label, 200), tuple(clean(n, 160) for n in names)))
+        return item_id
 
 
 def _node_index(result: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
@@ -172,9 +201,7 @@ def _name_of(node_id: str, index: Mapping[str, Mapping[str, Any]]) -> str:
     return clean(label, _NAME_CHARS)
 
 
-def _printed_receipts(
-    node: Mapping[str, Any], custody: Mapping[str, Any]
-) -> List[Any]:
+def _printed_receipts(node: Mapping[str, Any], custody: Mapping[str, Any]) -> List[Any]:
     """The node's external receipts that the Chain of custody table prints (its entry, not the receipt)."""
     seen: set = set()
     entries: List[Any] = []
@@ -188,11 +215,10 @@ def _printed_receipts(
 
 def _add_findings(
     builder: _Builder, shown: Sequence[Tuple[Any, Any]], index: Mapping[str, Mapping[str, Any]], block: PIBlock
-) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Findings as F ids. Returns (node id -> F id, F id -> label value)."""
-    builder.heading("FINDINGS (the label is computed by code; never change or upgrade it)")
+) -> Dict[str, str]:
+    """Findings as F ids. Returns F id -> label value."""
+    builder.heading("FINDINGS (the label is computed by code and rendered next to every citation)")
     custody = {entry.receipt_id: entry for entry in block.custody}
-    node_to_f: Dict[str, str] = {}
     labels: Dict[str, str] = {}
     for finding, label in shown:
         entries = _printed_receipts(index.get(finding.node_id, {}), custody)
@@ -207,100 +233,67 @@ def _add_findings(
             "F", line, f"{name} ({label.value}, {finding.source_count} source(s))", receipt_ids,
             values=(name, label.value, freshness, relevance),
         )
-        node_to_f[finding.node_id] = item_id
         labels[item_id] = label.value
+        if label.value == "lead":
+            builder.gaps.append(GapItem(item_id, LEAD_ONLY, name))
         for entry in entries:
             tool, url = clean(entry.tool, 40), clean(entry.url, _URL_CHARS)
-            digest = entry.sha256.lower() if re.fullmatch(r"[0-9a-fA-F]{64}", entry.sha256 or "") else ""
+            sha = entry.sha256.lower() if re.fullmatch(r"[0-9a-fA-F]{64}", entry.sha256 or "") else ""
             parts = [f"receipt {clean(entry.receipt_id, 40)}", f"tool={tool}", f"url={url}"]
-            if digest:
-                parts.append(f"sha256={digest}")
-            builder.extend(item_id, "    - " + " | ".join(parts), (clean(entry.receipt_id, 40), tool, url, digest))
-    return node_to_f, labels
+            if sha:
+                parts.append(f"sha256={sha}")
+            builder.extend(item_id, "    - " + " | ".join(parts), (clean(entry.receipt_id, 40), tool, url, sha))
+    return labels
 
 
-def _add_sanctions(builder: _Builder, block: PIBlock) -> None:
+def _record_sanctions(builder: _Builder, block: PIBlock) -> None:
+    """Sanctions facts as structured gaps (not in the prompt)."""
     sanctions = block.sanctions
-    builder.heading("SANCTIONS SCREENING")
-    screened = _unique([_unescaped(s) for s in _distinct(sanctions.screened)], MAX_LIST_ENTRIES) or ["none"]
     missed: List[str] = []
-    missed_values: List[str] = []
     for entry in _distinct(sanctions.not_screened)[:MAX_LIST_ENTRIES]:
         name, reason = (clean(_unescaped(part), 100) for part in _split_list_reason(entry))
         missed.append(f"{name}: {reason}")
-        missed_values += [name, reason]
-    builder.add(
-        "S",
-        f"status={sanctions.status} | lists screened: {'; '.join(screened)} | "
-        f"lists NOT screened or not reached: {'; '.join(missed) or 'none recorded'}",
-        "sanctions screening status and the lists screened or not screened",
-        values=[sanctions.status, *(s for s in screened if s != "none"), *missed_values],
+    screened = _unique([_unescaped(s) for s in _distinct(sanctions.screened)], MAX_LIST_ENTRIES)
+    builder.gap(
+        "S", SANCTIONS_STATUS, sanctions.status, "sanctions screening status and the lists screened or not",
+        [f"screened: {'; '.join(screened) or 'none'}", *missed],
     )
     for hit in _primary_hits(sanctions)[:MAX_ITEMS_PER_KIND]:
         name = clean(hit.get("name") or hit.get("match"), _NAME_CHARS)
-        listing, url = clean(hit.get("list"), 60), clean(hit.get("url"), _URL_CHARS)
-        builder.add(
-            "S",
-            f"possible list match, SOFT and unverified (verify on the primary list) | list={listing} | name={name}"
-            f" | url={url}",
-            f"possible sanctions-list match (soft): {name}", values=(listing, name, url),
-        )
+        builder.gap("S", SANCTIONS_POSSIBLE, name, f"possible sanctions-list match (soft): {name}", [name])
     for match in _graph_matches(sanctions)[:MAX_ITEMS_PER_KIND]:
         name = clean(match.get("name") or match.get("node_id"), _NAME_CHARS)
-        entry_name, listing = clean(match.get("matched_entry"), _NAME_CHARS), clean(match.get("list"), 60)
-        builder.add(
-            "S",
-            f"another graph entity's name matches a listed entry, SOFT and unverified | entity={name} | "
-            f"entry={entry_name} | list={listing}",
-            f"graph entity matches a sanctions-list entry (soft): {name}", values=(name, entry_name, listing),
-        )
-    weak = _weak_matches(sanctions)[:MAX_WEAK_MATCHES]
-    if weak:
-        builder.heading("SET-ASIDE NAME MATCHES (weak, NOT linked to the subject; not findings)")
-        for candidate in weak:
-            name, url = clean(candidate.get("name"), _NAME_CHARS), clean(candidate.get("url"), _URL_CHARS)
-            builder.add(
-                "W", f"weak name match, set aside and NOT linked | name={name} | url={url}",
-                f"weak name match set aside, not a finding: {name}", values=(name, url),
-            )
+        builder.gap("S", SANCTIONS_POSSIBLE, name, f"graph entity matches a sanctions-list entry (soft): {name}", [name])
+    for candidate in _weak_matches(sanctions)[:MAX_WEAK_MATCHES]:
+        name = clean(candidate.get("name"), _NAME_CHARS)
+        builder.gap("W", SET_ASIDE, name, f"weak name match set aside, not a finding: {name}", [name])
 
 
-def _coverage_line(row: CoverageRow) -> Tuple[str, List[str]]:
-    source_class = clean(row.source_class, 60)
-    if not _is_searched(row):
-        return f"source class {source_class}: NOT searched", [source_class]
-    ran = _unique(row.sources, 6, 40)
-    outcome = clean(row.outcome, 20) or "unknown"
-    text = f"source class {source_class}: searched, outcome={outcome}; sources that ran: {', '.join(ran) or 'none named'}"
-    values = [source_class, outcome, *ran]
-    if row.skipped:
-        skipped = _unique(row.skipped, 6, 40)
-        text += f"; tried but NOT reached: {', '.join(skipped)}"
-        values += skipped
-    return text, values
-
-
-def _add_gaps(builder: _Builder, block: PIBlock) -> None:
-    builder.heading("COVERAGE AND GAPS")
-    builder.add("G", STANDING_LIMITS, "standing limits of this tool (what was not checked)")
+def _record_coverage_and_gaps(builder: _Builder, block: PIBlock) -> None:
+    builder.gap("G", STANDING_LIMITS, "standing limits", "standing limits of this tool (what was not checked)")
     for row in block.coverage[:MAX_COVERAGE_ROWS]:
-        text, values = _coverage_line(row)
-        builder.add("G", text, text, values=values)
+        source_class = clean(row.source_class, 60)
+        if not _is_searched(row):
+            builder.gap("G", NOT_SEARCHED, source_class, f"source class {source_class}: not searched")
+        else:
+            outcome = clean(row.outcome, 20) or "unknown"
+            builder.gap("G", SEARCHED, source_class, f"source class {source_class}: searched, outcome {outcome}",
+                        [outcome])
     for note in _unique([_unescaped(n) for n in _distinct(block.identity_notes)], MAX_NOTES, 200):
-        builder.add("G", f"identity note: {note}", f"identity note: {note}", values=(note,))
+        builder.gap("G", IDENTITY_NOTE, note, f"identity note: {note}")
     for item in block.contradictions[:MAX_NOTES]:
-        kind, description = clean(item.kind, 40), clean(item.description, 200)
-        builder.add("G", f"contradiction ({kind}): {description}", f"contradiction ({kind}): {description}",
-                    values=(kind, description))
+        text = f"{clean(item.kind, 40)}: {clean(item.description, 200)}"
+        builder.gap("G", CONTRADICTION, text, f"contradiction ({text})")
     for gap in _unique([_unescaped(g) for g in _distinct(block.evidence_gaps)], MAX_NOTES, 200):
-        builder.add("G", f"chronology gap: {gap}", f"chronology gap: {gap}", values=(gap,))
+        builder.gap("G", CHRONOLOGY_GAP, gap, f"chronology gap: {gap}")
 
 
 def _add_ownership(builder: _Builder, block: PIBlock, index: Mapping[str, Mapping[str, Any]]) -> None:
     walk = block.ownership
     if not (walk.edges or walk.unresolved or walk.blocked_by_50_rule or walk.levels_walked):
         return
-    builder.heading("OWNERSHIP (legal ownership walked by the code; verify on the registry)")
+    if walk.edges:
+        builder.heading("OWNERSHIP EDGES (legal ownership walked by the code)")
     for edge in walk.edges[:MAX_OWNERSHIP_EDGES]:
         pct = f"{edge.pct:g}%" if edge.pct is not None else "unknown"
         child, parent = _name_of(edge.child, index), _name_of(edge.parent, index)
@@ -311,32 +304,8 @@ def _add_ownership(builder: _Builder, block: PIBlock, index: Mapping[str, Mappin
         )
     stops = _unique([_name_of(n, index) for n in walk.unresolved], MAX_NOTES)
     blocked = _unique([_name_of(n, index) for n in walk.blocked_by_50_rule], MAX_NOTES)
-    summary = f"ownership walk: levels walked={walk.levels_walked}"
-    summary += f" | stopped before a natural person at: {'; '.join(stops)}" if stops else ""
-    summary += f" | blocked by the 50% rule at: {'; '.join(blocked)}" if blocked else ""
-    builder.add("O", summary, "where the ownership walk stopped", values=[*stops, *blocked])
-
-
-def _add_dated_events(
-    builder: _Builder, result: Mapping[str, Any], node_to_f: Mapping[str, str]
-) -> List[str]:
-    """Event dates with the finding ids they belong to. Never the event's title or description."""
-    timeline = result.get("timeline")
-    events: List[Tuple[str, str]] = []
-    for item in timeline if isinstance(timeline, list) else []:
-        if not isinstance(item, Mapping):
-            continue
-        stamp = clean(item.get("timestamp"), 30)
-        cited = list(dict.fromkeys(node_to_f[str(n)] for n in item.get("node_ids") or [] if str(n) in node_to_f))
-        if re.fullmatch(r"\d{4}(?:-\d{2}(?:-\d{2})?)?[0-9T:.+\-Z]*", stamp) and cited:
-            events.append((stamp, ",".join(cited)))
-    if not events:
-        return []
-    builder.heading("DATED EVENTS (a date from the source; cite the finding ids on its line)")
-    shown = sorted(events)[:MAX_DATED_EVENTS]
-    for stamp, cite_ids in shown:
-        builder.raw(f"date={stamp} | cite={cite_ids}")
-    return [stamp for stamp, _ids in shown]
+    builder.gap("O", OWNERSHIP_WALK, str(walk.levels_walked), "where the ownership walk stopped",
+                [*stops, *(f"blocked: {b}" for b in blocked)])
 
 
 def _jurisdiction_words(jurisdiction: str) -> FrozenSet[str]:
@@ -344,7 +313,7 @@ def _jurisdiction_words(jurisdiction: str) -> FrozenSet[str]:
 
 
 def build_evidence(result: Mapping[str, Any]) -> Optional[NarrativeEvidence]:
-    """The evidence block for ``result``, or ``None`` when there is no valid PI block or no relevant finding.
+    """The evidence for ``result``, or ``None`` when there is no valid PI block or no relevant finding.
 
     The finding population is the report's own Findings table: records about the subject (relevance ``subject`` or
     ``related``), ranked confirmed first, at most :data:`MAX_FINDINGS`. With none of those there is nothing to connect,
@@ -371,17 +340,17 @@ def build_evidence(result: Mapping[str, Any]) -> Optional[NarrativeEvidence]:
     if engagement.jurisdiction:
         jurisdiction = clean(engagement.jurisdiction, 40)
         builder.raw(f"JURISDICTION: {jurisdiction}", (jurisdiction,))
-    node_to_f, labels = _add_findings(builder, shown, index, block)
-    _add_sanctions(builder, block)
-    _add_gaps(builder, block)
+    labels = _add_findings(builder, shown, index, block)
     _add_ownership(builder, block, index)
-    dates = _add_dated_events(builder, data, node_to_f)
+    _record_sanctions(builder, block)
+    _record_coverage_and_gaps(builder, block)
     return NarrativeEvidence(
         text="\n".join(builder.lines).strip("\n"),
         key=dict(builder.key),
         finding_labels=labels,
         lines=dict(builder.by_id),
+        model_ids=frozenset(builder.model_ids),
+        gaps=tuple(builder.gaps),
         values=tuple(builder.values),
-        date_values=tuple(dates),
         extra_words=_jurisdiction_words(engagement.jurisdiction),
     )
