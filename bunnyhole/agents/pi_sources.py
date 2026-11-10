@@ -20,7 +20,7 @@ import re
 import time
 import xml.etree.ElementTree as ET  # noqa: F401  (re-exported: tests patch ``pi_sources.ET``)
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -105,6 +105,7 @@ from bunnyhole.engine.models import (
     SelectorStrength,
 )
 from bunnyhole.engine.netutil import new_async_client
+from bunnyhole.engine.pi_anchoring import judge_listing
 
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 
@@ -206,6 +207,26 @@ class PISourcesAgent(_ReferenceRecordsMixin):
         if not isinstance(data, dict):
             raise _SourceSkip("unexpected response shape (expected a JSON object)")
         return data
+
+    def _set_aside_weak_listing(
+        self, label: str, names: Sequence[str], list_label: str, receipt: EvidenceReceipt
+    ) -> bool:
+        """PI person subject: True (after recording the candidate) when a list entry is only a weak name match.
+
+        The entry needs the subject's surname and a compatible full name to become a node and an edge; a match on
+        given-name tokens only, or a different spelling, is reported as "weak name match, not linked" and never
+        feeds a path, broker or predicted link. Without a PI person subject this is always False.
+        """
+        subject = self.graph.pi_subject
+        if subject is None:
+            return False
+        verdict = judge_listing(subject, names, list_name=list_label)
+        if verdict.attach:
+            return False
+        self.graph.set_aside_candidate(
+            DomainCategory.FIAT, "listing", f"{label} ({list_label})", receipt.tool, receipt.source_url, verdict, [receipt]
+        )
+        return True
 
     def _link_to_origin(
         self,
@@ -370,6 +391,8 @@ class PISourcesAgent(_ReferenceRecordsMixin):
                 f"aliases={rec['aliases'][:4]} | dob_or_build={rec['dob_or_build']} | imo={rec['imo']}"
             ),
         )
+        if self._set_aside_weak_listing(rec["name"], [rec["name"], *rec["aliases"]], "Canada SEMA", receipt):
+            return
         self.graph.upsert_node(
             GraphNode(
                 id=node_id,
@@ -477,6 +500,8 @@ class PISourcesAgent(_ReferenceRecordsMixin):
                 f"aliases={aliases[:4]} | {spec.program_label}={programs}" + (f" | {rec.extra}" if rec.extra else "")
             ),
         )
+        if self._set_aside_weak_listing(primary, [primary, *aliases], spec.label, receipt):
+            return
         self.graph.upsert_node(
             GraphNode(
                 id=node_id,

@@ -40,6 +40,7 @@ from bunnyhole.engine.netutil import (
     new_async_client,
     normalize_domain_lead,
 )
+from bunnyhole.engine.pi_anchoring import AccountFacts, SubjectAnchors, judge_account
 
 
 async def _communicate(proc: "asyncio.subprocess.Process", timeout: float) -> bytes:
@@ -695,10 +696,29 @@ class OSINTAgent:
 
         # 3. Local CLI Arsenal Username Sweep (Sherlock / Maigret in DEEP gear)
         if self.gear == GearMode.DEEP:
-            await self._run_local_arsenal_username_tools(clean_handle, origin_node_id, hop_depth)
+            if self._name_pivot_subject(clean_handle) is None:
+                await self._run_local_arsenal_username_tools(clean_handle, origin_node_id, hop_depth)
+            else:  # PI person subject: a CLI sweep gives no profile facts to judge a handle guessed from a name
+                self.graph.log(
+                    DomainCategory.OSINT,
+                    "NAME_PIVOT_ARSENAL_NOTE",
+                    clean_handle,
+                    f"Local username sweep not run for '@{clean_handle}': the handle was guessed from a name, and a "
+                    "name alone is not an anchor",
+                )
 
         # 4. HudsonRock Cavalier Infostealer Username Check
         await self.investigate_hudsonrock_infostealer(clean_handle, "username", origin_node_id, hop_depth)
+
+    def _name_pivot_subject(self, handle: str) -> Optional[SubjectAnchors]:
+        """The person subject's anchors when ``handle`` is a guess from a name (PI person subject only), else None.
+
+        None means "do not gate": outside a PI person run, or the investigator supplied this very handle.
+        """
+        subject = self.graph.pi_subject
+        if subject is None or subject.is_explicit_username(handle):
+            return None
+        return subject
 
     async def _lookup_keybase_proofs(self, handle: str, origin_node_id: str, hop_depth: int) -> None:
         """Query Keybase API for cryptographically signed cross-platform identity proofs."""
@@ -733,6 +753,29 @@ class OSINTAgent:
                     raw_snippet=f"full_name={full_name} | location={location} | bio={bio[:100]} | proofs={proof_list}",
                 )
                 kb_id = f"account:keybase:{handle.lower()}"
+                anchors: Tuple[str, ...] = ()
+                subject = self._name_pivot_subject(handle)
+                if subject is not None:  # two-anchor rule: the full name AND a shared domain/email/username/company
+                    web_types = ("dns", "generic_web_site")
+                    verdict = judge_account(
+                        subject,
+                        AccountFacts(
+                            platform="Keybase",
+                            handle=handle,
+                            display_name=full_name,
+                            websites=tuple(str(p.get("nametag") or "") for p in proofs if p.get("proof_type") in web_types),
+                            linked_handles=tuple(
+                                str(p.get("nametag") or "") for p in proofs if p.get("proof_type") not in web_types
+                            ),
+                        ),
+                    )
+                    if not verdict.attach:
+                        self.graph.set_aside_candidate(
+                            DomainCategory.OSINT, "account", f"Keybase @{handle} ({full_name or 'no name'})",
+                            rcpt.tool, kb_url, verdict, [rcpt],
+                        )
+                        return
+                    anchors = verdict.anchors
                 self.graph.upsert_node(
                     GraphNode(
                         id=kb_id,
@@ -756,7 +799,8 @@ class OSINTAgent:
                             domain=DomainCategory.OSINT,
                             admiralty_code="A1",
                             confidence=0.98,
-                            summary=f"Keybase Signed Proofs ({len(proofs)})",
+                            summary=f"Keybase Signed Proofs ({len(proofs)})"
+                            + (f"; full name + {', '.join(anchors)}" if anchors else ""),
                             receipts=[rcpt],
                         )
                     )
@@ -855,6 +899,28 @@ class OSINTAgent:
                     ),
                     raw_snippet=f"id={gh_uid} | name={name} | blog={blog} | emails={list(leaked_emails)} | PoL={pol_summary}",
                 )
+                anchors: Tuple[str, ...] = ()
+                subject = self._name_pivot_subject(handle)
+                if subject is not None:  # two-anchor rule: the full name AND a shared domain/email/username/company
+                    verdict = judge_account(
+                        subject,
+                        AccountFacts(
+                            platform="GitHub",
+                            handle=handle,
+                            display_name=name,
+                            company=company,
+                            websites=(blog,) if blog else (),
+                            emails=tuple(sorted(leaked_emails)),
+                            linked_handles=(twitter,) if twitter else (),
+                        ),
+                    )
+                    if not verdict.attach:
+                        self.graph.set_aside_candidate(
+                            DomainCategory.OSINT, "account", f"GitHub @{handle} ({name or f'UID {gh_uid}'})",
+                            rcpt.tool, f"https://github.com/{handle}", verdict, [rcpt],
+                        )
+                        return
+                    anchors = verdict.anchors
                 self.graph.upsert_node(
                     GraphNode(
                         id=gh_id,
@@ -888,7 +954,7 @@ class OSINTAgent:
                             domain=DomainCategory.OSINT,
                             admiralty_code="A1",
                             confidence=0.95,
-                            summary=f"GitHub UID {gh_uid}",
+                            summary=f"GitHub UID {gh_uid}" + (f"; full name + {', '.join(anchors)}" if anchors else ""),
                             receipts=[rcpt],
                         )
                     )

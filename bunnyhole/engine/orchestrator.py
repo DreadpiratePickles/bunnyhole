@@ -30,11 +30,13 @@ from bunnyhole.engine.models import (
     RelationType,
     SelectorStrength,
 )
-from bunnyhole.engine.pi import PIEngagement
+from bunnyhole.engine.pi import PIEngagement, looks_like_natural_person_name
+from bunnyhole.engine.pi_anchoring import SubjectAnchors
 from bunnyhole.engine.pi_runtime import (
     BREACH_SKIP_REASON,
     CREDENTIAL_SKIP_REASON,
     PIRunRecorder,
+    analytics_exclusions,
     assemble_pi_block,
     make_breach_blocker,
     make_holehe_blocker,
@@ -356,14 +358,45 @@ class BunnyholeOrchestrator:
             return
         self._pi_conflict_checked = True
         self._pi_selectors = selectors_from_seeds(seed_tuples, self.engagement.subject_is_person)
+        if self.engagement.subject_is_person:  # the two-anchor rule for name-derived pivots (pi_anchoring.py)
+            self.graph.pi_subject = SubjectAnchors.from_selectors(self._pi_selectors)
         values = [self.seed_query] + [v for lt, v in seed_tuples if lt not in ("credential", "document")]
         self._pi_prior_cases = run_conflict_check(self.case_store, values, self.graph.case_id, self.pi_recorder)
+
+    def _pi_refresh_analytics_exclusions(self) -> None:
+        """PI mode: tell the graph which nodes the paths, brokers and predicted-link tables must not run through.
+
+        Uses the relevance scorer the PI report already uses (``pi_relevance``); see ``analytics_exclusions``.
+        Safe to repeat: it recomputes from the current graph.
+        """
+        if self.engagement is None:
+            return
+        self.graph.analytics_excluded_ids = analytics_exclusions(
+            [n.model_dump() for n in self.graph.nodes.values()],
+            [e.model_dump() for e in self.graph.edges.values()],
+            self._pi_ownership_links,
+            self._pi_selectors,
+            self.seed_query,
+            subject_is_person=self.engagement.subject_is_person,
+        )
 
     def _create_seed_node(self, seed_str: str, hop_depth: int = 0, forced_type: Optional[str] = None) -> Tuple[str, GraphNode]:
         lead_type, ent_type, dom_cat = classify_seed_type(seed_str)
         if forced_type:
             lead_type = forced_type
         clean_val = seed_str.strip()
+        # A free-text name classifies as a company (that lead type keeps routing the name to the registry, sanctions
+        # and news sources). Under a PI engagement whose subject is a person, a person-shaped name is a Person node:
+        # an Organization seed would also make the identity notes and relevance scorer treat the subject as a company.
+        node_kind = lead_type
+        if (
+            lead_type == "company"
+            and ent_type == EntityType.ORGANIZATION
+            and self.engagement is not None
+            and self.engagement.subject_is_person
+            and looks_like_natural_person_name(clean_val)
+        ):
+            ent_type, node_kind = EntityType.PERSON, "person"
         if lead_type == "domain":
             clean_val = clean_val.replace("https://", "").replace("http://", "").split("/")[0].lower()
         if lead_type == "credential" and ":" in clean_val:
@@ -381,15 +414,15 @@ class BunnyholeOrchestrator:
             # the one id the on-chain agent also uses for this wallet (engine/ids.py), so its findings land here
             node_id = canonical_wallet_id("btc" if lead_type == "bitcoin" else "eth", clean_val)
         else:
-            node_id = f"{lead_type}:{masked_lbl.lower().replace(' ', '_')[:48]}"
+            node_id = f"{node_kind}:{masked_lbl.lower().replace(' ', '_')[:48]}"
         rcpt = EvidenceReceipt(
             tool="bunnyhole_case_director",
             domain=dom_cat,
             admiralty_code="A1",
             selector_strength=SelectorStrength.STRONG,
             source_url=f"seed://{masked_lbl}",
-            extracted_fact=f"Initial investigative anchor '{masked_lbl}' classified as {lead_type.upper()} ({ent_type.value})",
-            raw_snippet=f"seed={masked_lbl} | classified_type={lead_type}",
+            extracted_fact=f"Initial investigative anchor '{masked_lbl}' classified as {node_kind.upper()} ({ent_type.value})",
+            raw_snippet=f"seed={masked_lbl} | classified_type={node_kind}",
         )
         node = self.graph.upsert_node(
             GraphNode(
@@ -400,7 +433,7 @@ class BunnyholeOrchestrator:
                 selector_strength=SelectorStrength.STRONG,
                 smoke_score=50.0,
                 risk_flags=["PRIMARY_INVESTIGATION_ANCHOR"] if hop_depth == 0 else ["SECONDARY_ANCHOR"],
-                attributes={"raw_seed": masked_lbl, "seed_type": lead_type},
+                attributes={"raw_seed": masked_lbl, "seed_type": node_kind},
                 receipts=[rcpt],
                 hop_depth=hop_depth,
             )
@@ -833,6 +866,7 @@ class BunnyholeOrchestrator:
                 stage_errors["cross_case"], level="warning",
             )
 
+        self._pi_refresh_analytics_exclusions()
         interconnections = self.link_sleuth.analyze_interconnected_web()
         if source_query and target_query:
             interconnections["targeted_paths"] = self.link_sleuth.find_interconnection_paths(source_query, target_query)
@@ -885,6 +919,7 @@ class BunnyholeOrchestrator:
         source_query: Optional[str] = None,
         target_query: Optional[str] = None,
     ) -> Dict[str, Any]:
+        self._pi_refresh_analytics_exclusions()
         base = self.graph.to_dict()
         interconnections = self.link_sleuth.analyze_interconnected_web()
         if source_query and target_query:
@@ -915,6 +950,9 @@ class BunnyholeOrchestrator:
         base["analyst_framing"] = self.profile.analyst_framing()
         base["watchlist_hits"] = match_watchlist(base.get("nodes", []), self.profile.watchlist)
         if self.engagement is not None and self.pi_recorder is not None:
+            # Nodes the analytics tables left out (unanchored name-only records, platform accounts): the JSON keeps
+            # them, and the CLI tables use this list to skip them.
+            base["set_aside_node_ids"] = sorted(self.graph.analytics_excluded_ids)
             base["pi"] = assemble_pi_block(
                 self.engagement,
                 base,

@@ -149,8 +149,11 @@ def _render_investigation_results(result: dict) -> None:
     nodes_table.add_column("Centrality", justify="right", style="yellow")
     nodes_table.add_column("Flags", style="dim")
 
+    # PI run: nodes the identity rules set aside (name-only records, platform accounts) stay in the JSON but are
+    # not ranked here, so the summary does not contradict the report's "never link on a name alone" rule.
+    set_aside_ids = set(result.get("set_aside_node_ids") or [])
     nodes = sorted(
-        result.get("nodes", []),
+        (n for n in result.get("nodes", []) if n.get("id") not in set_aside_ids),
         key=lambda x: (x.get("is_cutout_broker", False), x.get("smoke_score", 0)),
         reverse=True,
     )
@@ -166,6 +169,12 @@ def _render_investigation_results(result: dict) -> None:
             flags_str[:48],
         )
     console.print(nodes_table)
+    weak = result.get("set_aside_candidates") or []
+    if weak or set_aside_ids:
+        console.print(
+            f"[dim]Set aside, not linked (weak name matches, see the JSON result): {len(weak)} candidate(s), "
+            f"{len(set_aside_ids)} unanchored record(s).[/dim]"
+        )
 
     # 2. Link Sleuth: Cross-Domain Paths & Adamic-Adar Predicted Missing Links
     paths = inter.get("targeted_paths") or inter.get("cross_domain_paths", [])
