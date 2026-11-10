@@ -347,7 +347,7 @@ model and provider.
   validator uses.
 - **Validated before it is written.** Allowlists first: the length cap runs before anything else; only ASCII letters, accented Latin
   letters, ASCII digits, the space and `. , ; : ' " ( ) - / & % @ _` are allowed (no invisible, bidi or format characters, no other
-  scripts, no look-alikes, no markup characters); exactly the heading and tagged bullets (or the single line `None.`); every
+  scripts, no fullwidth forms, no markup characters; see the known defects below for the look-alikes this does NOT stop); exactly the heading and tagged bullets (or the single line `None.`); every
   digit-bearing token, number word, month, hex string, IPv4 or IPv6 address, URL, email, domain, `@handle` and capitalised word
   (including the first word of a sentence; only closed-class function words are exempt) must occur in the evidence the model was shown,
   and a run of evidence words must appear in the evidence's order; a cheap English gate. Word screens are the second layer and have no
@@ -356,6 +356,17 @@ model and provider.
   cited evidence does not contain, advice, methods and instructions. A failed check gets one retry with fixed-wording reasons (never
   the model's own text); after that the section is left out and the report ends with one line, `AI analysis not included: <reason>`.
   `None.` means the model found no connections: the same note, no retry.
+- **Known defects at merge (found by independent review, not yet fixed).** (1) Unicode ligatures (for example the single character
+  for "fi") and small-capital letters are allowed by the character list but are not normalised before the word screens, so they
+  can spell a screened word (confirmed, verified, flagged, sanctions) past the check; the code-built label beside each tag is
+  still correct. (2) Words split by punctuation (`sanc/tions`, `s.a.n.c.t.i.o.n.s`) pass the word screens. (3) Unhedged identity
+  or ownership statements ("is the owner of", "is Jane's") and prose that contradicts the code label ("corroborated") are not
+  reliably caught. (4) The code-built "What is not established" and "Suggested next steps" sections are capped at 24 lines and drop
+  the rest silently, so with many findings the sanctions "not clearance" line and the standing limits can be cut from those two
+  sections (the Bottom line and the footer still carry "not clearance"). (5) The rules file does not name every rejected word, so
+  a rejected answer can cost a retry that does not fix itself. Until these are fixed, treat the AI section as an unverified
+  reading aid and run with `--no-ai-analysis` where a report will be relied on. Partial fixes sit, untested and unmerged, on the
+  local branch `wip/ai-analysis-round3-partial`.
 - **What remains unenforced (limits of a token and word screen, not understanding).** A fluent bullet that cites the wrong finding,
   misreads what a record means, or is defamatory without using a screened word passes; so does a real evidence date or name attached
   to the wrong thing. Invented facts and relations written in lowercase words around evidence names ("her son", "a cash business"),

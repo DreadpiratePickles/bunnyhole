@@ -10,8 +10,8 @@ oversized text), then the character allowlist, then the layout, then one pass ov
 What is enforced, allowlists first:
 
 - characters: ASCII letters, accented Latin letters, ASCII digits, the ASCII space and ``. , ; : ' " ( ) - / & % @ _``
-  only; square brackets only in the leading tag. Invisible, bidi and format characters, other scripts, look-alike and
-  fullwidth forms, backticks, ``#`` ``>`` ``*`` ``|`` ``<`` ``~`` and tabs are refused (typographic quotes and dashes
+  only; square brackets only in the leading tag. Invisible, bidi and format characters, other scripts, fullwidth
+  forms (NOT ligatures or small capitals: a known gap, see docs/PI_STREAM.md), backticks, ``#`` ``>`` ``*`` ``|`` ``<`` ``~`` and tabs are refused (typographic quotes and dashes
   are first turned into ASCII);
 - layout: the heading line, then bullets only (or the single line ``None.``); at most 6 bullets of at most 400
   characters and two sentences; each bullet starts with a tag of 1 to 4 ids, all of kind F or O that were in the
