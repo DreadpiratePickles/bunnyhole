@@ -1,25 +1,31 @@
 """Deterministic validator of the AI analysis. A pure function: it decides, the model does not.
 
 ``validate_analysis`` checks the model's text against the evidence it was given and the output contract in
-``pi_report_rules.md``. Any violation means the text is not written to the report. What it checks:
+``pi_report_rules.md``. Any violation means the text is not written to the report. Order of work: the length cap
+first (nothing else runs on an oversized text), then the character screen, then layout, then one pass over sentences.
 
-- layout: exactly the four sections, in order, nothing before the first (``structure``); a length cap (``too_long``);
-- markup: no links, images, HTML, code, square brackets that are not citations, or words that mix Latin with
-  Cyrillic or Greek letters (``markup``); the language screens read the text NFKC-normalised without zero-width
-  characters;
-- citations: every sentence ends with tags such as ``[F3]`` / ``[F2,F5]`` (``uncited``) and every id was supplied
-  (``unknown_id``);
-- invented specifics: a URL, domain, email, phone number, hash, receipt id, ISO date, year or capitalised name that
-  does not occur in the evidence (``invented``);
-- forbidden methods: pretext, hacking, impersonation and similar words, even when negated (``forbidden_method``);
-- labels: ``confirmed`` / ``probable`` wording must match the label of every cited finding; ``cleared``, ``no risk``
-  and similar are rejected (``label_upgrade``, ``clearance``).
+Structural rules (allowlists) come first, blocklists are the second layer:
 
-Limits, stated honestly (a keyword and token screen, not understanding): a fluent sentence can still be wrong about a
-cited record; a name written in lowercase, a sentence-initial name followed by a lowercase word, a number that is not
-a year, phone or date, and a paraphrase of a forbidden method are not caught; the capitalised-name check
-compares tokens with the evidence, so a real name the evidence also contains can be attached to the wrong record. The
-checks are deliberately conservative: a false rejection costs one retry, a false acceptance costs credibility.
+- layout: exactly the four sections, in order, nothing before the first; no invisible, bidi or control characters;
+  no links, images, HTML, code or square brackets that are not citations;
+- citations: every sentence ends in tags such as ``[F3]`` / ``[F2,F5]`` and every id was supplied;
+- specifics: every digit-bearing token, month name, URL, email, hash, receipt id, non-Latin word and capitalised
+  word (names, acronyms, the first word of a sentence unless it is an allow-listed starter) must occur in the
+  evidence, or be on a short allowlist of legal frames and generic institutional words;
+- Timeline: each bullet carries a date from the evidence; next steps: each sentence starts with an allow-listed lawful
+  verb, and a verb that reaches a person needs an honest-identification phrase;
+- labels: wording may not exceed the label of any cited finding; a sentence citing a lead must hedge; a set-aside
+  weak match must read as set aside and never as the subject;
+- sanctions: a sentence about sanctions may restate the evidence but may not conclude clearance, risk level,
+  compliance or safety, and absence-of-hit wording needs a same-sentence not-screened or not-clearance qualifier;
+- second layer (keyword screens, run on every sentence, negated mentions rejected too): forbidden or deceptive
+  methods, accusation words that the cited evidence does not itself contain.
+
+Limits, stated honestly: this is a token and keyword screen, not understanding. It cannot tell that a fluent, correctly
+cited sentence misreads a record, or that a cited statement is defamatory in context. A lowercase or uncased invented
+name ("robert smith"), a spelled-out number ("five") and a paraphrase of a forbidden method pass. The capitalised-name
+check compares tokens, so a real name in the evidence can be attached to the wrong record. Rejecting a sentence that
+only says "do not hack" is deliberate. A false rejection costs one retry; a false acceptance costs credibility.
 """
 
 from __future__ import annotations
@@ -27,8 +33,27 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
+from bunnyhole.engine.pi_narrative_checks import (
+    ACCUSATION,
+    CLEARANCE,
+    FORBIDDEN,
+    INVENTED,
+    LABEL,
+    NEXT_STEP,
+    TIMELINE,
+    EvidenceIndex,
+    accusation,
+    build_index,
+    clearance,
+    forbidden_method,
+    has_dated_token,
+    invented_specifics,
+    label_violation,
+    next_step_problem,
+    screen_text,
+)
 from bunnyhole.engine.pi_narrative_input import NarrativeEvidence
 
 SECTION_HEADINGS: Tuple[str, ...] = (
@@ -37,52 +62,91 @@ SECTION_HEADINGS: Tuple[str, ...] = (
     "What is not established",
     "Suggested next steps (lawful)",
 )
+TIMELINE_SECTION = SECTION_HEADINGS[1]
+NEXT_STEPS_SECTION = SECTION_HEADINGS[3]
 #: The only sentences allowed without a citation (an empty section).
 EXEMPT_SENTENCES: FrozenSet[str] = frozenset({"None.", "No dated facts were supplied."})
 MAX_CHARS = 8000
+_MAX_VIOLATIONS = 40
 
+#: Note-level reasons (fixed wording; never quotes model text).
 REASON_TEXT: Dict[str, str] = {
     "structure": "the sections were not exactly the four required, in order",
     "too_long": "it was too long",
+    "invisible": "it contained invisible or control characters",
     "markup": "it used disallowed markup or square brackets that are not citations",
     "unknown_id": "a citation used an id that was not supplied",
     "uncited": "a sentence did not end with a citation",
-    "invented": "it named a URL, email, number, date, hash or name that is not in the evidence",
-    "forbidden_method": "it mentioned an unlawful or deceptive method",
-    "label_upgrade": "it described a finding more strongly than its label allows",
-    "clearance": "it used clearance wording",
+    INVENTED: "it named a URL, email, number, date, hash, name or word that is not in the evidence",
+    FORBIDDEN: "it mentioned an unlawful or deceptive method or a contact without honest identification",
+    ACCUSATION: "it used an accusation word the evidence does not contain",
+    CLEARANCE: "it used clearance, risk-level or safety wording about sanctions",
+    LABEL: "it described a finding more strongly than its label allows",
+    TIMELINE: "a Timeline bullet had no date from the evidence",
+    NEXT_STEP: "a next step did not start with an allowed lawful verb",
+    "no_content": "the model produced no analysis",
 }
+#: Per-sentence feedback for the retry prompt (fixed wording; ``{n}`` is the sentence number).
+_FEEDBACK: Dict[str, str] = {
+    "uncited": "sentence {n} has no citation",
+    INVENTED: "sentence {n} names a URL, email, number, date, hash, name or word that is not in the evidence",
+    FORBIDDEN: "sentence {n} names an unlawful or deceptive method, or contacts a person without honest identification",
+    ACCUSATION: "sentence {n} uses an accusation word that the evidence does not contain",
+    CLEARANCE: "sentence {n} uses clearance, risk-level or safety wording, or states an absence of hits without a qualifier",
+    LABEL: "sentence {n} says more than the label allows, or states a lead or set-aside match without a hedge",
+    TIMELINE: "sentence {n} has no date that is in the evidence",
+    NEXT_STEP: "sentence {n} does not start with an allowed lawful verb",
+    "markup": "sentence {n} uses disallowed markup or brackets",
+}
+_UNSAFE_ID_TEXT = "an unknown citation id"
 
 
 @dataclass(frozen=True)
 class Violation:
-    """One failed check. ``detail`` is a short quote of the offending fragment (for the retry prompt only)."""
+    """One failed check. ``detail`` is for logs and tests only: it is never put into a prompt, note or report."""
 
     code: str
-    detail: str
+    detail: str = ""
+    sentence: int = 0
 
 
 def reasons(violations: Sequence[Violation]) -> List[str]:
-    """The distinct human reasons for ``violations``, in first-seen order. Never quotes model text."""
+    """The distinct note-level reasons for ``violations``, in first-seen order. Never quotes model text."""
     return list(dict.fromkeys(REASON_TEXT[v.code] for v in violations))
 
 
-def _clip(text: str, limit: int = 60) -> str:
-    one_line = re.sub(r"\s+", " ", text).strip()
+def feedback_lines(violations: Sequence[Violation]) -> List[str]:
+    """Fixed-wording, per-sentence lines for the retry prompt. Only ids of the shape ``F9`` are ever echoed."""
+    lines: List[str] = []
+    for v in violations:
+        if v.code == "unknown_id":
+            text = f"unknown id {v.detail}" if re.fullmatch(r"[A-Za-z]\d{1,6}", v.detail) else _UNSAFE_ID_TEXT
+        elif v.code in _FEEDBACK and v.sentence:
+            text = _FEEDBACK[v.code].format(n=v.sentence)
+        else:
+            text = REASON_TEXT[v.code]
+        if text not in lines:
+            lines.append(text)
+    return lines
+
+
+def _clip(text: str, limit: int = 40) -> str:
+    one_line = " ".join(text.split())
     return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
 
 
 # --------------------------------------------------------------------------------------- parsing
 
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*(.*?)\s*#*\s*$")
-_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d{1,2}[.)])\s+")
-_TAG_SHAPE = r"\[\s*[A-Za-z]\d+(?:\s*,\s*[A-Za-z]\d+)*\s*\]"
-_TAG_RE = re.compile(_TAG_SHAPE)
-_ENDS_WITH_TAG_RE = re.compile(_TAG_SHAPE + r"[\s.!?]*$")
-_BRACKET_RE = re.compile(r"\[[^\[\]]*\]")
-_BOUNDARY_RE = re.compile(r"[.!?]+(?:\s*\[[^\[\]]*\])*(?=\s+[A-Z0-9\[(\"'“]|\s*$)")
+_TAG_RE = re.compile(r"\[\s*[A-Za-z]\d+(?:\s*,\s*[A-Za-z]\d+)*\s*\]")
+_BRACKET_RE = re.compile(r"\[[^\[\]]*+\]")
+_BULLET_RE = re.compile(r"^\s*+(?:[-*•]|\d{1,2}[.)])\s++")
+_BOUNDARY_RE = re.compile(
+    r"(?<![.!?])[.!?]++(?:\s*+\[[^\[\]]*+\])*+(?=\s++[A-Z0-9\[(\"'“]|\s*+$)"
+)
 _ABBREVIATIONS = frozenset({"ltd", "inc", "corp", "co", "llc", "plc", "gmbh", "mr", "mrs", "ms", "dr", "vs", "no",
                             "st", "jr", "sr", "etc", "approx", "ref", "cf"})
+_ALLOWED_CONTROL = frozenset({"\n", "\r", "\t"})
+_BAD_CATEGORIES = frozenset({"Cf", "Cc", "Co", "Cs", "Cn", "Zl", "Zp"})
 
 
 def cited_ids(text: str) -> List[str]:
@@ -93,12 +157,19 @@ def cited_ids(text: str) -> List[str]:
     return ids
 
 
+def _has_invisible(text: str) -> bool:
+    return any(ch not in _ALLOWED_CONTROL and unicodedata.category(ch) in _BAD_CATEGORIES for ch in text)
+
+
+def _heading(line: str) -> Optional[str]:
+    if not line.lstrip(" ").startswith("#") or len(line) - len(line.lstrip(" ")) > 3:
+        return None
+    return line.strip().lstrip("#").strip().rstrip("#").strip()
+
+
 def _section_title(raw: str) -> Optional[str]:
     cleaned = raw.strip().rstrip(":").strip()
-    for title in SECTION_HEADINGS:
-        if cleaned.lower() == title.lower():
-            return title
-    return None
+    return next((title for title in SECTION_HEADINGS if cleaned.lower() == title.lower()), None)
 
 
 def _parse(text: str) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
@@ -106,10 +177,9 @@ def _parse(text: str) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]
     preamble: List[str] = []
     sections: List[Tuple[str, List[str]]] = []
     headings: List[str] = []
-    for line in text.splitlines():
-        match = _HEADING_RE.match(line)
-        if match:
-            raw = match.group(1)
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        raw = _heading(line)
+        if raw is not None:
             headings.append(raw)
             sections.append((_section_title(raw) or raw, []))
         elif sections:
@@ -120,14 +190,15 @@ def _parse(text: str) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]
 
 
 def split_sentences(line: str) -> List[str]:
-    """Sentences of one line. A full stop after a legal-form abbreviation (``Ltd.``) is not a boundary."""
+    """Sentences of one line. A full stop after a legal-form abbreviation or an initial is not a boundary."""
     sentences: List[str] = []
     start = 0
+    stripped_end = len(line.rstrip())
     for match in _BOUNDARY_RE.finditer(line):
-        before = re.search(r"([A-Za-z]+)$", line[start:match.start()])
+        before = re.search(r"([A-Za-z]++)$", line[max(0, start):match.start()])
         single_dot = line[match.start():match.start() + 1] == "." and not match.group(0).startswith("..")
         abbreviated = before is not None and (before.group(1).lower() in _ABBREVIATIONS or len(before.group(1)) == 1)
-        if abbreviated and single_dot and match.end() < len(line.rstrip()):
+        if abbreviated and single_dot and match.end() < stripped_end:
             continue
         sentences.append(line[start:match.end()].strip())
         start = match.end()
@@ -146,6 +217,17 @@ def _sentences_of(body: Sequence[str]) -> List[str]:
     return out
 
 
+def _is_exempt(sentence: str) -> bool:
+    return sentence.rstrip(" ") in EXEMPT_SENTENCES
+
+
+def has_content(text: str) -> bool:
+    """True when ``text`` has at least one sentence that is not an exempt empty-section line."""
+    preamble, sections, _headings = _parse(text)
+    lines = list(preamble) + [line for _title, body in sections for line in body]
+    return any(not _is_exempt(s) for s in _sentences_of(lines))
+
+
 def canonical_markdown(text: str) -> str:
     """The analysis with canonical ``###`` headings and no blank lines inside a section. Call only after validation."""
     _preamble, sections, _headings = _parse(text)
@@ -156,230 +238,89 @@ def canonical_markdown(text: str) -> str:
     return "\n\n".join(blocks)
 
 
-# --------------------------------------------------------------------------------------- identifiers and names
-
-_URL_RE = re.compile(r"(?i)\bhttps?://[^\s<>\"')\]]+|\bwww\.[^\s<>\"')\]]+")
-_EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
-_RCPT_RE = re.compile(r"(?i)\brcpt_[0-9a-z]+")
-_HASH_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{12,64}(?![0-9A-Fa-f])")
-_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
-_DOMAIN_RE = re.compile(r"(?i)\b(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+[a-z]{2,24}\b")
-_PHONE_RE = re.compile(r"(?<![\w.])\+?\(?\d[\d\s().\-]{5,}\d(?!\w)")
-_YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
-_WORD_RE = re.compile(r"[^\W\d_][\w'’\-]*", re.UNICODE)
-_MIN_PHONE_DIGITS = 7
-
-#: Capitalised words that may appear without being in the evidence: acronyms and legal frames the rules name.
-ALLOWED_WORDS: FrozenSet[str] = frozenset(
-    {"ofac", "sdn", "pipeda", "fcra", "glba", "dppa", "ubo", "kyc", "aml", "pep", "peps", "sha", "url", "ai", "llm",
-     "pi", "eu", "un", "uk", "us", "usa", "lei", "id", "ids", "canada", "canadian", "ontario", "wayback", "ltd",
-     "inc", "llc", "plc", "corp", "gmbh", "january", "february", "march", "april", "may", "june", "july", "august",
-     "september", "october", "november", "december",
-     # function words that are only capitalised because they start a sentence ("The Acme ...")
-     "the", "a", "an", "this", "that", "these", "those", "both", "each", "any", "all", "some", "its", "their",
-     "his", "her", "our", "whether", "while", "although", "however", "if", "when", "since", "because", "after",
-     "before", "as", "in", "on", "at", "by", "for", "from", "with", "without", "of", "to", "and", "or", "but",
-     "not", "no", "none", "it", "there", "one", "two", "three", "four", "five"}
-)
+# --------------------------------------------------------------------------------------- validation
 
 
-def _fold(word: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", word.replace("’", "'"))
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
-
-
-def _tokens(text: str) -> Set[str]:
-    found: Set[str] = set()
-    for word in _WORD_RE.findall(text):
-        folded = _fold(word).removesuffix("'s")
-        found.add(folded)
-        found.update(part for part in re.split(r"[\-']", folded) if part)
-    return found
-
-
-def _phone_digit_runs(text: str) -> Set[str]:
-    runs = {re.sub(r"\D", "", m.group(0)) for m in _PHONE_RE.finditer(text)}
-    return {digits for digits in runs if len(digits) >= _MIN_PHONE_DIGITS}
-
-
-def _strip(pattern: "re.Pattern[str]", text: str) -> Tuple[List[str], str]:
-    return [m.group(0) for m in pattern.finditer(text)], pattern.sub(" ", text)
-
-
-def _invented(sentence: str, evidence_lower: str, tokens: Set[str], phones: Set[str]) -> List[str]:
-    """Specifics in ``sentence`` that do not occur in the evidence (each a short quote)."""
-    bad: List[str] = []
-    text = _TAG_RE.sub(" ", sentence)
-    urls, text = _strip(_URL_RE, text)
-    bad += [u for u in urls if u.rstrip(".,;:!?").rstrip("/").lower() not in evidence_lower]
-    emails, text = _strip(_EMAIL_RE, text)
-    bad += [e for e in emails if e.lower() not in evidence_lower]
-    rcpts, text = _strip(_RCPT_RE, text)
-    bad += [r for r in rcpts if r.lower() not in evidence_lower]
-    hashes, text = _strip(_HASH_RE, text)
-    bad += [h for h in hashes if re.search(r"\d", h) and re.search(r"[A-Fa-f]", h) and h.lower() not in evidence_lower]
-    dates, text = _strip(_DATE_RE, text)
-    bad += [d for d in dates if d not in evidence_lower]
-    domains, text = _strip(_DOMAIN_RE, text)
-    bad += [d for d in domains if d.lower().rstrip(".") not in evidence_lower]
-    for match in _PHONE_RE.finditer(text):
-        digits = re.sub(r"\D", "", match.group(0))
-        if len(digits) >= _MIN_PHONE_DIGITS and digits not in phones:
-            bad.append(match.group(0).strip())
-    text = _PHONE_RE.sub(" ", text)
-    bad += [y for y in _YEAR_RE.findall(text) if not re.search(rf"(?<!\d){y}(?!\d)", evidence_lower)]
-    bad += _unknown_names(text, tokens)
-    return bad
-
-
-def _unknown_names(text: str, tokens: Set[str]) -> List[str]:
-    """Capitalised words (names, organisations, acronyms) that are not in the evidence nor allow-listed.
-
-    A capitalised word at the start of a sentence is only a name when another capitalised word follows it.
-    """
-    words = [m.group(0) for m in _WORD_RE.finditer(text)]
-    unknown: List[str] = []
-    for position, word in enumerate(words):
-        core = word.rstrip("'’-")
-        core = core[:-2] if core.lower().endswith(("'s", "’s")) else core
-        if len(core) < 2 or not core[0].isupper():
-            continue
-        folded = _fold(core)
-        parts = [p for p in re.split(r"[\-']", folded) if p]
-        if folded in ALLOWED_WORDS or folded in tokens or (parts and all(p in tokens for p in parts)):
-            continue
-        if position == 0 and not (len(words) > 1 and words[1][0].isupper()):
-            continue
-        unknown.append(core)
-    return unknown
-
-
-# --------------------------------------------------------------------------------------- language screens
-
-_FORBIDDEN_METHOD_RE = re.compile(
-    r"\bpretext\w*|\bfalse\s+(?:pretens?es?|pretences?|name|names|identity|identities)\b"
-    r"|\bhack(?:ing|ed|s|er|ers)?\b|\bbypass\w*|\bimpersonat\w+|\bsocial[- ]engineer\w*|\bphish\w*"
-    r"|\bbrute[- ]?forc\w*|\bcredential[- ]stuff\w*"
-    r"|\b(?:log(?:ging|s)?|sign(?:ing|s)?)\s+in(?:to)?\s+(?:to\s+)?(?:his|her|their|the|a|an|someone's)\s+(?:\w+\s+){0,2}account"
-    r"|\b(?:reset|guess|crack)\w*\s+(?:his|her|their|the|a)\s+(?:\w+\s+)?password"
-    r"|\b(?:gain\w*\s+access\s+to|access\w*)\s+(?:his|her|their|the\s+subject's)\s+(?:\w+\s+)?"
-    r"(?:account|device|phone|email|inbox|messages)"
-    r"|\btrespass\w*|\bwiretap\w*|\beavesdrop\w*"
-    r"|\bgps\s+track\w*|\btracking\s+device|\btrack\w*\s+(?:his|her|their|the\s+subject's)\s+(?:phone|vehicle|car|location|movements)"
-    r"|\bpos(?:e|es|ed|ing)\s+as\b|\b(?:fake|dummy|sock[- ]?puppet|burner)\s+(?:account|profile|identity|persona|email)"
-    r"|\bwithout\s+(?:their|his|her|the\s+subject's)\s+(?:knowledge|consent|permission)"
-    r"|\bdeceiv\w+|\bdeceptive\w*",
-    re.IGNORECASE,
-)
-_CLEARANCE_NEGATABLE_RE = re.compile(r"\b(?:cleared|clean|clearance)\b", re.IGNORECASE)
-_CLEARANCE_ALWAYS_RE = re.compile(
-    r"\ball[- ]clear\b|\bno\s+(?:\w+\s+){0,2}risks?\b|\bnot\s+(?:been\s+)?sanctioned\b|\binnocen\w*|\bexonerat\w*"
-    r"|\bsafe\s+to\s+(?:proceed|deal|trade|engage|contract)\b|\bfree\s+(?:of|from)\s+(?:any\s+)?sanctions?\b",
-    re.IGNORECASE,
-)
-_CONFIRM_RE = re.compile(r"\b(?:confirmed|confirms|verified|corroborated|proven|established)\b", re.IGNORECASE)
-_PROBABLE_RE = re.compile(r"\bprobabl[ey]\b", re.IGNORECASE)
-_NEGATORS = frozenset({"not", "no", "never", "cannot", "can't", "isn't", "aren't", "wasn't", "hasn't", "without",
-                       "neither", "nor"})
-
-
-def _negated(text: str, start: int) -> bool:
-    """True when one of the three words before ``start`` is a negator."""
-    return any(word in _NEGATORS for word in re.findall(r"[a-z']+", text[:start].lower())[-3:])
-
-
-def _screen_text(text: str) -> str:
-    """``text`` as the language screens read it: NFKC-normalised, zero-width and other format characters removed."""
-    return "".join(ch for ch in unicodedata.normalize("NFKC", text) if unicodedata.category(ch) != "Cf")
-
-
-def _mixed_script_word(text: str) -> Optional[str]:
-    """A word that mixes Latin with Cyrillic or Greek letters (a homoglyph trick), else ``None``."""
-    for word in _WORD_RE.findall(text):
-        scripts = {unicodedata.name(ch, "").split(" ")[0] for ch in word if ch.isalpha()}
-        if "LATIN" in scripts and scripts & {"CYRILLIC", "GREEK"}:
-            return word
-    return None
-
-
-def _first_unnegated(pattern: "re.Pattern[str]", text: str) -> Optional[str]:
-    for match in pattern.finditer(text):
-        if not _negated(text, match.start()):
-            return match.group(0)
-    return None
-
-
-def _label_violation(sentence: str, ids: Sequence[str], labels: Dict[str, str]) -> Optional[str]:
-    """The upgrading word when ``sentence`` says more than the labels of the cited ids allow."""
-    cited_labels = [labels.get(i) for i in ids]
-    word = _first_unnegated(_CONFIRM_RE, sentence)
-    if word and not (cited_labels and all(label == "confirmed" for label in cited_labels)):
-        return word
-    word = _first_unnegated(_PROBABLE_RE, sentence)
-    if word and not (cited_labels and all(label in ("probable", "confirmed") for label in cited_labels)):
-        return word
-    return None
-
-
-def _clearance_word(sentence: str) -> Optional[str]:
-    match = _CLEARANCE_ALWAYS_RE.search(sentence)
-    return match.group(0) if match else _first_unnegated(_CLEARANCE_NEGATABLE_RE, sentence)
-
-
-# --------------------------------------------------------------------------------------- the validator
-
-
-def _structure(preamble: Sequence[str], headings: Sequence[str], sections: Sequence[Tuple[str, List[str]]]) -> List[Violation]:
-    found = [title for title, _body in sections]
-    if found != list(SECTION_HEADINGS) or any(line.strip() for line in preamble):
+def _structure(preamble: Sequence[str], sections: Sequence[Tuple[str, List[str]]], headings: Sequence[str]) -> List[Violation]:
+    if [title for title, _body in sections] != list(SECTION_HEADINGS) or any(line.strip() for line in preamble):
         return [Violation("structure", _clip(", ".join(headings) or "no headings"))]
     return []
 
 
 def _markup(text: str) -> List[Violation]:
     problems = []
-    if "`" in text or "](" in text or "![" in text or re.search(r"<\s*/?\s*[A-Za-z!]", text):
+    if ("`" in text or "](" in text or "![" in text or re.search(r"<\s*/?\s*[A-Za-z!]", text)
+            or re.search(r"(?i)\b(?:javascript|vbscript|data|file):", text)):
         problems.append(Violation("markup", "link, image, code or HTML"))
-    for bracket in _BRACKET_RE.findall(text):
-        if not _TAG_RE.fullmatch(bracket):
-            problems.append(Violation("markup", _clip(bracket)))
+    problems += [Violation("markup", "bracket") for b in _BRACKET_RE.findall(text) if not _TAG_RE.fullmatch(b)][:3]
     return problems
+
+
+def _ends_with_tag(sentence: str) -> bool:
+    body = sentence.rstrip(" \t.!?")
+    start = body.rfind("[")
+    return start >= 0 and body.endswith("]") and _TAG_RE.fullmatch(body[start:]) is not None
+
+
+def _check_sentence(
+    raw: str, number: int, section: Optional[str], idx: EvidenceIndex
+) -> List[Violation]:
+    sentence = screen_text(raw)
+    found: List[Violation] = []
+
+    def flag(code: str, detail: str = "") -> None:
+        found.append(Violation(code, _clip(detail), number))
+
+    if not _ends_with_tag(sentence):
+        flag("uncited")
+    ids = cited_ids(sentence)
+    for item_id in dict.fromkeys(ids):
+        if item_id not in idx.known_ids:
+            found.append(Violation("unknown_id", item_id, number))
+    for item in invented_specifics(sentence, idx):
+        flag(INVENTED, item)
+    method = forbidden_method(sentence)
+    if method:
+        flag(FORBIDDEN, method)
+    word = accusation(sentence, ids, idx)
+    if word:
+        flag(ACCUSATION, word)
+    word = clearance(sentence, ids)
+    if word:
+        flag(CLEARANCE, word)
+    word = label_violation(sentence, ids, idx, hedge_required=section != NEXT_STEPS_SECTION)
+    if word:
+        flag(LABEL, word)
+    if section == TIMELINE_SECTION and not has_dated_token(sentence, idx):
+        flag(TIMELINE)
+    if section == NEXT_STEPS_SECTION:
+        problem = next_step_problem(sentence)
+        if problem:
+            flag(problem)
+    return found
 
 
 def validate_analysis(text: str, evidence: NarrativeEvidence) -> List[Violation]:
     """Every violation of the output contract in ``text`` (empty list means the text may be written)."""
+    if len(text) > MAX_CHARS:  # first, before any regex: an oversized text is never scanned
+        return [Violation("too_long", f"{len(text)} characters")]
+    if _has_invisible(text):
+        return [Violation("invisible")]
     violations: List[Violation] = []
-    if len(text) > MAX_CHARS:
-        violations.append(Violation("too_long", f"{len(text)} characters"))
     preamble, sections, headings = _parse(text)
-    violations += _structure(preamble, headings, sections)
+    violations += _structure(preamble, sections, headings)
     violations += _markup(text)
-
-    known = evidence.known_ids
-    labels = dict(evidence.finding_labels)
-    evidence_lower = evidence.text.lower()
-    tokens = _tokens(evidence.text)
-    phones = _phone_digit_runs(evidence.text)
-    body_lines = list(preamble) + [line for _title, body in sections for line in body]
-    for raw_sentence in _sentences_of(body_lines):
-        if raw_sentence.rstrip(" ") in EXEMPT_SENTENCES:
-            continue
-        sentence = _screen_text(raw_sentence)
-        mixed = _mixed_script_word(sentence)
-        if mixed:
-            violations.append(Violation("markup", _clip(f"mixed-script word {mixed}")))
-        if not _ENDS_WITH_TAG_RE.search(sentence):
-            violations.append(Violation("uncited", _clip(sentence)))
-        ids = cited_ids(sentence)
-        violations += [Violation("unknown_id", i) for i in dict.fromkeys(ids) if i not in known]
-        violations += [Violation("invented", _clip(item)) for item in _invented(sentence, evidence_lower, tokens, phones)]
-        method = _FORBIDDEN_METHOD_RE.search(sentence)
-        if method:
-            violations.append(Violation("forbidden_method", _clip(method.group(0))))
-        upgrade = _label_violation(sentence, ids, labels)
-        if upgrade:
-            violations.append(Violation("label_upgrade", _clip(upgrade)))
-        clearance = _clearance_word(sentence)
-        if clearance:
-            violations.append(Violation("clearance", _clip(clearance)))
+    if not violations and not has_content(text):
+        return [Violation("no_content")]
+    idx = build_index(evidence)
+    number = 0
+    for title, body in [("", list(preamble))] + [(t, b) for t, b in sections]:
+        section: Optional[str] = title if title in SECTION_HEADINGS else None
+        for sentence in _sentences_of(body):
+            number += 1
+            if _is_exempt(sentence):
+                continue
+            violations += _check_sentence(sentence, number, section, idx)
+            if len(violations) >= _MAX_VIOLATIONS:
+                return violations
     return violations

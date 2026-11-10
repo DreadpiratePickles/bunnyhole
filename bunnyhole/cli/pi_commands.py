@@ -9,9 +9,13 @@ Nothing here touches the network: the ``pi`` commands only render the static tab
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import os
+import stat
+import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import typer
 from rich.console import Console
@@ -34,6 +38,7 @@ from bunnyhole.engine.pi import (
 from bunnyhole.engine.pi_purpose import require_no_credentials
 
 console = Console()
+T = TypeVar("T")
 
 PI_PERSONA_KEY = "pi"
 
@@ -250,18 +255,57 @@ def require_report_for_ai_flag(no_ai_analysis: bool, pi_report: Optional[Path]) 
         )
 
 
-def _report_with_ai_analysis(report: str, result: Dict[str, Any]) -> str:
-    """``report`` plus the AI analysis section or the one-line note. Prints what happened; never raises."""
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through a temp file in the same directory and ``os.replace``.
+
+    A failure at any point leaves an existing ``path`` exactly as it was (and removes the temp file).
+    """
+    if path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+    else:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temp_name = handle.name
+            handle.write(text)
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    except BaseException:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        raise
+
+
+def _run_sync(make_coroutine: Callable[[], Coroutine[Any, Any, T]]) -> T:
+    """Run a coroutine from sync code, also when an event loop is already running in this thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(make_coroutine())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, make_coroutine()).result()
+
+
+def _report_with_ai_analysis(report: str, result: Dict[str, Any]) -> Tuple[str, Text]:
+    """``report`` plus the AI analysis section or the one-line note, and the console message about it."""
     from bunnyhole.engine.pi_narrative import append_ai_analysis, generate_ai_analysis
 
-    analysis = asyncio.run(generate_ai_analysis(result))
+    analysis = _run_sync(lambda: generate_ai_analysis(result))
     if analysis.status == "included":
-        console.print(Text(f"✔ AI analysis added to the report ({analysis.model}, {analysis.provider}).", style="green"))
+        message = Text(f"✔ AI analysis added to the report ({analysis.model}, {analysis.provider}).", style="green")
     elif analysis.status == "omitted":
-        console.print(Text(f"⚠ AI analysis not included: {analysis.reason}", style="yellow"))
+        message = Text(f"⚠ AI analysis not included: {analysis.reason}", style="yellow")
     else:
-        console.print(Text(f"AI analysis skipped: {analysis.reason}.", style="dim"))
-    return append_ai_analysis(report, analysis)
+        message = Text(f"AI analysis skipped: {analysis.reason}.", style="dim")
+    return append_ai_analysis(report, analysis), message
 
 
 def write_pi_report(
@@ -273,19 +317,29 @@ def write_pi_report(
 ) -> None:
     """Write the BOTTOM-LINE-UP-FRONT PI report for ``result`` to ``pi_report`` (no-op when not requested).
 
-    The code-built report is always written. With ``ai_analysis`` (the default) and a configured LLM provider, a
-    validated, clearly labelled AI-written section is appended after it, or a one-line note when the analysis failed
-    (see :mod:`bunnyhole.engine.pi_narrative`); ``--no-ai-analysis`` turns it off and nothing is sent to a provider.
+    The code-built report is always written first, atomically. With ``ai_analysis`` (the default) and a configured
+    LLM provider, a validated, clearly labelled AI-written section is then appended after it, or a one-line note when
+    the analysis failed (see :mod:`bunnyhole.engine.pi_narrative`); the final text replaces the file atomically, so a
+    failure can never truncate the report already on disk. ``--no-ai-analysis`` turns the analysis off and nothing is
+    sent to a provider. Works inside a running event loop too.
     """
     if builder is None or pi_report is None:
         return
     report = builder(result)
+    _atomic_write_text(pi_report, report)  # the code-built report is on disk before any model call
     if ai_analysis:
-        pi_report.write_text(report, encoding="utf-8")  # the code-built report is on disk before any model call
-        report = _report_with_ai_analysis(report, result)
+        final, message = _report_with_ai_analysis(report, result)
+        if final != report:
+            try:
+                _atomic_write_text(pi_report, final)
+            except OSError as exc:
+                message = Text(
+                    f"⚠ AI analysis could not be written ({type(exc).__name__}); the code-built report is intact.",
+                    style="yellow",
+                )
+        console.print(message)
     else:
         console.print(Text("AI analysis skipped: switched off with --no-ai-analysis.", style="dim"))
-    pi_report.write_text(report, encoding="utf-8")
     console.print(f"[bold green]✔ Saved PI Report to:[/bold green] {pi_report}")
 
 

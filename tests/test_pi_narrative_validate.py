@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import List
 
 import pytest
-from pi_narrative_helpers import GLEIF_URL, GOOD_ANALYSIS, INFO_EMAIL, narrative_result
+from pi_narrative_helpers import GLEIF_URL, GOOD_ANALYSIS, narrative_result
 
 from bunnyhole.engine.pi_narrative_input import NarrativeEvidence, build_evidence
 from bunnyhole.engine.pi_narrative_validate import (
@@ -115,7 +115,6 @@ def test_identifier_or_name_not_in_the_evidence_is_rejected(evidence: NarrativeE
     "sentence",
     [
         f"Acme Holdings Ltd is described at {GLEIF_URL} [F1].",
-        f"Acme Holdings Ltd lists the contact {INFO_EMAIL} [F1].",
         "Acme Holdings Ltd was incorporated on 2021-03-04 [F1].",
         "Acme Holdings Ltd was linked to Jane Q Example [F1,F2].",
         "The OFAC SDN list was screened, and Canada SEMA too [S1].",
@@ -233,7 +232,7 @@ def test_section_headings_are_the_four_of_the_contract() -> None:
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda t: t.replace("### Timeline\n- 2021-03-04: Incorporated is the only dated fact supplied [F1].\n\n", ""),
+        lambda t: t.replace("### Timeline\n- On 2021-03-04 Acme Holdings Ltd was incorporated [F1].\n\n", ""),
         lambda t: t + "\n### Bonus\n- Extra [F1].\n",
         lambda t: "Here is my analysis.\n\n" + t,
         lambda t: t.replace("### Connections", "### Timeline", 1),

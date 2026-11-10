@@ -327,32 +327,53 @@ Ontario or the UK, MLAT or letter of request cross-border). The handoff sheet tu
 licensed investigator or counsel can act on. For an entity subject the sheet gives action lines such as "Verify the sanctions hit on the primary list: <url>" (or the lists that were not screened) and "Confirm corporate status and beneficial ownership on the primary registry", rather than "Run through licensed database" for company addresses; person subjects and `locate` or `missing_person` cases still get the licensed-database and field-verification lines. Nothing is sent by Bunnyhole.
 
 **AI analysis (optional, AI-written, added after the sixteen sections).** With a provider key configured (`GEMINI_API_KEY`,
-`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, tried in that order, the synthesizer's own switch) and `--pi-report`, one extra LLM call
-asks a model to connect the findings the way an investigator would: `Connections`, `Timeline`, `What is not established`,
+`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, tried in that order, the synthesizer's own switch) and `--pi-report`, a model is asked to
+connect the findings the way an investigator would: `Connections`, `Timeline`, `What is not established`,
 `Suggested next steps (lawful)`. It is additive: the Bottom line, labels and sanctions text are code-built and unchanged, and the
-section sits under `## AI analysis (AI-written, not independently verified; not clearance)`.
+section sits under `## AI analysis (AI-written, not independently verified; not clearance)` with a citation key and a footer that
+names the model and provider.
 
-- **Rules.** The model's system prompt is [`bunnyhole/engine/pi_report_rules.md`](../bunnyhole/engine/pi_report_rules.md), a distilled
-  field-method rulebook (triangulation, identifier discipline, systematic exhaustion, sanctions, ownership, provenance, legal lines,
-  output contract). It ships inside the package. Edit that file to change the analyst's behaviour; the contract it states is
-  enforced by code, so keep both in step (a test checks the headings and the two empty-section lines).
-- **Validated before it is written.** Every sentence must end in a citation tag (`[F3]`, `[F2,F5]`) that points at an item the code
-  supplied (`F` findings, `S` sanctions, `W` set-aside weak matches, `G` gaps and limits, `O` ownership). The text is rejected if it
-  cites an unknown id, leaves a claim uncited, contains a URL, domain, email, phone number, hash, receipt id, ISO date, year or
-  capitalised name that is not in the evidence, names an unlawful method, upgrades a label (calls a lead confirmed) or says
-  cleared / no risk. One retry with the reasons; then the section is omitted and the report ends with one line,
-  `AI analysis not included: <reason>`. The validator is a keyword and token screen, not understanding: it cannot tell that a
-  fluent sentence misreads a record, and it does not catch a lowercase invented name or a paraphrase of a forbidden method.
-- **Costs.** One extra call per report, at most two with the retry, 120 s per call, the shared `BUNNYHOLE_LLM_MAX_TOKENS` budget.
-  No key, `--no-ai-analysis`, no relevant finding or a missing PI block: no call, the report is exactly the code-built one.
-  Any failure (provider error, truncation, validation) leaves the rest of the report as it was and adds the note.
-- **What is sent to the provider** (through the same `--proxy`/`--tor` route as the synthesizer): the subject, subject kind, case
-  type, purpose category and jurisdiction; for each relevant finding its label, source count, freshness and up to three receipts
-  (receipt id, tool, URL, SHA-256, an extract of at most 200 characters); the sanctions status, lists screened and not screened,
-  possible and weak matches; coverage and gap lines, identity notes, contradictions; ownership edges; dated timeline events. This is
-  wider than the synthesizer in that it includes URLs, the sanctions and coverage picture and ownership, and it is all already
-  printed in the report. Not sent: the client name, matter reference or purpose text, raw page snippets, unrelated records, API keys.
-  The model's own name and provider appear in the section footer; a citation key resolves each cited id to its receipt ids.
+- **Rules and checks live in two places that must stay in step.** The model's system prompt is
+  [`bunnyhole/engine/pi_report_rules.md`](../bunnyhole/engine/pi_report_rules.md) (a distilled field-method rulebook; it ships inside
+  the package). What the code enforces on its answer is in `bunnyhole/engine/pi_narrative_validate.py` (orchestration and the module
+  docstring that lists every rule and limit), `pi_narrative_checks.py` (the per-sentence checks) and `pi_narrative_lexicon.py` (the
+  word lists). A test checks that the rules file states the headings and the empty-section lines the validator uses.
+- **Validated before it is written.** Allowlists first: exactly the four sections; every sentence ends in a citation tag (`[F3]`,
+  `[F2,F5]`) of an id the code supplied; every digit-bearing token, month, URL, email, hash, receipt id and non-Latin word must occur in
+  the evidence; a capitalised word must be in the evidence or on a small allowlist (the first word of a sentence may be an ordinary
+  starter); next steps must start with a lawful verb, and Interview/Ask/Contact/Call need an honest-identification phrase; each Timeline
+  bullet needs a date from the evidence; a sentence citing a lead must hedge; a set-aside match must read as set aside. A sentence
+  about sanctions may only restate the evidence: clearance, risk-level, compliance and safety wording is rejected, and "no hit" wording
+  needs a same-sentence not-screened or not-clearance qualifier. Blocklists are the second layer: forbidden or deceptive methods
+  (a sentence that only says "do not hack" is rejected too), accusation words the cited evidence does not contain, invisible and
+  control characters, markup. A failed check gets one retry with fixed-wording reasons (never the model's own text); after that the
+  section is left out and the report ends with one line, `AI analysis not included: <reason>`. An answer whose four sections are all
+  empty is left out the same way.
+- **What remains unenforced (limits of a token and keyword screen, not understanding).** A fluent sentence that is correctly cited
+  but misreads what a record means passes; a cited statement that is defamatory in context passes if it uses none of the screened
+  words. Invented names in lowercase or in an uncased script written as ordinary words, spelled-out numbers ("five"), paraphrases of a
+  forbidden method, and a real name from the evidence attached to the wrong record are not caught. Month names are checked only in
+  full and capitalised, and a month is accepted whenever any evidence date falls in it. Hedge and label wording is matched by word
+  lists, so unusual phrasing can slip through or be rejected wrongly. Natural wording that names something outside the evidence
+  (a platform, a foreign registry) is rejected and costs a retry. The code-built report is what governs; this section is labelled not
+  independently verified.
+- **Calls and cost.** A report costs up to two model calls (one, plus one retry only after a failed check), each of which may try
+  up to three providers in turn (Gemini, Anthropic, OpenAI), with 120 s per attempt and the shared `BUNNYHOLE_LLM_MAX_TOKENS` budget, so the
+  worst case is six attempts. No key, `--no-ai-analysis`, no relevant finding or a missing PI block: no call, and the file is exactly
+  the code-built report. A provider error, truncation or failed validation leaves the rest of the report as it was and adds the note.
+  The code-built report is written to disk first and the final text replaces it atomically, so a failure cannot truncate it.
+- **What is sent to the provider** (through the same `--proxy`/`--tor` route as the synthesizer): only what the report itself prints,
+  in the same words. The subject (seed), subject kind, case type, attested purpose category and jurisdiction; per relevant finding its
+  printed name, label, source count, freshness and relevance, and up to three of its receipts as the *Chain of custody* table prints
+  them (receipt id, tool, URL, SHA-256 digest); the sanctions status, lists screened, lists not screened (with reasons), possible
+  and graph matches and up to three weak name matches (name and URL); coverage rows, identity notes, contradictions and chronology
+  gaps; ownership edges and where the walk stopped; and, for each event on the timeline, only its date and the finding ids it belongs
+  to (the one item the report does not print). **Not sent:** receipt extracts or raw snippets, node attributes, event titles and
+  descriptions, the client name, matter reference and purpose text, unrelated records, API keys. Compared with the synthesizer this is
+  narrower in one way (no receipt extracts) and wider in others (URLs, the sanctions and coverage picture, ownership), all of it
+  already in the report. Tests assert that no string the report does not print reaches the provider.
+- **Run inside an event loop.** `write_pi_report` is synchronous; when called from code that already runs an event loop it runs the
+  analysis on a worker thread instead of failing.
 
 ---
 
@@ -419,7 +440,7 @@ See `PISourcesAgent` in `bunnyhole/agents/pi_sources.py` and the list machinery 
 - **Companies House.** Unit tests use mocked responses. Unless you have run it with a real key, treat the parser as untested against the live API.
 - **Ontario and Canada.** PSISA licensing, PIPEDA, Criminal Code s.184 and s.264 are marked unverified. Verify with the Ministry of the Solicitor General and counsel.
 - **Single pass.** One run, one human gate. There is no loop and no oracle; corroborate before relying.
-- **The AI analysis is checked by code, not understood by it.** See section 7. It can still be wrong about what a cited record means; the code-built Bottom line governs, and the section is labelled not independently verified. Its validator and rules file were never run against a live model in the test suite (all tests use fakes).
+- **The AI analysis is checked by code, not understood by it.** See section 7 for the checks and for what remains unenforced. The code-built Bottom line governs, and the section is labelled not independently verified. Its validator and rules file were never run against a live model in the test suite (all tests use fakes), so the first live runs may see more retries and omitted sections than expected.
 
 ---
 
