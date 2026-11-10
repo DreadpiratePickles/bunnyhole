@@ -125,6 +125,11 @@ def _primary_hits(sanctions: SanctionsScreening) -> List[Mapping[str, Any]]:
     return [h for h in sanctions.hits if isinstance(h, Mapping) and not h.get("graph_match")]
 
 
+def _weak_matches(sanctions: SanctionsScreening) -> List[Mapping[str, Any]]:
+    """List entries that matched on a name only and were not linked to the subject (``set_aside_candidates``)."""
+    return [w for w in sanctions.weak_matches if isinstance(w, Mapping)]
+
+
 def _graph_matches(sanctions: SanctionsScreening) -> List[Mapping[str, Any]]:
     """Other graph entities whose name matches a sanctions-list entry (soft), flagged ``graph_match``."""
     return [h for h in sanctions.hits if isinstance(h, Mapping) and h.get("graph_match")]

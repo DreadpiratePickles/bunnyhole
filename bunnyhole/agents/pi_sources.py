@@ -105,7 +105,7 @@ from bunnyhole.engine.models import (
     SelectorStrength,
 )
 from bunnyhole.engine.netutil import new_async_client
-from bunnyhole.engine.pi_anchoring import judge_listing
+from bunnyhole.engine.pi_anchoring import AnchorVerdict, judge_listing
 
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 
@@ -208,25 +208,34 @@ class PISourcesAgent(_ReferenceRecordsMixin):
             raise _SourceSkip("unexpected response shape (expected a JSON object)")
         return data
 
-    def _set_aside_weak_listing(
+    def _judge_listing_for_subject(
         self, label: str, names: Sequence[str], list_label: str, receipt: EvidenceReceipt
-    ) -> bool:
-        """PI person subject: True (after recording the candidate) when a list entry is only a weak name match.
+    ) -> Optional[AnchorVerdict]:
+        """PI person subject: judge a list entry against the subject's name; None without a PI person subject.
 
-        The entry needs the subject's surname and a compatible full name to become a node and an edge; a match on
-        given-name tokens only, or a different spelling, is reported as "weak name match, not linked" and never
-        feeds a path, broker or predicted link. Without a PI person subject this is always False.
+        The entry needs a compatible full name (the subject's surname and given name; see ``pi_anchoring``) to
+        become a node and an edge. A match on given-name tokens only, or a different spelling, is recorded as a
+        set-aside candidate ("weak name match, not linked") and the caller must not link it. A one-word subject
+        name links only on an exact one-word match, flagged weak (``mark_weak_listing``).
         """
         subject = self.graph.pi_subject
         if subject is None:
-            return False
+            return None
         verdict = judge_listing(subject, names, list_name=list_label)
-        if verdict.attach:
-            return False
-        self.graph.set_aside_candidate(
-            DomainCategory.FIAT, "listing", f"{label} ({list_label})", receipt.tool, receipt.source_url, verdict, [receipt]
-        )
-        return True
+        if not verdict.attach:
+            self.graph.set_aside_candidate(
+                DomainCategory.FIAT, "listing", f"{label} ({list_label})", receipt.tool, receipt.source_url, verdict,
+                [receipt],
+            )
+        return verdict
+
+    def _mark_weak_listing(self, node_id: str, verdict: Optional[AnchorVerdict]) -> None:
+        """Flag a listing node that attached only on a one-word name, so it reads as a weak match."""
+        if verdict is not None and verdict.weak and node_id in self.graph.nodes:
+            node = self.graph.nodes[node_id]
+            if "WEAK_NAME_MATCH_SINGLE_WORD" not in node.risk_flags:
+                node.risk_flags.append("WEAK_NAME_MATCH_SINGLE_WORD")
+            node.attributes["anchor_note"] = "; ".join(verdict.anchors)
 
     def _link_to_origin(
         self,
@@ -391,7 +400,8 @@ class PISourcesAgent(_ReferenceRecordsMixin):
                 f"aliases={rec['aliases'][:4]} | dob_or_build={rec['dob_or_build']} | imo={rec['imo']}"
             ),
         )
-        if self._set_aside_weak_listing(rec["name"], [rec["name"], *rec["aliases"]], "Canada SEMA", receipt):
+        verdict = self._judge_listing_for_subject(rec["name"], [rec["name"], *rec["aliases"]], "Canada SEMA", receipt)
+        if verdict is not None and not verdict.attach:
             return
         self.graph.upsert_node(
             GraphNode(
@@ -417,6 +427,7 @@ class PISourcesAgent(_ReferenceRecordsMixin):
                 hop_depth=hop_depth,
             )
         )
+        self._mark_weak_listing(node_id, verdict)
         self._link_to_origin(
             origin_node_id, node_id, RelationType.LINKED_IDENTITY, "B3", 0.55,
             "Canadian sanctions list name match (verify)", receipt,
@@ -500,7 +511,8 @@ class PISourcesAgent(_ReferenceRecordsMixin):
                 f"aliases={aliases[:4]} | {spec.program_label}={programs}" + (f" | {rec.extra}" if rec.extra else "")
             ),
         )
-        if self._set_aside_weak_listing(primary, [primary, *aliases], spec.label, receipt):
+        verdict = self._judge_listing_for_subject(primary, [primary, *aliases], spec.label, receipt)
+        if verdict is not None and not verdict.attach:
             return
         self.graph.upsert_node(
             GraphNode(
@@ -531,6 +543,7 @@ class PISourcesAgent(_ReferenceRecordsMixin):
                 hop_depth=hop_depth,
             )
         )
+        self._mark_weak_listing(node_id, verdict)
         self._link_to_origin(
             origin_node_id, node_id, RelationType.LINKED_IDENTITY, "B3", 0.55,
             f"{spec.label} name match (verify)", receipt,

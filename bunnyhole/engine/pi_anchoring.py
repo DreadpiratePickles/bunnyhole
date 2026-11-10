@@ -21,10 +21,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from bunnyhole.engine.pi_identifiers import is_free_mail_address, looks_like_natural_person_name
-from bunnyhole.engine.pi_identity import full_names_compatible, surname_of
-from bunnyhole.engine.pi_relevance import name_match_level
+from bunnyhole.engine.pi_identity import fold_name, full_names_compatible, name_tokens, surname_of
+from bunnyhole.engine.pi_relevance import LEGAL_FORMS, name_match_level
 
 WEAK_MATCH_PREFIX = "weak name match, not linked"
+SINGLE_WORD_NOTE = "single-word name: exact match only, verify identifiers"
 _STRONG_COMPANY_LEVELS = ("exact", "strong")
 _MIN_DOMAIN_LABEL_CHARS = 4
 _SECOND_LEVEL_LABELS = frozenset({"co", "com", "org", "net", "gov", "ac", "edu"})
@@ -40,6 +41,11 @@ GENERIC_PLATFORM_HANDLES = frozenset(
         "cloudflare", "gravatar", "wikimedia", "mastodon", "bluesky",
     }
 )
+
+
+def has_legal_form(text: str) -> bool:
+    """True when a word of ``text`` is a legal form (Ltd, Inc, LLC, GmbH ...): it names a company, not a person."""
+    return any(token in LEGAL_FORMS for token in name_tokens(fold_name(text)))
 
 
 def normalize_host(value: str) -> str:
@@ -82,10 +88,11 @@ class SubjectAnchors:
             values = [raw] if isinstance(raw, str) else list(raw)
             return [str(v).strip() for v in values if v is not None and str(v).strip()]
 
-        names: List[str] = []
-        companies: List[str] = []
-        for text in clean("names") + clean("organizations"):
-            (names if looks_like_natural_person_name(text) else companies).append(text)
+        # The engagement says the subject is a person, so every name given is a usable full-name anchor: the
+        # person-vs-entity shape heuristic decides the gates, not what may be compared. Organisation-looking
+        # names are also kept as company anchors for account profiles.
+        names = clean("names") + clean("organizations")
+        companies = [text for text in names if not looks_like_natural_person_name(text)]
         emails = [e.lower() for e in clean("emails")]
         domains = [h for h in (normalize_host(d) for d in clean("domains")) if h]
         domains += [
@@ -122,6 +129,7 @@ class AccountFacts:
 class AnchorVerdict:
     attach: bool
     anchors: Tuple[str, ...] = ()  # what agreed, for the receipt text
+    weak: bool = False  # attached, but only as a flagged weak match (a one-word name)
     detail: str = ""  # why it was not linked ("" when it was)
 
     @property
@@ -181,12 +189,18 @@ def judge_listing(subject: SubjectAnchors, listed_names: Iterable[str], *, list_
     names = [n for n in dict.fromkeys(str(n).strip() for n in listed_names) if n]
     if any(full_names_compatible(s, n) for s in subject.names for n in names):
         return AnchorVerdict(attach=True, anchors=("full name",))
-    surnames = {part for s in subject.names for part in surname_of(s).replace("-", " ").split() if part}
+    one_word = {fold_name(s).strip() for s in subject.names if len(name_tokens(fold_name(s))) == 1}
+    if any(fold_name(n).strip() in one_word for n in names):
+        # a one-word subject name has no surname to compare: an exact one-word match is kept, but only as a weak match
+        return AnchorVerdict(attach=True, anchors=(SINGLE_WORD_NOTE,), weak=True)
+    surnames = {part for s in subject.names for part in name_tokens(fold_name(surname_of(s))) if part}
     shown = f"'{names[0]}'" if names else "the entry"
     where = f" on {list_name}" if list_name else ""
-    if not surnames:
+    if not surnames and one_word:
+        detail = f"{shown}{where}: the subject has a one-word name, and only an exact one-word match is linked"
+    elif not surnames:
         detail = f"{shown}{where}: no full person name to compare with"
-    elif any(set(re.findall(r"\w+", n.lower())) & surnames for n in names):
+    elif any(set(name_tokens(fold_name(n))) & surnames for n in names):
         detail = f"{shown}{where}: the surname agrees but no listed name is a compatible full name"
     else:
         detail = (
@@ -237,6 +251,6 @@ def candidate_record(
 
 __all__ = [
     "GENERIC_PLATFORM_HANDLES", "WEAK_MATCH_PREFIX", "AccountFacts", "AnchorVerdict", "SubjectAnchors",
-    "account_anchors", "candidate_record", "is_generic_platform_account", "judge_account", "judge_listing",
+    "SINGLE_WORD_NOTE", "has_legal_form", "account_anchors", "candidate_record", "is_generic_platform_account", "judge_account", "judge_listing",
     "normalize_host", "set_aside_notes",
 ]

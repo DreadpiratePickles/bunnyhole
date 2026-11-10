@@ -37,6 +37,7 @@ from bunnyhole.engine.pi_report_common import (
     _relevant,
     _sentence,
     _undecorated,
+    _weak_matches,
     truncate_words,
 )
 
@@ -161,6 +162,13 @@ def _graph_match_clause(sanctions: SanctionsScreening, labels: _Labels) -> str:
     )
 
 
+def _weak_match_clause(sanctions: SanctionsScreening) -> str:
+    count = len(_weak_matches(sanctions))
+    if not count:
+        return ""
+    return f"{_plural(count, 'weak name match', 'weak name matches')}, not linked (verify on the primary list)"
+
+
 def _flag_clause(block: PIBlock, labels: _Labels) -> str:
     blocked = [labels.label(node) for node in block.ownership.blocked_by_50_rule]
     if not blocked:
@@ -202,7 +210,11 @@ def _sanctions_bullet(block: PIBlock, labels: _Labels) -> str:
     missing = _list_names_only(sanctions.not_screened)
     if not missing:
         missing = "all lists (screening did not run)" if sanctions.status == "not_run" else "none recorded"
-    extras = [clause for clause in (_flag_clause(block, labels), _graph_match_clause(sanctions, labels)) if clause]
+    extras = [
+        clause
+        for clause in (_weak_match_clause(sanctions), _flag_clause(block, labels), _graph_match_clause(sanctions, labels))
+        if clause
+    ]
     candidates: List[str] = []
     for kept in range(len(extras), -1, -1):
         tail = "; ".join(extras[:kept])

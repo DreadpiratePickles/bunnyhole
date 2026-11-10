@@ -31,7 +31,7 @@ from bunnyhole.engine.models import (
     SelectorStrength,
 )
 from bunnyhole.engine.pi import PIEngagement, looks_like_natural_person_name
-from bunnyhole.engine.pi_anchoring import SubjectAnchors
+from bunnyhole.engine.pi_anchoring import SubjectAnchors, has_legal_form
 from bunnyhole.engine.pi_runtime import (
     BREACH_SKIP_REASON,
     CREDENTIAL_SKIP_REASON,
@@ -363,6 +363,16 @@ class BunnyholeOrchestrator:
         values = [self.seed_query] + [v for lt, v in seed_tuples if lt not in ("credential", "document")]
         self._pi_prior_cases = run_conflict_check(self.case_store, values, self.graph.case_id, self.pi_recorder)
 
+    def _is_primary_person_name(self, text: str) -> bool:
+        """The first name the investigator gave, for a person subject, whatever its shape.
+
+        ``looks_like_natural_person_name`` is a conservative heuristic for the person-vs-entity gates (it rejects a
+        one-word name, a five-word name, "Jane Church"); it must not decide how the subject's own name is typed.
+        A name with a legal form (Ltd, Inc, LLC ...) still reads as a company.
+        """
+        names = self._pi_selectors.get("names") or [self.seed_query]  # a plain trace types its seed before the case starts
+        return names[0] == text and not has_legal_form(text)
+
     def _pi_refresh_analytics_exclusions(self) -> None:
         """PI mode: tell the graph which nodes the paths, brokers and predicted-link tables must not run through.
 
@@ -394,7 +404,7 @@ class BunnyholeOrchestrator:
             and ent_type == EntityType.ORGANIZATION
             and self.engagement is not None
             and self.engagement.subject_is_person
-            and looks_like_natural_person_name(clean_val)
+            and (looks_like_natural_person_name(clean_val) or self._is_primary_person_name(clean_val))
         ):
             ent_type, node_kind = EntityType.PERSON, "person"
         if lead_type == "domain":
@@ -870,6 +880,8 @@ class BunnyholeOrchestrator:
         interconnections = self.link_sleuth.analyze_interconnected_web()
         if source_query and target_query:
             interconnections["targeted_paths"] = self.link_sleuth.find_interconnection_paths(source_query, target_query)
+            if note := self.link_sleuth.set_aside_endpoint_note(source_query, target_query):
+                interconnections["targeted_path_note"] = note
 
         synth_res: Dict[str, Any] | BaseException
         council_res: Dict[str, Any] | BaseException
@@ -924,6 +936,8 @@ class BunnyholeOrchestrator:
         interconnections = self.link_sleuth.analyze_interconnected_web()
         if source_query and target_query:
             interconnections["targeted_paths"] = self.link_sleuth.find_interconnection_paths(source_query, target_query)
+            if note := self.link_sleuth.set_aside_endpoint_note(source_query, target_query):
+                interconnections["targeted_path_note"] = note
         base["interconnections"] = interconnections
         base["cross_case_hits"] = self.cross_case_hits
         if not self.synthesis:

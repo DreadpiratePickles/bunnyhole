@@ -11,6 +11,7 @@ See docs/superpowers/specs/2026-11-09-pi-stream-design.md section 3.2.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, FrozenSet, List, Optional, Set, Tuple
@@ -331,10 +332,25 @@ def full_names_compatible(a: str, b: str) -> bool:
     spelling of it (``Roe`` and ``Rowe``) is not compatible. This is the "full name" half of the two-anchor rule:
     it never says two records are the same person, only that the names do not rule it out.
     """
+    a, b = fold_name(a), fold_name(b)
+    tokens_a, tokens_b = name_tokens(a), name_tokens(b)
+    if len(tokens_a) >= 2 and sorted(tokens_a) == sorted(tokens_b):
+        return True  # same words in any order ("Roe Jane" and "Jane Roe"), hyphen and space alike
     parsed_a, parsed_b = _parse_name(a), _parse_name(b)
     if parsed_a is None or parsed_b is None or not parsed_a.last or not parsed_b.last:
         return False  # two lone given names ("Jane" and "Jane") are not a full-name match
     return _compare_names(parsed_a, parsed_b) != "none"
+
+
+def fold_name(text: str) -> str:
+    """``text`` with diacritics removed and case folded (``Zoë`` -> ``zoe``); nothing else is changed."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+
+
+def name_tokens(folded: str) -> List[str]:
+    """Words of an already folded name; hyphens, spaces, commas and periods all separate them."""
+    return re.findall(r"[^\W_]+(?:'[^\W_]+)*", folded)
 
 
 def surname_of(full_name: str) -> str:
