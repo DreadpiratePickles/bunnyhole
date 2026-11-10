@@ -701,6 +701,7 @@ class AccountantAgent:
                                 os_entity_url, verdict, [rcpt],
                             )
                             continue
+                        flags += ["WEAK_NAME_MATCH_SINGLE_WORD"] if verdict.weak else []
                     self.graph.upsert_node(
                         GraphNode(
                             id=node_id,

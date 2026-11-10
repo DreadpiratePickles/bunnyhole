@@ -250,6 +250,8 @@ class SanctionsScreening(BaseModel):
     screened: List[str] = Field(default_factory=list)  # lists that ran, e.g. "Canada SEMA", "OFAC SDN"
     not_screened: List[str] = Field(default_factory=list)  # lists tried but not reached, or never run
     hits: List[dict] = Field(default_factory=list)  # {"list","name","match","url","node_id"}
+    # list entries that matched on a name only and were NOT linked to a person subject: {"name","reason","url"}
+    weak_matches: List[dict] = Field(default_factory=list)
 
 
 class PlaybookProgress(BaseModel):

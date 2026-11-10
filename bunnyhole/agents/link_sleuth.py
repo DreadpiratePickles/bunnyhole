@@ -337,6 +337,32 @@ class LinkSleuthAgent:
             pass
         return None
 
+    def set_aside_endpoint_note(self, *queries: str) -> str:
+        """A sentence naming each targeted-path endpoint that matches only set-aside (unanchored) nodes, else ``""``.
+
+        Without it a PI path request to an excluded node returns nothing and reads as "no path exists".
+        """
+        excluded = self.graph.analytics_excluded_ids
+        if not excluded:
+            return ""
+
+        def matches(q: str, nid: str) -> bool:
+            ql = q.lower().strip()
+            node = self.graph.nodes[nid]
+            return bool(ql) and (ql in nid.lower() or ql in node.label.lower())
+
+        names = [
+            q for q in queries
+            if any(matches(q, nid) for nid in excluded if nid in self.graph.nodes)
+            and not any(matches(q, nid) for nid in self.graph.nodes if nid not in excluded)
+        ]
+        if not names:
+            return ""
+        return (
+            f"Targeted path endpoint(s) {', '.join(repr(n) for n in names)} were set aside as unanchored (a name-only "
+            "or platform record): no path is drawn through them; they stay in the JSON result (set_aside_node_ids)."
+        )
+
     def find_interconnection_paths(
         self,
         source_query: Optional[str] = None,

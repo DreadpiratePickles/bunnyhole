@@ -37,6 +37,7 @@ from bunnyhole.engine.pi_report_common import (
     _Raw,
     _relevant,
     _undecorated,
+    _weak_matches,
     truncate_words,
 )
 
@@ -363,6 +364,9 @@ def _split_reason(entry: str) -> Tuple[_Raw, _Raw]:
     return _Raw(match.group("list")), _Raw(match.group("reason"))
 
 
+_MAX_WEAK_LISTED = 3
+
+
 def _sanctions_section(block: PIBlock) -> List[str]:
     sanctions = block.sanctions
     status_text = _SANCTIONS_STATUS_TEXT.get(sanctions.status, "")
@@ -396,6 +400,20 @@ def _sanctions_section(block: PIBlock) -> List[str]:
             for h in graph_matches
         ]
         lines += _table(["Graph entity", "Node", "Matches listed entry", "List", "Status"], rows)
+    weak = _weak_matches(sanctions)
+    if weak:
+        lines += ["", f"**Weak name matches, not linked ({len(weak)}):**", ""]
+        lines += [
+            f"- {_inline(w.get('name'))}: weak name match, not linked; verify on the primary list. {_inline(w.get('url'))}".rstrip()
+            for w in weak[:_MAX_WEAK_LISTED]
+        ]
+        if len(weak) > _MAX_WEAK_LISTED:
+            lines.append(f"- +{len(weak) - _MAX_WEAK_LISTED} more (see `set_aside_candidates` in the JSON result)")
+        lines += [
+            "",
+            "A weak name match was not linked to the subject (given-name tokens only, or a different spelling): it is "
+            "not a hit, and not clearance either.",
+        ]
     lines += ["", NAME_MATCH_CAVEAT]
     return lines
 

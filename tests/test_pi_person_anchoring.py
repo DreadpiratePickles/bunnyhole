@@ -495,7 +495,9 @@ def test_subject_anchors_split_person_names_from_company_names_and_use_work_emai
         {"names": [SUBJECT, "Roecorp Holdings Ltd"], "emails": ["Jane.Roe@Roecorp.example", "jroe@gmail.com"],
          "usernames": ["@JRoe"], "domains": ["https://www.Roecorp.example/about"]}
     )
-    assert anchors.names == (SUBJECT,) and anchors.companies == ("Roecorp Holdings Ltd",)
+    # every name the investigator gave under a person subject is a usable full-name anchor (no shape heuristic gate);
+    # the organisation-looking one is also kept as a company anchor for account profiles
+    assert anchors.names == (SUBJECT, "Roecorp Holdings Ltd") and anchors.companies == ("Roecorp Holdings Ltd",)
     assert anchors.domains == (DOMAIN,)  # the free-mail domain is not an anchor
     assert anchors.usernames == ("jroe",) and anchors.is_explicit_username("@JROE")
 
@@ -514,3 +516,146 @@ def test_intake_path_types_the_name_seed_as_a_person_and_arms_the_two_anchor_rul
     assert orch.graph.pi_subject is not None and orch.graph.pi_subject.names == (SUBJECT,)
     assert orch.graph.pi_subject.domains == (DOMAIN,)
     PIBlock.model_validate(result["pi"])
+
+
+# ==============================================================================================================
+# Verifier round: an exact full-name listing must never be hidden, whatever the shape of the name
+# ==============================================================================================================
+
+
+def _person_run(subject: str) -> tuple:
+    orch = _orch()
+    orch.seed_query = subject
+    orch._pi_start_case([("company", subject)])
+    origin = orch._create_seed_node(subject, hop_depth=0, forced_type="company")[1]
+    assert orch.pi_sources is not None
+    return orch, origin
+
+
+@pytest.mark.parametrize(
+    "subject",
+    ["Karim Omar Fadel Al Roe", "Zoran Mihail Petrov Roe", "Jane Church", "Grace Fund", "Madonna",
+     "Jane Roe-Smith Esq", "Dr. Jane Roe", "O'Neil Mary-Jane Roe"],
+)
+def test_exact_name_listing_attaches_whatever_the_shape_of_the_subject_name(subject: str) -> None:
+    orch, origin = _person_run(subject)
+    assert origin.entity_type == EntityType.PERSON  # the engagement says person: the primary name is a Person
+    _screen_list(orch.pi_sources, origin.id, subject, _record(subject))
+    listed = _listed(orch.graph)
+    assert listed, f"genuine exact-name match for {subject!r} was hidden"
+    node = orch.graph.nodes[listed[0]]
+    assert "Name match only; verify identifiers." in node.receipts[0].extracted_fact
+    assert "set_aside_candidates" not in orch.graph.to_dict()
+
+
+def test_single_word_subject_exact_match_attaches_only_as_a_flagged_weak_match() -> None:
+    orch, origin = _person_run("Madonna")
+    _screen_list(orch.pi_sources, origin.id, "Madonna", _record("Madonna"))
+    node = orch.graph.nodes[_listed(orch.graph)[0]]
+    assert "WEAK_NAME_MATCH_SINGLE_WORD" in node.risk_flags
+    assert "single-word" in node.attributes["anchor_note"]
+    other, other_origin = _person_run("Madonna")  # anything longer than the single token is still only weak
+    _screen_list(other.pi_sources, other_origin.id, "Madonna", _record("Madonna Louise"))
+    assert _listed(other.graph) == [] and len(other.graph.to_dict()["set_aside_candidates"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("subject", "listed", "expected"),
+    [
+        ("Zoë Roe-Smith", "Zoe Roe-Smith", True),  # diacritics folded
+        ("Zoë Roe-Smith", "Zoe ROE SMITH", True),  # hyphen and space are separators
+        ("Zoë Roe-Smith", "ROE-SMITH, Zoë", True),
+        ("Jane Roe", "  jane   ROE ", True),
+        ("Jane Roe", "Roe Jane", True),  # surname first without a comma: identical token multiset
+        ("Jane Roe", "Jane Roe-Smith", True),
+        ("Jane Roe", "Jane de la Roe", True),
+        ("Jane Roe", "Jane", False),  # given-name only
+        ("Jane Roe", "Jane Marie", False),
+        ("Jane Roe", "Jayne Rowe", False),  # different spelling of the surname
+        ("Jane Roe", "Janet Roewood", False),
+        ("Jane Roe", "Roe Trading Company", False),
+        ("Zoë Roe-Smith", "Zoe Rowe-Jones", False),
+        ("Jane Marie Roe", "Jane Marie", False),
+    ],
+)
+def test_listing_name_matrix(subject: str, listed: str, expected: bool) -> None:
+    from bunnyhole.engine.pi_anchoring import SubjectAnchors, judge_listing
+
+    verdict = judge_listing(SubjectAnchors(names=(subject,)), [listed])
+    assert verdict.attach is expected
+    if not expected:
+        assert verdict.reason.startswith("weak name match, not linked")
+
+
+def test_account_name_order_and_diacritics_follow_the_same_fold() -> None:
+    orch = _orch()
+    seed = _started(orch)
+    _sweep(orch, seed, github=_github("Roe Jane", blog=DOMAIN), keybase=_keybase("jane  ROE", [{"proof_type": "dns", "nametag": DOMAIN}]))
+    assert "account:github:jane" in orch.graph.nodes and "account:keybase:jane" in orch.graph.nodes
+    other = _orch()
+    other_seed = _started(other)
+    _sweep(other, other_seed, github=_github("Jane", blog=DOMAIN), keybase=_keybase("Jane Rowe", [{"proof_type": "dns", "nametag": DOMAIN}]))
+    assert "account:github:jane" not in other.graph.nodes and "account:keybase:jane" not in other.graph.nodes
+
+
+# ==============================================================================================================
+# Verifier round: the report's Sanctions section discloses set-aside listings itself
+# ==============================================================================================================
+
+
+def test_report_sanctions_section_discloses_a_weak_listing_and_keeps_the_caveats() -> None:
+    from bunnyhole.engine.pi_report import build_pi_report
+
+    orch = _orch()
+    seed = _started(orch)
+    _screen_list(orch.pi_sources, seed.id, "Jane Marie Roe", _record("Jane Marie"))
+    result = orch.compile_full_result()
+    assert len(result["pi"]["sanctions"]["weak_matches"]) == 1
+    md = build_pi_report(result)
+    start = md.index("## Sanctions screening")
+    section = md[start: md.index("\n## ", start + 5)]
+    assert "weak name match, not linked; verify on the primary list" in section
+    assert "Jane Marie" in section
+    assert "not clearance" in section.lower()
+    assert "EU Consolidated List" in section and "not automated" in section
+    bottom = md[: md.index("\n## ", md.index("Bottom line") + 5)] if "Bottom line" in md else md
+    assert "weak name match" in bottom.lower()
+
+
+def test_report_without_a_weak_listing_is_unchanged() -> None:
+    from bunnyhole.engine.pi_report import build_pi_report
+
+    orch = _orch()
+    _started(orch)
+    md = build_pi_report(orch.compile_full_result())
+    assert "weak name match" not in md.lower().split("## sanctions screening", 1)[1].split("\n## ", 1)[0]
+
+
+def test_report_lists_at_most_three_weak_listings_and_counts_the_rest() -> None:
+    from bunnyhole.engine.pi_report import build_pi_report
+
+    orch = _orch()
+    seed = _started(orch)
+    for index in range(5):
+        _screen_list(orch.pi_sources, seed.id, "Jane Marie Roe", _record(f"Jane Marie{'x' * index}"))
+    md = build_pi_report(orch.compile_full_result())
+    section = md.split("## Sanctions screening", 1)[1].split("\n## ", 1)[0]
+    assert "(5)" in section and "+2 more" in section
+
+
+# ==============================================================================================================
+# Verifier round: a targeted path to a set-aside endpoint says so
+# ==============================================================================================================
+
+
+def test_targeted_path_to_a_set_aside_endpoint_says_it_was_set_aside() -> None:
+    orch = _orch()
+    seed = _started(orch)
+    stray = _node("court:roewood", "Janet Roewood", EntityType.PERSON, DomainCategory.FIAT, tool="court_dockets")
+    orch.graph.upsert_node(stray)
+    _link(orch, seed.id, stray.id)
+    result = orch.compile_full_result(source_query="Janet Roewood", target_query="Jane Roe")
+    inter = result["interconnections"]
+    assert inter["targeted_paths"] == []
+    assert "set aside as unanchored" in inter["targeted_path_note"]
+    assert "Janet Roewood" in inter["targeted_path_note"]

@@ -177,6 +177,8 @@ def _render_investigation_results(result: dict) -> None:
         )
 
     # 2. Link Sleuth: Cross-Domain Paths & Adamic-Adar Predicted Missing Links
+    if inter.get("targeted_path_note"):
+        console.print(f"[yellow]{inter['targeted_path_note']}[/yellow]")
     paths = inter.get("targeted_paths") or inter.get("cross_domain_paths", [])
     if paths:
         path_table = Table(title="🔗 Link Sleuth: Multi-Domain Interconnection Chains", show_lines=True)

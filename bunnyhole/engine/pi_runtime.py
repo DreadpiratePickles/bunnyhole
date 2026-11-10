@@ -1062,6 +1062,13 @@ def assemble_pi_block(
     playbook = playbook_for(engagement.case_type)
     identity_notes = identity_notes_for(nodes, selectors_map, engagement.subject_is_person)
     set_aside = [c for c in graph_dict.get("set_aside_candidates") or [] if isinstance(c, Mapping)]
+    weak_listings = [
+        {"name": str(c.get("label") or ""), "reason": str(c.get("reason") or ""), "url": str(c.get("source_url") or "")}
+        for c in set_aside
+        if c.get("kind") == "listing"
+    ]
+    if weak_listings:  # the Sanctions section must never read "no hit" while a weak match was set aside
+        sanctions = sanctions.model_copy(update={"weak_matches": weak_listings})
     identity_notes = _merge_notes(
         identity_notes,
         set_aside_notes(set_aside)  # weak name matches that were not linked (pi_anchoring): never dropped silently
