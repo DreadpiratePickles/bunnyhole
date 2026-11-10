@@ -24,6 +24,7 @@ from bunnyhole.agents.accountant import AccountantAgent, n_number_to_icao_hex
 from bunnyhole.agents.journalist import JournalistAgent
 from bunnyhole.agents.osint import OSINTAgent
 from bunnyhole.cli import pi_commands
+from bunnyhole.cli.ask_command import register_ask
 from bunnyhole.cli.pi_commands import SubjectType
 from bunnyhole.engine.graph import InvestigationGraph
 from bunnyhole.engine.intake import AnchorMode, CaseIntakePacket, SmartIntakeParser
@@ -43,6 +44,7 @@ app = typer.Typer(
 )
 console = Console()
 app.add_typer(pi_commands.pi_app, name="pi")
+register_ask(app)  # `bunnyhole ask "<question>"`: bunnyhole/cli/ask_command.py
 
 
 class _EngagementKwargs(TypedDict, total=False):

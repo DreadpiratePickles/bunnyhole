@@ -173,6 +173,7 @@ instead of running an empty case. Note that `-p` is `--phone` on `trace`/`intake
 | --- | --- | --- |
 | `trace <seed>` | Autonomous multi-domain investigation of one seed; Markdown dossier (`--out`) and graph JSON (`--json`). Also takes `--pi` (see below) | Network |
 | `intake` | Case intake: a hypothesis plus at least one known selector (`--dump`, `--domain`, `--email`, `--wallet`, `--org`, `--username`, `--phone`, `--doc`), optional `--exclude`, and an anchor mode. Also takes `--pi` | Network |
+| `ask "<question>"` | Plain-English front end: "see if X is connected to Y" runs `link`; "see if X has anything shady going on" runs a sanctions-emphasis trace and prints a fixed risk checklist. No model parses the question; naming a person applies the PI gates. See [`docs/ASK.md`](docs/ASK.md) | Network |
 | `link <a> <b>` | Link Sleuth, bidirectional meet-in-the-middle: how do two entities connect? | Network |
 | `jet <tail_or_hex>` | FAA N-Number to ICAO hex and back, plus ADS-B telemetry from adsb.lol | Network |
 | `council <seed>` | 5-seat council (specialist briefs, deterministic evidence ranking (not peer review), chairman verdict) over a short trace | Network; an AI key for real model deliberation, deterministic council without one |
@@ -504,6 +505,7 @@ The complete 12-volume intelligence & tradecraft spec lives in
 - [`CHEATSHEET.md`](CHEATSHEET.md) — the fast, practical lead & prospect-research guide.
 - [`docs/PERSONALIZATION.md`](docs/PERSONALIZATION.md) — personas, the remembered profile, OpenSanctions screening.
 - [`docs/MCP_SERVER.md`](docs/MCP_SERVER.md) — your own MCP server: setup, tools, safety.
+- [`docs/ASK.md`](docs/ASK.md) — `bunnyhole ask`: plain-English connection and company-risk questions, what the answer says and never says.
 - [`docs/PI_STREAM.md`](docs/PI_STREAM.md) — the private-investigator (`--pi`) stream: gates, flags, report, legal filter, limits.
 - [`docs/superpowers/specs/`](docs/superpowers/specs/) — design specs (the PI stream design).
 - [`research/00_INDEX.md`](research/00_INDEX.md) — the tradecraft research library (above).
