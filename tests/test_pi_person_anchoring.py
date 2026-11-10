@@ -659,3 +659,63 @@ def test_targeted_path_to_a_set_aside_endpoint_says_it_was_set_aside() -> None:
     assert inter["targeted_paths"] == []
     assert "set aside as unanchored" in inter["targeted_path_note"]
     assert "Janet Roewood" in inter["targeted_path_note"]
+
+
+# ==============================================================================================================
+# Verifier round 2: apostrophes, letters with no decomposition, CJK spacing, and the Bottom line's closing clause
+# ==============================================================================================================
+
+
+@pytest.mark.parametrize("subject", ["Sean O’Roe", "Sean O'Roe", "Sean OʼRoe", "Sean O`Roe", "Sean O‘Roe"])
+@pytest.mark.parametrize("listed", ["SEAN O'ROE", "OROE, SEAN", "Sean ORoe", "Sean O Roe", "Sean O’Roe"])
+def test_apostrophe_variants_of_an_exact_name_attach(subject: str, listed: str) -> None:
+    from bunnyhole.engine.pi_anchoring import SubjectAnchors, judge_listing
+
+    assert judge_listing(SubjectAnchors(names=(subject,)), [listed]).attach is True
+
+
+def test_apostrophe_listing_attaches_through_the_agent_flagged_name_match_only() -> None:
+    orch, origin = _person_run("Sean O’Roe")
+    _screen_list(orch.pi_sources, origin.id, "Sean O’Roe", _record("OROE, SEAN"))
+    node = orch.graph.nodes[_listed(orch.graph)[0]]
+    assert "Name match only; verify identifiers." in node.receipts[0].extracted_fact
+
+
+@pytest.mark.parametrize(
+    ("subject", "listed", "expected"),
+    [
+        ("Søren Roe", "Soren Roe", True),
+        ("SØREN ROE", "Soren Roe", True),
+        ("Jane Łukasz", "Jane Lukasz", True),
+        ("Đorđe Roe", "Dorde Roe", True),
+        ("Æsa Roe", "Aesa Roe", True),
+        ("Jane Bœuf", "Jane Boeuf", True),
+        ("Jane Roß", "Jane Ross", True),
+        ("王 小明", "王小明", True),  # CJK names carry no word spaces
+        ("王小明", "王 小明", True),
+        ("王 小明", "王 小红", False),
+        ("Søren Roe", "Soren Rowe", False),  # a different spelling is still rejected
+        ("Sean O'Roe", "Sean Rowe", False),
+        ("Sean O'Roe", "Sean", False),  # given-name only
+        ("Sean O'Roe", "Sean O'Neil", False),  # different surname
+    ],
+)
+def test_special_letters_and_cjk_spacing(subject: str, listed: str, expected: bool) -> None:
+    from bunnyhole.engine.pi_anchoring import SubjectAnchors, judge_listing
+
+    assert judge_listing(SubjectAnchors(names=(subject,)), [listed]).attach is expected
+
+
+def test_bottom_line_keeps_the_not_clearance_wording_next_to_two_weak_matches() -> None:
+    from bunnyhole.engine.pi_report import build_pi_report
+
+    orch = _orch()
+    seed = _started(orch)
+    for given in ("Jane Marie", "Jane Maria"):
+        _screen_list(orch.pi_sources, seed.id, "Jane Marie Roe", _record(given))
+    md = build_pi_report(orch.compile_full_result())
+    bullet = next(line for line in md.splitlines() if line.startswith("- **Sanctions:**"))
+    assert len(bullet) <= 220
+    assert "2 weak name matches, not linked" in bullet
+    assert "not clearance" in bullet.lower()
+    assert "EU Consolidated List" in bullet or "not screened" in bullet.lower()

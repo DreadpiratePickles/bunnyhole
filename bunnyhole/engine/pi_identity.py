@@ -333,6 +333,19 @@ def full_names_compatible(a: str, b: str) -> bool:
     it never says two records are the same person, only that the names do not rule it out.
     """
     a, b = fold_name(a), fold_name(b)
+    if _CJK.search(a) or _CJK.search(b):  # CJK names carry no word spaces: "王 小明" is "王小明"
+        compact_a, compact_b = _CJK_SEPARATORS.sub("", a), _CJK_SEPARATORS.sub("", b)
+        if compact_a and compact_a == compact_b:
+            return True
+    # An apostrophe may be kept, dropped or a space in another record ("O'Roe", "ORoe", "O Roe"): try each form.
+    return any(_compatible_forms(x, y) for x in _apostrophe_forms(a) for y in _apostrophe_forms(b))
+
+
+def _apostrophe_forms(folded: str) -> List[str]:
+    return list(dict.fromkeys([folded, folded.replace("'", ""), folded.replace("'", " ")]))
+
+
+def _compatible_forms(a: str, b: str) -> bool:
     tokens_a, tokens_b = name_tokens(a), name_tokens(b)
     if len(tokens_a) >= 2 and sorted(tokens_a) == sorted(tokens_b):
         return True  # same words in any order ("Roe Jane" and "Jane Roe"), hyphen and space alike
@@ -342,10 +355,21 @@ def full_names_compatible(a: str, b: str) -> bool:
     return _compare_names(parsed_a, parsed_b) != "none"
 
 
+_APOSTROPHES = "\u2019\u02bc\u2018\u00b4`"  # right and left single quotes, modifier letter apostrophe, acute, backtick
+_LETTER_FOLDS = str.maketrans({"ø": "o", "đ": "d", "ł": "l", "æ": "ae", "œ": "oe", "ß": "ss", "ð": "d", "þ": "th"})
+_CJK = re.compile("[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+_CJK_SEPARATORS = re.compile(r"[\s.,\u00b7\u30fb-]+")
+
+
 def fold_name(text: str) -> str:
-    """``text`` with diacritics removed and case folded (``Zoë`` -> ``zoe``); nothing else is changed."""
+    """``text`` with diacritics removed, case folded and look-alike letters unified.
+
+    ``Zoë`` -> ``zoe``, ``Søren`` -> ``soren``, ``Łukasz`` -> ``lukasz``, ``Œ`` -> ``oe``; every apostrophe form
+    (U+2019, U+02BC, U+2018, acute, backtick) becomes an ASCII ``'``. Nothing else is changed.
+    """
     decomposed = unicodedata.normalize("NFKD", text or "")
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+    return "".join("'" if ch in _APOSTROPHES else ch for ch in stripped).translate(_LETTER_FOLDS)
 
 
 def name_tokens(folded: str) -> List[str]:
