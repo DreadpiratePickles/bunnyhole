@@ -259,7 +259,7 @@ def test_valid_analysis_becomes_a_labelled_section_after_the_code_built_report(m
 def test_code_renders_the_label_next_to_every_connection_tag(monkeypatch: pytest.MonkeyPatch) -> None:
     result = narrative_result()
     out = append_ai_analysis(build_pi_report(result), _run(result, FakeLLM(outcome(GOOD_ANALYSIS)), monkeypatch))
-    assert "- [F1 · confirmed, F2 · probable, O1] Jane Q Example is recorded as the owner" in out
+    assert "- [F1 · confirmed, F2 · probable, O1] Acme Holdings Ltd is owned by Jane Q Example" in out
     assert "- [F3 · lead] The GitHub account" in out
     assert "[F1,F2,O1]" not in out
 

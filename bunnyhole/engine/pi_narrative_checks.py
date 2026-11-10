@@ -30,6 +30,7 @@ from bunnyhole.engine.pi_narrative_lexicon import (
     OBFUSCATION_RE,
     SEASONS_RE,
 )
+from bunnyhole.engine.pi_narrative_screens import first_match, fold, views
 
 #: ASCII punctuation a bullet may contain. Square brackets are only legal inside the leading citation tag.
 ALLOWED_PUNCTUATION = frozenset(".,;:'\"()-/&%@_[]")
@@ -37,6 +38,7 @@ ALLOWED_PUNCTUATION = frozenset(".,;:'\"()-/&%@_[]")
 _TYPOGRAPHY = {"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", " ": " "}
 
 _URL_RE = re.compile(r"(?i)(?<![\w])(?:https?://|www\.)[^\s<>\"')\]]++")
+_BARE_URL_RE = re.compile(r"(?<![\w\-.@])[\w\-]++(?:\.[\w\-]++)+/[\w\-./%]++")
 _EMAIL_RE = re.compile(r"(?<![\w.+\-])[\w.+\-]++@[\w\-]++(?:\.[\w\-]++)+")
 _HANDLE_RE = re.compile(r"(?<![\w@])@[\w.]{1,40}")
 _RCPT_RE = re.compile(r"(?i)(?<!\w)rcpt_\w++")
@@ -56,18 +58,30 @@ def normalise_typography(text: str) -> str:
     return "".join(_TYPOGRAPHY.get(ch, ch) for ch in unicodedata.normalize("NFC", text))
 
 
-def fold(word: str) -> str:
-    """Casefolded, accent-stripped form used to compare a token with the evidence."""
-    decomposed = unicodedata.normalize("NFKD", word)
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+#: Letters that survive the NFKC and range tests but are used as look-alikes: dotless i and j, kra, turned e.
+_LOOKALIKE_LETTERS = frozenset("\u0131\u0237\u0138\u01dd\u018e")
+_LATIN_LETTERS_FIRST, _LATIN_LETTERS_LAST = 0xC0, 0x24F  # Latin-1 letters, Latin Extended-A and B
+
+
+def _allowed_letter(ch: str) -> bool:
+    """A Latin-1 Supplement or Latin Extended-A/B letter that is its own NFKC form and not a known look-alike."""
+    return (
+        _LATIN_LETTERS_FIRST <= ord(ch) <= _LATIN_LETTERS_LAST
+        and unicodedata.category(ch) in ("Ll", "Lu")
+        and ch not in _LOOKALIKE_LETTERS
+        and unicodedata.normalize("NFKC", ch) == ch
+    )
 
 
 def disallowed_character(text: str) -> Optional[str]:
     """The first character outside the allowlist, or ``None``.
 
-    Allowed: ASCII letters and accented Latin letters, ASCII digits, the ASCII space, the line feed, and
-    :data:`ALLOWED_PUNCTUATION`. Everything else is refused: invisible, bidi and format characters, other scripts and
-    look-alike letters, fullwidth forms, backticks, ``#``, ``>``, ``*``, ``|``, ``<``, ``~``, tabs, emoji.
+    Allowed: ASCII letters, ASCII digits, Latin-1 Supplement and Latin Extended-A/B letters (U+00C0 to U+024F), the
+    ASCII space, the line feed, and :data:`ALLOWED_PUNCTUATION`. A character whose NFKC form differs from itself
+    (ligatures, fullwidth and other compatibility forms) is refused, never normalised and accepted. Refused too:
+    IPA and Phonetic Extensions, small capitals, Latin Extended-C/D/E, modifier letters, dotless i and j and other
+    look-alikes, invisible, bidi and format characters, other scripts, backticks, ``#``, ``>``, ``*``, ``|``,
+    ``<``, ``~``, tabs, emoji.
     """
     for ch in text:
         if ch in (" ", "\n") or ch in ALLOWED_PUNCTUATION:
@@ -75,9 +89,8 @@ def disallowed_character(text: str) -> Optional[str]:
         if ch.isascii():
             if ch.isalnum():
                 continue
-        elif unicodedata.category(ch) == "Ll" or unicodedata.category(ch) == "Lu":
-            if unicodedata.name(ch, "").startswith("LATIN"):
-                continue
+        elif _allowed_letter(ch):
+            continue
         return ch
     return None
 
@@ -122,7 +135,8 @@ class EvidenceIndex:
     months: FrozenSet[str]
     run_text: str
     model_ids: FrozenSet[str]
-    lines: Mapping[str, str]
+    lines: Mapping[str, str]  # id -> folded line (accent-folded, casefolded)
+    names: FrozenSet[str] = frozenset()
 
 
 def build_index(evidence: NarrativeEvidence) -> EvidenceIndex:
@@ -138,7 +152,8 @@ def build_index(evidence: NarrativeEvidence) -> EvidenceIndex:
         months=frozenset(months),
         run_text=" " + " ".join(run_words) + " ",
         model_ids=evidence.model_ids,
-        lines={key: value.lower() for key, value in evidence.lines.items()},
+        lines={key: fold(value) for key, value in evidence.lines.items()},
+        names=frozenset(evidence.names),
     )
 
 
@@ -213,6 +228,8 @@ def invented_specifics(text: str, idx: EvidenceIndex) -> List[str]:
     bad: List[str] = []
     urls, text = _strip(_URL_RE, text)
     bad += [u for u in urls if u.rstrip(".,;:").rstrip("/").lower() not in idx.lower]
+    paths, text = _strip(_BARE_URL_RE, text)  # "example.org/some/path": the full string must be in the evidence
+    bad += [p for p in paths if p.rstrip(".,;:/").lower() not in idx.lower]
     emails, text = _strip(_EMAIL_RE, text)
     bad += [e for e in emails if e.lower() not in idx.lower]
     handles, text = _strip(_HANDLE_RE, text)
@@ -252,21 +269,19 @@ def obfuscation(text: str) -> Optional[str]:
 
 def excluded_topic(text: str) -> Optional[str]:
     """A word of a topic that belongs to the code-built sections (sanctions, screening, absence, risk)."""
-    match = EXCLUDED_TOPIC_RE.search(text)
-    return match.group(0) if match else None
+    return first_match(EXCLUDED_TOPIC_RE, text)
 
 
 def certainty_word(text: str) -> Optional[str]:
     """A label or certainty word (the code renders the label next to the tag; the model never states one)."""
-    match = CERTAINTY_RE.search(text)
-    return match.group(0) if match else None
+    return first_match(CERTAINTY_RE, text)
 
 
 def advice_or_method(text: str) -> Optional[str]:
     """Advice, a method, or an imperative: the code builds every next step, so a bullet may contain none."""
-    match = ADVICE_OR_METHOD_RE.search(text)
-    if match:
-        return match.group(0)
+    word = first_match(ADVICE_OR_METHOD_RE, text)
+    if word:
+        return word
     first = _words(text)[:1]
     return first[0] if first and fold(first[0]) in IMPERATIVE_STARTS else None
 
@@ -278,10 +293,11 @@ def too_short(text: str) -> bool:
 
 def accusation(text: str, ids: List[str], idx: EvidenceIndex) -> Optional[str]:
     """An accusation word that the evidence for every cited id does not itself contain."""
-    for match in ACCUSATION_RE.finditer(text):
-        word = match.group(0).lower()
-        if not ids or not all(word in idx.lines.get(item_id, "") for item_id in ids):
-            return word
+    for view in views(text):
+        for match in ACCUSATION_RE.finditer(view):
+            word = match.group(0).lower()
+            if not ids or not all(word in idx.lines.get(item_id, "") for item_id in ids):
+                return word
     return None
 
 

@@ -29,6 +29,12 @@ from bunnyhole.engine.pi_narrative_input import (
 from bunnyhole.engine.pi_narrative_validate import escape_markdown
 
 MAX_LINES = 24
+#: More lead-only findings than this collapse into one line that lists their ids (one line each below this).
+COLLAPSE_LEADS_ABOVE = 5
+#: Kinds whose lines are never dropped, in the order they are written. Everything else follows, lead-only last.
+CRITICAL_KINDS: Tuple[str, ...] = (SANCTIONS_STATUS, SANCTIONS_POSSIBLE, STANDING_LIMITS, OWNERSHIP_WALK, SET_ASIDE)
+_OTHER_KINDS: Tuple[str, ...] = (CONTRADICTION, IDENTITY_NOTE, CHRONOLOGY_GAP, NOT_SEARCHED, SEARCHED, LEAD_ONLY)
+_OMITTED_LINE = "- {n} further lines omitted; see the full code-built report above."
 #: Every next step starts with one of these verbs: an action on records or a lawful request, never an event.
 NEXT_STEP_VERBS: FrozenSet[str] = frozenset(
     {"Obtain", "Request", "Verify", "Review", "Search", "Check", "Screen", "Compare", "Archive", "Record", "Engage",
@@ -48,8 +54,8 @@ _BY_SOURCE_CLASS: Dict[str, str] = {
 }
 _ARCHIVE_STEP = "Archive the cited source pages (for example with Save Page Now) before they change."
 _LEGAL_PROCESS_STEP = (
-    "Engage a licensed investigator or a lawyer for records that only legal process can reach "
-    "(court records, bank and telephone records)."
+    "Engage a licensed investigator or a lawyer for court records beyond the public portals searched, and for bank "
+    "and telephone records, which only legal process can reach."
 )
 
 
@@ -98,6 +104,19 @@ def _ownership_line(item: GapItem) -> str:
     return text
 
 
+_SEARCHED_BY_OUTCOME: Dict[str, str] = {
+    "hit": "returned records; the records are cited above.",
+    "positive": "returned records; the records are cited above.",
+    "negative": "returned nothing; absence from this source is not proof of absence.",
+    "empty": "returned nothing; absence from this source is not proof of absence.",
+}
+
+
+def _searched_outcome(outcome: str) -> str:
+    """Fixed wording for what a searched source class returned (an unknown or unavailable outcome: not checked)."""
+    return _SEARCHED_BY_OUTCOME.get(outcome.strip().lower(), "could not be checked.")
+
+
 _NOT_ESTABLISHED: Dict[str, Callable[[GapItem], str]] = {
     STANDING_LIMITS: lambda g: (
         "This tool uses free public passive sources only; licensed or paid investigator databases, paid records, "
@@ -112,10 +131,7 @@ _NOT_ESTABLISHED: Dict[str, Callable[[GapItem], str]] = {
         f"{_e(g.label)} is a weak name match that was set aside; it is not linked to the subject and is not a finding."
     ),
     NOT_SEARCHED: lambda g: f"Source class {_e(g.label)} was not searched.",
-    SEARCHED: lambda g: (
-        f"Source class {_e(g.label)} was searched with outcome {_e(g.names[0] if g.names else 'unknown')}; "
-        "absence from the sources searched is not proof of absence."
-    ),
+    SEARCHED: lambda g: f"Source class {_e(g.label)} {_searched_outcome(g.names[0] if g.names else '')}",
     IDENTITY_NOTE: lambda g: f"Identity note from the program: {_e(g.label)}",
     CONTRADICTION: lambda g: f"Contradiction recorded by the program: {_e(g.label)}",
     CHRONOLOGY_GAP: lambda g: f"Chronology gap recorded by the program: {_e(g.label)}",
@@ -126,10 +142,41 @@ _NOT_ESTABLISHED: Dict[str, Callable[[GapItem], str]] = {
 }
 
 
+def _prioritised(gaps: Sequence[GapItem]) -> List[GapItem]:
+    """``gaps`` with the critical kinds first (in :data:`CRITICAL_KINDS` order), then the others, lead-only last."""
+    rank = {kind: i for i, kind in enumerate((*CRITICAL_KINDS, *_OTHER_KINDS))}
+    return sorted((g for g in gaps if g.kind in rank), key=lambda g: rank[g.kind])
+
+
+def _ids(items: Sequence[GapItem]) -> str:
+    return ", ".join(g.item_id for g in items)
+
+
+def _capped(critical: List[str], others: List[str]) -> List[str]:
+    """Every critical line, then as many other lines as fit; an explicit line says how many were dropped."""
+    kept = others[: max(0, MAX_LINES - len(critical))]
+    dropped = len(others) - len(kept)
+    return [*critical, *kept, *([_OMITTED_LINE.format(n=dropped)] if dropped else [])]
+
+
 def not_established_lines(gaps: Sequence[GapItem]) -> List[str]:
-    """Fixed-wording "not established" lines, each tagged with its id."""
-    lines = [f"- {_NOT_ESTABLISHED[g.kind](g)} [{g.item_id}]" for g in gaps if g.kind in _NOT_ESTABLISHED]
-    return lines[:MAX_LINES]
+    """Fixed-wording "not established" lines, each tagged with its id.
+
+    Critical lines first and never dropped; many lead-only findings become one line listing their ids; anything else
+    that does not fit is replaced by an explicit omission line.
+    """
+    ordered = [g for g in _prioritised(gaps) if g.kind in _NOT_ESTABLISHED]
+    leads = [g for g in ordered if g.kind == LEAD_ONLY]
+    collapse = len(leads) > COLLAPSE_LEADS_ABOVE
+    critical = [f"- {_NOT_ESTABLISHED[g.kind](g)} [{g.item_id}]" for g in ordered if g.kind in CRITICAL_KINDS]
+    others = [f"- {_NOT_ESTABLISHED[g.kind](g)} [{g.item_id}]" for g in ordered
+              if g.kind not in CRITICAL_KINDS and not (collapse and g.kind == LEAD_ONLY)]
+    if collapse:
+        others.append(
+            f"- {len(leads)} findings each rest on a single source and are leads only; each needs a second "
+            f"independent source. [{_ids(leads)}]"
+        )
+    return _capped(critical, others)
 
 
 # --------------------------------------------------------------------------------------- next steps
@@ -177,14 +224,28 @@ _NEXT_STEPS: Dict[str, Callable[[GapItem], str]] = {
 
 
 def next_step_lines(gaps: Sequence[GapItem]) -> List[str]:
-    """Fixed-menu lawful next steps, each tagged with the id of the gap it answers (duplicates are merged)."""
-    seen: Dict[str, str] = {}
-    for gap in gaps:
+    """Fixed-menu lawful next steps, each tagged with the id of the gap it answers (duplicates are merged).
+
+    Same order and limits as :func:`not_established_lines`: critical steps first, never dropped; many lead-only steps
+    become one line listing the ids; an explicit omission line replaces anything else that does not fit.
+    """
+    ordered = _prioritised(gaps)
+    leads = [g for g in ordered if g.kind == LEAD_ONLY]
+    collapse = len(leads) > COLLAPSE_LEADS_ABOVE
+    critical: Dict[str, str] = {}
+    others: Dict[str, str] = {}
+    for gap in ordered:
         build = _NEXT_STEPS.get(gap.kind)
         step = build(gap) if build else ""
-        if step and step not in seen:
-            seen[step] = gap.item_id
-    limits = next((g.item_id for g in gaps if g.kind == STANDING_LIMITS), "")
-    if limits and _ARCHIVE_STEP not in seen:
-        seen[_ARCHIVE_STEP] = limits
-    return [f"- {step} [{item_id}]" for step, item_id in seen.items()][:MAX_LINES]
+        if not step or (collapse and gap.kind == LEAD_ONLY):
+            continue
+        bucket = critical if gap.kind in CRITICAL_KINDS else others
+        if step not in critical and step not in others:
+            bucket[step] = gap.item_id
+    limits = next((g.item_id for g in ordered if g.kind == STANDING_LIMITS), "")
+    if limits and _ARCHIVE_STEP not in critical:
+        critical[_ARCHIVE_STEP] = limits
+    lines_others = [f"- {step} [{item_id}]" for step, item_id in others.items()]
+    if collapse:
+        lines_others.append(f"- Seek a second independent source for each lead-only finding. [{_ids(leads)}]")
+    return _capped([f"- {step} [{item_id}]" for step, item_id in critical.items()], lines_others)

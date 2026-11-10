@@ -66,7 +66,7 @@ def test_unsafe_unknown_id_text_is_not_echoed(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_invisible_characters_never_reach_the_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    reply = GOOD_ANALYSIS.replace("Jane Q Example is recorded", "Jane Q Example ‮tsiluc​ is recorded", 1)
+    reply = GOOD_ANALYSIS.replace("Acme Holdings Ltd is owned", "Acme Holdings Ltd ‮tsiluc​ is owned", 1)
     monkeypatch.setattr(pi_narrative, "complete_with_fallback", FakeLLM(outcome(reply)))
     out = tmp_path / "r.md"
     pi_commands.write_pi_report(build_pi_report, narrative_result(), out)

@@ -371,20 +371,14 @@ NOT_HOSTILE_AFTER_CONVERSION = {
     ("r1x", "capital tool name lowercase 'github'"): "legitimate: a lowercase 'github' is ordinary text",
     ("r2", "M24"): "legitimate: the handle is in the evidence",
 }
-#: Cases that pass the validator: documented limits of a token and word screen (see docs/PI_STREAM.md).
+#: Cases that pass the validator: documented limits of a token and word screen (see docs/PI_STREAM.md). Round 3
+#: removed the entries the identity and ownership screen now rejects (controlled, probably, son, is X's, owned, husband).
 ACCEPTED_LIMITS = {
-    ("r1", "12 lowercase name"): "a lowercase invented name cannot be told from ordinary words",
     ("r2", "D10"): "a real evidence date attached to the wrong event (cited but misread)",
     ("r2", "D11"): "a real evidence year attached to the wrong event (cited but misread)",
-    ("r2", "M02"): "a lowercase invented name cannot be told from ordinary words",
     ("r2", "M15"): "a lowercase invented place cannot be told from ordinary words",
-    ("r2", "E31"): "speculation written in lowercase words around an evidence name",
-    ("r2", "E37"): "an invented relation (son) in lowercase words around an evidence name",
-    ("r2", "E38"): "an invented claim in lowercase words around an evidence name",
     ("r2", "E45"): "an invented fact in lowercase words (cash business)",
     ("r2", "E46"): "an invented fact in lowercase words (high turnover)",
-    ("r2", "E47"): "a lowercase restatement with an invented fact (nominee)",
-    ("r2", "E48"): "an invented relation (husband) around an evidence token",
 }
 
 
