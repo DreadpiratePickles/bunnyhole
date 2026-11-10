@@ -18,11 +18,15 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from bunnyhole.engine.graph import InvestigationGraph
-from bunnyhole.engine.llm_providers import PROVIDER_ORDER, complete_with_fallback, configured_providers
+from bunnyhole.engine.llm_providers import PROVIDER_ORDER, complete_with_fallback, configured_providers, llm_max_tokens
 from bunnyhole.engine.models import ConfidenceTier, DomainCategory, SelectorStrength
 
 STAGE2_METHOD = "deterministic_evidence_rubric"
 STAGE2_LABEL = "Deterministic evidence ranking (not peer review)"
+
+#: Per-provider-attempt HTTP timeout for council LLM calls. A thinking model with the shared token budget can
+#: legitimately take a while.
+COUNCIL_LLM_TIMEOUT_S = 120.0
 
 
 def deterministic_rubric_score(stage1_result: Dict[str, Any]) -> float:
@@ -286,8 +290,8 @@ class InvestigativeCouncil:
             providers=PROVIDER_ORDER,
             openrouter_model=preferred_model,
             fast=fast,
-            max_tokens=900,
-            timeout=20.0,
+            max_tokens=llm_max_tokens(),
+            timeout=COUNCIL_LLM_TIMEOUT_S,
             graph=self.graph,
             purpose=purpose,
         )
