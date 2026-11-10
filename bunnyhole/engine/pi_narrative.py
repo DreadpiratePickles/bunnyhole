@@ -51,7 +51,7 @@ MAX_RETRIES = 1
 _MAX_REASON_CHARS = 300
 _MAX_FEEDBACK_ITEMS = 8
 NO_CONNECTIONS_REASON = "the model found no connections between findings"
-_ID_AT_END_RE = re.compile(r"\[([A-Z]\d+)\]$")
+_IDS_AT_END_RE = re.compile(r"\[([A-Z]\d+(?:, [A-Z]\d+)*)\]$")
 
 AnalysisStatus = Literal["included", "omitted", "skipped"]
 
@@ -140,8 +140,8 @@ def _section(text: str, evidence: NarrativeEvidence, outcome: LLMOutcome) -> str
         lead = re.match(r"^- \[([^\]]+)\]", line)
         used += [part.split(" ")[0] for part in lead.group(1).split(", ")] if lead else []
     for line in [*not_established, *next_steps]:  # "- text [G1]": the id comes last
-        tail = _ID_AT_END_RE.search(line)
-        used += [tail.group(1)] if tail else []
+        tail = _IDS_AT_END_RE.search(line)
+        used += tail.group(1).split(", ") if tail else []
     used = [i for i in used if i in evidence.key]
     who = f"{_inline(outcome.model or 'unknown model')} via {_inline(outcome.provider or 'unknown provider')}"
     footer = (
@@ -212,7 +212,8 @@ async def generate_ai_analysis(result: dict) -> AiAnalysis:
     try:
         return await _generate(result)
     except Exception as exc:  # noqa: BLE001 - reported in the note and the log; a failure here must not lose the report
-        logger.warning("PI report analysis failed: %s", type(exc).__name__, exc_info=True)
+        # Class name only, never exc_info or str(exc): an unexpected exception may carry a key, a URL or a record.
+        logger.warning("PI report analysis failed with an unexpected %s", type(exc).__name__)
         return AiAnalysis(status="omitted", reason=f"internal error ({type(exc).__name__})")
 
 

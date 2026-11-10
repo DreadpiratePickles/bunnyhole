@@ -118,7 +118,7 @@ def narrative_result(*, bio: str = INJECTION, subject_is_person: bool = False) -
 
 
 GOOD_ANALYSIS = """### Connections
-- [F1,F2,O1] Jane Q Example is recorded as the owner of Acme Holdings Ltd at 60% according to companies_house.
+- [F1,F2,O1] Acme Holdings Ltd is owned by Jane Q Example at 60% according to companies_house.
 - [F3] The GitHub account @janex on GitHub rests on a single source and may be unrelated to the other findings.
 """
 

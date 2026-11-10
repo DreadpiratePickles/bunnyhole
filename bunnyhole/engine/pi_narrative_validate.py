@@ -51,7 +51,9 @@ from bunnyhole.engine.pi_narrative_checks import (
     obfuscation,
     too_short,
 )
+from bunnyhole.engine.pi_narrative_feedback import echoable_word, invented_class
 from bunnyhole.engine.pi_narrative_input import NarrativeEvidence
+from bunnyhole.engine.pi_narrative_screens import content_free, duplicate_ids, identity_or_ownership
 
 SECTION_HEADING = "Connections"
 HEADING_LINE = f"### {SECTION_HEADING}"
@@ -77,6 +79,9 @@ REASON_TEXT: Dict[str, str] = {
     "certainty": "it used a label or certainty word",
     "advice": "it gave advice, named a method or started with an instruction, which the code builds instead",
     "accusation": "it used an accusation word the evidence does not contain",
+    "duplicate_id": "a tag repeated an id",
+    "repetitive": "a bullet had too little content (repeated words or mostly punctuation)",
+    "identity": "it asserted an identity, an ownership, a relation or a probability in its own words",
     "invented": "it named a number, month, address, handle or name that is not in the evidence",
     "language": "it was not in English",
     "no_connections": "the model found no connections between findings",
@@ -90,6 +95,12 @@ _FEEDBACK: Dict[str, str] = {
     "certainty": "bullet {n} uses a label or certainty word",
     "advice": "bullet {n} gives advice, names a method or starts with an instruction",
     "accusation": "bullet {n} uses an accusation word that the evidence does not contain",
+    "duplicate_id": "bullet {n} repeats an id inside its tag",
+    "repetitive": "bullet {n} has too little content: use at least three distinct words of three letters or more",
+    "identity": (
+        "bullet {n} states an identity, ownership, relation or probability in its own words; state an ownership "
+        "edge only as the exact phrase of its O line"
+    ),
     "invented": "bullet {n} names a number, month, address, handle or capitalised word that is not in the evidence",
     "language": "bullet {n} is not in English",
 }
@@ -98,11 +109,17 @@ _UNSAFE_ID_TEXT = "an unknown citation id"
 
 @dataclass(frozen=True)
 class Violation:
-    """One failed check. ``detail`` is for logs and tests only: it is never put into a prompt, note or report."""
+    """One failed check. ``detail`` is for logs and tests only: it is never put into a prompt, note or report.
+
+    ``word`` is the offending word only when it is in the validator's own fixed vocabulary (so a retry prompt may
+    echo it); ``word_class`` is a fixed description of what kind of item was offending. Both are safe to print.
+    """
 
     code: str
     detail: str = ""
     bullet: int = 0
+    word: str = ""
+    word_class: str = ""
 
 
 class Bullet(NamedTuple):
@@ -123,6 +140,10 @@ def feedback_lines(violations: Sequence[Violation]) -> List[str]:
             text = f"unknown id {v.detail}" if _SAFE_ID_RE.match(v.detail) else _UNSAFE_ID_TEXT
         elif v.code in _FEEDBACK and v.bullet:
             text = _FEEDBACK[v.code].format(n=v.bullet)
+            if v.word_class:
+                text += f"; first offending item: {v.word_class}"
+            if v.word:
+                text += f" ('{v.word}')"
         else:
             text = REASON_TEXT[v.code]
         if text not in lines:
@@ -201,11 +222,19 @@ def _check_bullet(
     found: List[Violation] = []
 
     def flag(code: str, detail: str = "") -> None:
-        found.append(Violation(code, _clip(detail), number))
+        found.append(Violation(code, _clip(detail), number, echoable_word(detail)))
+
+    def flag_invented(item: str) -> None:
+        word_class, word = invented_class(item)
+        found.append(Violation("invented", _clip(item), number, word, word_class))
 
     text = bullet.text
     if line_length > MAX_BULLET_CHARS or _sentence_count(text) > MAX_SENTENCES or too_short(text):
         flag("bullets")
+    elif content_free(text):
+        flag("repetitive")
+    if duplicate_ids(bullet.ids):
+        flag("duplicate_id")
     for item_id in dict.fromkeys(bullet.ids):
         if item_id in idx.model_ids:
             continue
@@ -214,7 +243,7 @@ def _check_bullet(
         flag("markup")
     word = obfuscation(text)
     if word:
-        flag("invented", word)
+        flag_invented(word)
     word = excluded_topic(text)
     if word:
         flag("topic", word)
@@ -227,10 +256,13 @@ def _check_bullet(
     word = accusation(text, list(bullet.ids), idx)
     if word:
         flag("accusation", word)
+    word = identity_or_ownership(text, bullet.ids, idx.names, idx.lines)
+    if word:
+        flag("identity", word)
     if not language_ok(text, idx):
         flag("language")
     for item in invented_specifics(text, idx):
-        flag("invented", item)
+        flag_invented(item)
     return found
 
 

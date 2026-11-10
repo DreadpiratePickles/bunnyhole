@@ -113,15 +113,15 @@ def test_only_f_and_o_ids_of_the_prompt_are_citable(evidence: NarrativeEvidence)
 
 
 def test_bullet_shape_limits(evidence: NarrativeEvidence) -> None:
-    ok = "- [F1] Acme Holdings Ltd is owned by Jane Q Example."
+    ok = "- [F1,O1] Acme Holdings Ltd is owned by Jane Q Example."
     rejects(wrap(*([ok] * (MAX_BULLETS + 1))), "bullets", evidence)
     accepts(wrap(*([ok] * MAX_BULLETS)), evidence)
-    rejects(bullet("Acme Holdings Ltd is owned by Jane Q Example. " * 3), "bullets", evidence)
-    rejects(bullet("Acme Holdings Ltd is owned by Jane Q Example and " + "it is also described by gleif " * 20), "bullets", evidence)
+    rejects(bullet("Acme Holdings Ltd is owned by Jane Q Example. " * 3, "[F1,O1]"), "bullets", evidence)
+    rejects(bullet("Acme Holdings Ltd is owned by Jane Q Example and " + "it is also described by gleif " * 20, "[F1,O1]"), "bullets", evidence)
     rejects(bullet("Acme."), "bullets", evidence)
     rejects(bullet("---."), "bullets", evidence)
-    accepts(bullet("Acme Holdings Ltd is owned by Jane Q Example. It is also described by gleif."), evidence)
-    accepts(bullet("Acme Holdings Ltd. is owned by Jane Q Example."), evidence)
+    accepts(bullet("Acme Holdings Ltd is owned by Jane Q Example. It is also described by gleif.", "[F1,O1]"), evidence)
+    accepts(bullet("Acme Holdings Ltd. is owned by Jane Q Example.", "[F1,O1]"), evidence)
 
 
 def test_square_brackets_only_in_the_tag(evidence: NarrativeEvidence) -> None:
@@ -147,7 +147,7 @@ def test_accented_latin_letters_are_allowed_when_in_the_evidence() -> None:
     result["pi"]["findings"][0]["label"] = "Société Acme Ltd"
     evidence = build_evidence(result)
     assert evidence is not None
-    accepts(bullet("Société Acme is owned by Jane Q Example."), evidence)
+    accepts(bullet("Société Acme appears with Jane Q Example in the companies_house record."), evidence)
 
 
 # ------------------------------------------------------------------------------------- evidence-derived tokens
@@ -192,7 +192,7 @@ def test_specifics_must_come_from_the_evidence(sentence: str, evidence: Narrativ
 @pytest.mark.parametrize(
     "sentence",
     [
-        "Jane Q Example owns 60% of Acme Holdings Ltd.",
+        "Jane Q Example appears with 60% in the edge for Acme Holdings Ltd.",
         "Acme Holdings Ltd has 3 sources.",
         "Acme Holdings Ltd is described by 3 sources.",
         "The ownership edge is dated 2024-01-01 and so falls in January 2024.",
@@ -239,7 +239,7 @@ def test_capitalised_words_must_be_in_the_evidence(sentence: str, evidence: Narr
 
 def test_function_words_may_start_a_sentence(evidence: NarrativeEvidence) -> None:
     accepts(bullet("Both records name Acme Holdings Ltd. This is how Jane Q Example is tied to it."), evidence)
-    accepts(bullet("It is the same tool, companies_house, that names Acme Holdings Ltd."), evidence)
+    accepts(bullet("It is the tool companies_house that names Acme Holdings Ltd."), evidence)
 
 
 def test_language_gate(evidence: NarrativeEvidence) -> None:
@@ -368,7 +368,7 @@ def test_render_shows_the_codes_label_next_to_every_tag(evidence: NarrativeEvide
 
 
 def test_render_escapes_markdown_and_emits_plain_list_items_only(evidence: NarrativeEvidence) -> None:
-    text = bullet("Acme Holdings Ltd (see: jane_q) is owned by Jane Q Example & others @janex.")
+    text = bullet("Acme Holdings Ltd (see: jane_q) appears with Jane Q Example & others @janex.")
     accepts(text, evidence)
     rendered = render_connections(text, dict(evidence.finding_labels))
     assert "\\(" in rendered and "\\)" in rendered and "\\_" in rendered and "\\&" in rendered
@@ -441,11 +441,11 @@ def test_realistic_outputs_pass_the_validator(evidence: NarrativeEvidence) -> No
 
 NATURAL_SENTENCES = [
     "Acme Holdings Ltd is supported by 3 sources, so it is the best-documented finding.",
-    "Jane Q Example appears as the owner of Acme Holdings Ltd, with 60% recorded by companies_house.",
-    "Jane Q Example is a probable finding with 2 sources and aging freshness.",
+    "Jane Q Example appears as a party to Acme Holdings Ltd, with 60% recorded by companies_house.",
+    "Jane Q Example is a finding with 2 sources and aging freshness.",
     "The GitHub account @janex on GitHub is a single-source finding and may belong to a different person.",
-    "Legal ownership runs from Acme Holdings Ltd to Jane Q Example.",
-    "This would be consistent with Jane Q Example controlling Acme Holdings Ltd.",
+    "Legal ownership is described from Acme Holdings Ltd to Jane Q Example.",
+    "This would be consistent with a link between Jane Q Example and Acme Holdings Ltd.",
     "Acme Holdings Ltd and Jane Q Example are connected through the ownership edge.",
     "Both the registry record and the GLEIF record name Acme Holdings Ltd.",
     "Ownership data comes from companies_house and is dated 2024-01-01.",

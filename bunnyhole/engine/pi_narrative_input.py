@@ -53,6 +53,7 @@ MAX_COVERAGE_ROWS = 12
 MAX_NOTES = 5
 _NAME_CHARS = 120
 _URL_CHARS = 200
+_NOTE_CHARS = 300  # identity notes, contradictions and chronology gaps: whole up to here, cut at a word beyond
 
 # Gap kinds: what a code-rendered "not established" line and its next step are keyed by.
 STANDING_LIMITS = "standing_limits"
@@ -96,6 +97,7 @@ class NarrativeEvidence:
     gaps: Tuple[GapItem, ...]  # structured gaps, rendered by code
     values: Tuple[str, ...]  # every data string sent; each must be printed by the report
     extra_words: FrozenSet[str]  # vocabulary the validator accepts that is not itself sent (jurisdiction words)
+    names: FrozenSet[str] = frozenset()  # printed names of the findings and of the ownership edges' parties
 
     @property
     def known_ids(self) -> FrozenSet[str]:
@@ -147,6 +149,7 @@ class _Builder:
         self.model_ids: List[str] = []
         self.gaps: List[GapItem] = []
         self.values: List[str] = []
+        self.names: List[str] = []
         self._counts: Dict[str, int] = {}
 
     def heading(self, title: str) -> None:
@@ -181,7 +184,7 @@ class _Builder:
         """An id that is NOT in the prompt: a structured gap that code renders."""
         item_id = self._next(family)
         self.key[item_id] = KeyEntry(clean(description, 160), ())
-        self.gaps.append(GapItem(item_id, kind, clean(label, 200), tuple(clean(n, 160) for n in names)))
+        self.gaps.append(GapItem(item_id, kind, clean(label, _NOTE_CHARS), tuple(clean(n, 160) for n in names)))
         return item_id
 
 
@@ -234,6 +237,7 @@ def _add_findings(
             values=(name, label.value, freshness, relevance),
         )
         labels[item_id] = label.value
+        builder.names.append(name)
         if label.value == "lead":
             builder.gaps.append(GapItem(item_id, LEAD_ONLY, name))
         for entry in entries:
@@ -279,12 +283,12 @@ def _record_coverage_and_gaps(builder: _Builder, block: PIBlock) -> None:
             outcome = clean(row.outcome, 20) or "unknown"
             builder.gap("G", SEARCHED, source_class, f"source class {source_class}: searched, outcome {outcome}",
                         [outcome])
-    for note in _unique([_unescaped(n) for n in _distinct(block.identity_notes)], MAX_NOTES, 200):
+    for note in _unique([_unescaped(n) for n in _distinct(block.identity_notes)], MAX_NOTES, _NOTE_CHARS):
         builder.gap("G", IDENTITY_NOTE, note, f"identity note: {note}")
     for item in block.contradictions[:MAX_NOTES]:
         text = f"{clean(item.kind, 40)}: {clean(item.description, 200)}"
         builder.gap("G", CONTRADICTION, text, f"contradiction ({text})")
-    for gap in _unique([_unescaped(g) for g in _distinct(block.evidence_gaps)], MAX_NOTES, 200):
+    for gap in _unique([_unescaped(g) for g in _distinct(block.evidence_gaps)], MAX_NOTES, _NOTE_CHARS):
         builder.gap("G", CHRONOLOGY_GAP, gap, f"chronology gap: {gap}")
 
 
@@ -298,6 +302,7 @@ def _add_ownership(builder: _Builder, block: PIBlock, index: Mapping[str, Mappin
         pct = f"{edge.pct:g}%" if edge.pct is not None else "unknown"
         child, parent = _name_of(edge.child, index), _name_of(edge.parent, index)
         source, as_of = clean(edge.source, 40) or "unknown", clean(edge.as_of, 20) or "unknown"
+        builder.names += [child, parent]
         builder.add(
             "O", f"{child} is owned by {parent} | pct={pct} | source={source} | as_of={as_of}",
             f"ownership edge: {child} owned by {parent}", values=(child, parent, pct, source, as_of),
@@ -353,4 +358,5 @@ def build_evidence(result: Mapping[str, Any]) -> Optional[NarrativeEvidence]:
         gaps=tuple(builder.gaps),
         values=tuple(builder.values),
         extra_words=_jurisdiction_words(engagement.jurisdiction),
+        names=frozenset(n for n in builder.names if n),
     )
