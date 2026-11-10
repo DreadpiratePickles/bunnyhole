@@ -307,7 +307,7 @@ Watchlist hits show as `watchlist_hits` in results. Profile is `~/.bunnyhole/pro
 **Cases:** every `trace`/`intake` run is saved automatically (`link`: **unverified**) to `~/.bunnyhole/cases.db`.
 `cases` (list), `cases -q acme.io` (cross-case sightings), `cases -l bh_xxxxxxxx` (re-display summary; for files use `--out`/`--json` at run time).
 
-**Exports:** `--out FILE.md` full dossier; `--json FILE.json` full graph (gains a `pi` key with `--pi`); `--pi-report FILE.md` PI report.
+**Exports:** `--out FILE.md` full dossier; `--json FILE.json` full graph (gains a `pi` key with `--pi`); `--pi-report FILE.md` PI report (with a provider key set it also gets a validated, labelled AI-analysis section; `--no-ai-analysis` skips it, see docs/PI_STREAM.md section 7).
 
 ---
 

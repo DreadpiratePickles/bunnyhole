@@ -327,6 +327,7 @@ def intake_command(
     subject_type: Optional[SubjectType] = typer.Option(None, "--subject-type", help="PI: person or entity (default person). Needs --pi."),
     pi_jurisdiction: Optional[str] = typer.Option(None, "--pi-jurisdiction", help="PI: jurisdiction for custodians and legal notes, e.g. us, ca-on, uk. Needs --pi."),
     pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
+    no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: leave the AI-written analysis section out of --pi-report (no LLM call is made). The section is only added when a provider key is configured. Needs --pi-report."),
     confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
 ) -> None:
     """Run a Dual-Mode Case Intake investigation combining a Working Hypothesis with multiple known credentials/selectors."""
@@ -335,6 +336,7 @@ def intake_command(
             d = evt["data"]
             console.print(f"[dim][{d['agent'].upper()}][/dim] [bold]{_rich_escape(str(d['action']))}[/bold] ({_rich_escape(str(d['target']))}): {_rich_escape(str(d['detail']))}")
 
+    pi_commands.require_report_for_ai_flag(no_ai_analysis, pi_report)
     engagement, persona = pi_commands.resolve_pi_flags(
         pi=pi, case_type=case_type, purpose=purpose, client=client, matter_ref=matter_ref,
         subject_type=subject_type, pi_jurisdiction=pi_jurisdiction, pi_report=pi_report, persona=persona,
@@ -395,7 +397,7 @@ def intake_command(
     _render_investigation_results(result)
     if engagement is not None:
         pi_commands.render_pi_summary(result)
-        pi_commands.write_pi_report(report_builder, result, pi_report)
+        pi_commands.write_pi_report(report_builder, result, pi_report, ai_analysis=not no_ai_analysis)
 
     if out:
         md = orch.graph.export_markdown_dossier()
@@ -435,6 +437,7 @@ def trace_command(
     subject_type: Optional[SubjectType] = typer.Option(None, "--subject-type", help="PI: person or entity (default person). Needs --pi."),
     pi_jurisdiction: Optional[str] = typer.Option(None, "--pi-jurisdiction", help="PI: jurisdiction for custodians and legal notes, e.g. us, ca-on, uk. Needs --pi."),
     pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
+    no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: leave the AI-written analysis section out of --pi-report (no LLM call is made). The section is only added when a provider key is configured. Needs --pi-report."),
     confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
 ) -> None:
     """Run an autonomous multi-domain Bunnyhole investigation down the rabbit hole.
@@ -473,6 +476,7 @@ def trace_command(
             subject_type=subject_type,
             pi_jurisdiction=pi_jurisdiction,
             pi_report=pi_report,
+            no_ai_analysis=no_ai_analysis,
             confirm_entity=confirm_entity,
         )
         return
@@ -482,6 +486,7 @@ def trace_command(
             d = evt["data"]
             console.print(f"[dim][{d['agent'].upper()}][/dim] [bold]{_rich_escape(str(d['action']))}[/bold] ({_rich_escape(str(d['target']))}): {_rich_escape(str(d['detail']))}")
 
+    pi_commands.require_report_for_ai_flag(no_ai_analysis, pi_report)
     engagement, persona = pi_commands.resolve_pi_flags(
         pi=pi, case_type=case_type, purpose=purpose, client=client, matter_ref=matter_ref,
         subject_type=subject_type, pi_jurisdiction=pi_jurisdiction, pi_report=pi_report, persona=persona,
@@ -502,7 +507,7 @@ def trace_command(
     _render_investigation_results(result)
     if engagement is not None:
         pi_commands.render_pi_summary(result)
-        pi_commands.write_pi_report(report_builder, result, pi_report)
+        pi_commands.write_pi_report(report_builder, result, pi_report, ai_analysis=not no_ai_analysis)
 
     if out:
         md = orch.graph.export_markdown_dossier()
@@ -1131,7 +1136,7 @@ def menu_command(ctx: typer.Context) -> None:
                 wallet=None, domain=None, doc=None, exclude=None,
                 anchor_mode=AnchorMode.CONVERGENCE, out=None, json_out=None,
                 pi=False, case_type=None, purpose=None, purpose_category=None, client=None, matter_ref=None,
-                subject_type=None, pi_jurisdiction=None, pi_report=None, confirm_entity=False,
+                subject_type=None, pi_jurisdiction=None, pi_report=None, no_ai_analysis=False, confirm_entity=False,
             )
         elif choice == "2":
             ea = Prompt.ask("Enter Entity A", default="vitalik.eth")

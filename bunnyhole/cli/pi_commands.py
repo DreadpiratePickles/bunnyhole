@@ -8,6 +8,7 @@ Nothing here touches the network: the ``pi`` commands only render the static tab
 
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -239,13 +240,52 @@ def load_report_builder(pi_report: Optional[Path]) -> Optional[Callable[[Dict[st
     return build_pi_report
 
 
+def require_report_for_ai_flag(no_ai_analysis: bool, pi_report: Optional[Path]) -> None:
+    """``--no-ai-analysis`` only means something together with ``--pi-report`` (exit 2 otherwise, like every PI option)."""
+    if no_ai_analysis and pi_report is None:
+        raise _refuse(
+            "--no-ai-analysis only applies together with --pi-report (it leaves the AI-written analysis section out "
+            "of that report). Add --pi and --pi-report, or drop the option.",
+            title="PI option without --pi-report",
+        )
+
+
+def _report_with_ai_analysis(report: str, result: Dict[str, Any]) -> str:
+    """``report`` plus the AI analysis section or the one-line note. Prints what happened; never raises."""
+    from bunnyhole.engine.pi_narrative import append_ai_analysis, generate_ai_analysis
+
+    analysis = asyncio.run(generate_ai_analysis(result))
+    if analysis.status == "included":
+        console.print(Text(f"✔ AI analysis added to the report ({analysis.model}, {analysis.provider}).", style="green"))
+    elif analysis.status == "omitted":
+        console.print(Text(f"⚠ AI analysis not included: {analysis.reason}", style="yellow"))
+    else:
+        console.print(Text(f"AI analysis skipped: {analysis.reason}.", style="dim"))
+    return append_ai_analysis(report, analysis)
+
+
 def write_pi_report(
-    builder: Optional[Callable[[Dict[str, Any]], str]], result: Dict[str, Any], pi_report: Optional[Path]
+    builder: Optional[Callable[[Dict[str, Any]], str]],
+    result: Dict[str, Any],
+    pi_report: Optional[Path],
+    *,
+    ai_analysis: bool = True,
 ) -> None:
-    """Write the BOTTOM-LINE-UP-FRONT PI report for ``result`` to ``pi_report`` (no-op when not requested)."""
+    """Write the BOTTOM-LINE-UP-FRONT PI report for ``result`` to ``pi_report`` (no-op when not requested).
+
+    The code-built report is always written. With ``ai_analysis`` (the default) and a configured LLM provider, a
+    validated, clearly labelled AI-written section is appended after it, or a one-line note when the analysis failed
+    (see :mod:`bunnyhole.engine.pi_narrative`); ``--no-ai-analysis`` turns it off and nothing is sent to a provider.
+    """
     if builder is None or pi_report is None:
         return
-    pi_report.write_text(builder(result), encoding="utf-8")
+    report = builder(result)
+    if ai_analysis:
+        pi_report.write_text(report, encoding="utf-8")  # the code-built report is on disk before any model call
+        report = _report_with_ai_analysis(report, result)
+    else:
+        console.print(Text("AI analysis skipped: switched off with --no-ai-analysis.", style="dim"))
+    pi_report.write_text(report, encoding="utf-8")
     console.print(f"[bold green]✔ Saved PI Report to:[/bold green] {pi_report}")
 
 

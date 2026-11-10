@@ -135,6 +135,7 @@ CourtListener token were not set (both logged as skipped), not that nothing exis
 | `--confirm-entity` | off | Overrides the person-vs-entity check for a seed that reads like a person (for example "Maple Leaf Roofing", no legal form). Only meaningful with `--subject-type entity`; it overrides the check completely. |
 | `--pi-jurisdiction` | empty | e.g. `us`, `ca-on`, `uk`. Picks the legal instrument named for each custodian; unknown or empty falls back to a generic cross-border route (MLAT, letter of request). |
 | `--pi-report` | none | Path for the Markdown report. |
+| `--no-ai-analysis` | off | Leaves the AI-written analysis section out of `--pi-report` and makes no LLM call. Needs `--pi-report` (exit 2 otherwise). Only new flag of the AI analysis: there was no earlier LLM opt-out; the synthesizer is switched off only by having no provider key. |
 
 `--cred` is refused with `--pi` (exit 2). The usual `--gear`, `--depth`, `--breadth`, `--hypothesis`,
 other selector flags work as before. `--proxy` and `--tor` are global flags and go before the command
@@ -325,6 +326,34 @@ engagement jurisdiction (for example a subpoena or court order in the US, a Norw
 Ontario or the UK, MLAT or letter of request cross-border). The handoff sheet turns that into lines a
 licensed investigator or counsel can act on. For an entity subject the sheet gives action lines such as "Verify the sanctions hit on the primary list: <url>" (or the lists that were not screened) and "Confirm corporate status and beneficial ownership on the primary registry", rather than "Run through licensed database" for company addresses; person subjects and `locate` or `missing_person` cases still get the licensed-database and field-verification lines. Nothing is sent by Bunnyhole.
 
+**AI analysis (optional, AI-written, added after the sixteen sections).** With a provider key configured (`GEMINI_API_KEY`,
+`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, tried in that order, the synthesizer's own switch) and `--pi-report`, one extra LLM call
+asks a model to connect the findings the way an investigator would: `Connections`, `Timeline`, `What is not established`,
+`Suggested next steps (lawful)`. It is additive: the Bottom line, labels and sanctions text are code-built and unchanged, and the
+section sits under `## AI analysis (AI-written, not independently verified; not clearance)`.
+
+- **Rules.** The model's system prompt is [`bunnyhole/engine/pi_report_rules.md`](../bunnyhole/engine/pi_report_rules.md), a distilled
+  field-method rulebook (triangulation, identifier discipline, systematic exhaustion, sanctions, ownership, provenance, legal lines,
+  output contract). It ships inside the package. Edit that file to change the analyst's behaviour; the contract it states is
+  enforced by code, so keep both in step (a test checks the headings and the two empty-section lines).
+- **Validated before it is written.** Every sentence must end in a citation tag (`[F3]`, `[F2,F5]`) that points at an item the code
+  supplied (`F` findings, `S` sanctions, `W` set-aside weak matches, `G` gaps and limits, `O` ownership). The text is rejected if it
+  cites an unknown id, leaves a claim uncited, contains a URL, domain, email, phone number, hash, receipt id, ISO date, year or
+  capitalised name that is not in the evidence, names an unlawful method, upgrades a label (calls a lead confirmed) or says
+  cleared / no risk. One retry with the reasons; then the section is omitted and the report ends with one line,
+  `AI analysis not included: <reason>`. The validator is a keyword and token screen, not understanding: it cannot tell that a
+  fluent sentence misreads a record, and it does not catch a lowercase invented name or a paraphrase of a forbidden method.
+- **Costs.** One extra call per report, at most two with the retry, 120 s per call, the shared `BUNNYHOLE_LLM_MAX_TOKENS` budget.
+  No key, `--no-ai-analysis`, no relevant finding or a missing PI block: no call, the report is exactly the code-built one.
+  Any failure (provider error, truncation, validation) leaves the rest of the report as it was and adds the note.
+- **What is sent to the provider** (through the same `--proxy`/`--tor` route as the synthesizer): the subject, subject kind, case
+  type, purpose category and jurisdiction; for each relevant finding its label, source count, freshness and up to three receipts
+  (receipt id, tool, URL, SHA-256, an extract of at most 200 characters); the sanctions status, lists screened and not screened,
+  possible and weak matches; coverage and gap lines, identity notes, contradictions; ownership edges; dated timeline events. This is
+  wider than the synthesizer in that it includes URLs, the sanctions and coverage picture and ownership, and it is all already
+  printed in the report. Not sent: the client name, matter reference or purpose text, raw page snippets, unrelated records, API keys.
+  The model's own name and provider appear in the section footer; a citation key resolves each cited id to its receipt ids.
+
 ---
 
 ## 8. Free sources added by this stream
@@ -390,6 +419,7 @@ See `PISourcesAgent` in `bunnyhole/agents/pi_sources.py` and the list machinery 
 - **Companies House.** Unit tests use mocked responses. Unless you have run it with a real key, treat the parser as untested against the live API.
 - **Ontario and Canada.** PSISA licensing, PIPEDA, Criminal Code s.184 and s.264 are marked unverified. Verify with the Ministry of the Solicitor General and counsel.
 - **Single pass.** One run, one human gate. There is no loop and no oracle; corroborate before relying.
+- **The AI analysis is checked by code, not understood by it.** See section 7. It can still be wrong about what a cited record means; the code-built Bottom line governs, and the section is labelled not independently verified. Its validator and rules file were never run against a live model in the test suite (all tests use fakes).
 
 ---
 

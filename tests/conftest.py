@@ -319,3 +319,16 @@ def _hermetic_network(request: pytest.FixtureRequest):
             + "\n".join(dict.fromkeys(attempts)),
             pytrace=False,
         )
+
+
+_LLM_KEY_ENV_VARS = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_llm_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer's real provider keys must not decide whether a test reaches an LLM code path.
+
+    Tests that need a provider set a fake key themselves (``monkeypatch.setenv``) and mock the HTTP layer.
+    """
+    for name in _LLM_KEY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
