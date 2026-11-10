@@ -356,17 +356,25 @@ model and provider.
   cited evidence does not contain, advice, methods and instructions. A failed check gets one retry with fixed-wording reasons (never
   the model's own text); after that the section is left out and the report ends with one line, `AI analysis not included: <reason>`.
   `None.` means the model found no connections: the same note, no retry.
-- **Known defects at merge (found by independent review, not yet fixed).** (1) Unicode ligatures (for example the single character
-  for "fi") and small-capital letters are allowed by the character list but are not normalised before the word screens, so they
-  can spell a screened word (confirmed, verified, flagged, sanctions) past the check; the code-built label beside each tag is
-  still correct. (2) Words split by punctuation (`sanc/tions`, `s.a.n.c.t.i.o.n.s`) pass the word screens. (3) Unhedged identity
-  or ownership statements ("is the owner of", "is Jane's") and prose that contradicts the code label ("corroborated") are not
-  reliably caught. (4) The code-built "What is not established" and "Suggested next steps" sections are capped at 24 lines and drop
-  the rest silently, so with many findings the sanctions "not clearance" line and the standing limits can be cut from those two
-  sections (the Bottom line and the footer still carry "not clearance"). (5) The rules file does not name every rejected word, so
-  a rejected answer can cost a retry that does not fix itself. Until these are fixed, treat the AI section as an unverified
-  reading aid and run with `--no-ai-analysis` where a report will be relied on. Partial fixes sit, untested and unmerged, on the
-  local branch `wip/ai-analysis-round3-partial`.
+- **Known defects at merge (round 3: fixed and remaining).** Fixed: (1) any character whose NFKC form differs from itself
+  (ligatures, fullwidth forms) is rejected, letters are limited to Basic Latin, Latin-1 Supplement and U+0100 to U+024F (so IPA,
+  phonetic extensions, small capitals, Latin Extended-C/D/E, presentation forms and modifier letters are refused), and the word
+  screens also run on an accent-folded copy (`sánctions`), while an evidence name such as "José Álvarez" still passes. (2) The
+  screens also run on a squashed copy with `. - / _ '` removed between letter fragments (`sanc/tions`, `s.a.n.c.t.i.o.n.s`,
+  `con-firmed`, `o.f.a.c.`), ordinary hyphenated words (cross-border, co-founder) pass, a bullet needs three distinct words of three
+  letters or more, and an id may not repeat inside one tag. (3) Bullets with "owns", "owner", "controls", "controlled by", "same",
+  "corroborated", "confidence", "probable", "probably", "likely", "highly likely", a possessive identity ("is Jane's") or a
+  copular identity with an evidence name ("is Jane Q Example") are rejected. (4) The code-built "What is not established" and
+  "Suggested next steps" sections put the critical lines first (sanctions not screened and not clearance, standing limits,
+  ownership stop, set-aside notice), merge per-finding duplicates into one line listing the ids, and say "N further lines omitted;
+  see the full code-built report above." if anything else is dropped; critical lines are never dropped. (5) An unexpected
+  exception in the analysis is logged by class name and a fixed message only, never with its text or traceback, and the retry
+  wording names the class of the first failure and echoes only words from a fixed vocabulary. Remaining: paraphrase classes (a
+  screened topic reworded, or a word split by whitespace, `sanc tions`), invented relations and facts in lowercase words (family
+  terms, "owned by" in other words, "a nominee"), a bullet that cites the right id but misreads it, no run against a live model
+  (all tests use fakes), and gaps in the retry wording (a rejected answer can still cost a retry that does not fix itself).
+  Until live runs show otherwise, treat the AI section as an unverified reading aid and run with `--no-ai-analysis` where a
+  report will be relied on.
 - **What remains unenforced (limits of a token and word screen, not understanding).** A fluent bullet that cites the wrong finding,
   misreads what a record means, or is defamatory without using a screened word passes; so does a real evidence date or name attached
   to the wrong thing. Invented facts and relations written in lowercase words around evidence names ("her son", "a cash business"),

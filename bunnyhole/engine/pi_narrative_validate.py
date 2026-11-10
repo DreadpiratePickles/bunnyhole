@@ -256,7 +256,7 @@ def _check_bullet(
     word = accusation(text, list(bullet.ids), idx)
     if word:
         flag("accusation", word)
-    word = identity_or_ownership(text, bullet.ids, idx.names, idx.lines)
+    word = identity_or_ownership(text, idx.names)
     if word:
         flag("identity", word)
     if not language_ok(text, idx):

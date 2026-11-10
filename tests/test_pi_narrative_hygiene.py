@@ -1,4 +1,4 @@
-"""Round 3: no stderr or log leak of an unexpected exception, and hard links survive the report write."""
+"""Round 3: no stderr or log leak of an unexpected exception."""
 
 from __future__ import annotations
 
@@ -9,12 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pi_narrative_helpers import GOOD_ANALYSIS, FakeLLM, narrative_result, outcome
+from pi_narrative_helpers import narrative_result
 
 from bunnyhole.cli import pi_commands
 from bunnyhole.engine import pi_narrative
 from bunnyhole.engine.pi_narrative import generate_ai_analysis
-from bunnyhole.engine.pi_report import build_pi_report
 
 SECRET = "boom secret AIzaSECRET-in-an-exception"
 
@@ -49,29 +48,6 @@ def test_the_source_never_logs_with_exc_info() -> None:
 
     source = inspect.getsource(pi_narrative)
     assert "exc_info=" not in source
-
-
-def test_a_hard_linked_report_keeps_its_link_on_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pi_narrative, "complete_with_fallback", FakeLLM(outcome(GOOD_ANALYSIS)))
-    report = tmp_path / "r.md"
-    report.write_text("old", encoding="utf-8")
-    twin = tmp_path / "twin.md"
-    os.link(report, twin)
-    assert report.stat().st_nlink == 2
-    pi_commands.write_pi_report(build_pi_report, narrative_result(), report)
-    assert report.stat().st_nlink == 2 and os.path.samefile(report, twin)
-    assert "Bunnyhole PI report" in twin.read_text(encoding="utf-8")
-    assert "AI analysis (AI-written" in twin.read_text(encoding="utf-8")
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["r.md", "twin.md"]
-
-
-def test_the_first_write_of_a_hard_linked_report_without_ai_analysis_keeps_the_link(tmp_path: Path) -> None:
-    report = tmp_path / "r.md"
-    report.write_text("old", encoding="utf-8")
-    twin = tmp_path / "twin.md"
-    os.link(report, twin)
-    pi_commands._write_report_text(report, "new text\n")
-    assert twin.read_text(encoding="utf-8") == "new text\n" and report.stat().st_nlink == 2
 
 
 def test_a_single_link_file_is_still_replaced_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

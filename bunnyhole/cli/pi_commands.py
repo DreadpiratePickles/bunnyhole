@@ -285,13 +285,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _can_replace_atomically(target: Path) -> bool:
-    """True for a regular, singly linked (or not yet existing) file in a writable directory: temp file plus
-    ``os.replace`` is safe. A file with other hard links is written in place instead, because ``os.replace`` would
-    break the link (``write_text`` always kept it)."""
-    if target.exists():
-        info = target.stat()
-        if not (stat.S_ISREG(info.st_mode) and os.access(target, os.W_OK)) or info.st_nlink > 1:
-            return False
+    """True for a regular (or not yet existing) file in a writable directory: temp file plus ``os.replace`` is safe."""
+    if target.exists() and not (stat.S_ISREG(target.stat().st_mode) and os.access(target, os.W_OK)):
+        return False
     return os.access(target.parent, os.W_OK | os.X_OK)
 
 

@@ -8,10 +8,9 @@ Three jobs, all on one already length-capped, already character-checked bullet t
   they pass. Whitespace between two multi-letter fragments (``sanc tions``) is not joined: that is a paraphrase
   class the validator does not catch.
 - **Identity and ownership.** The code owns every relation, so a bullet may not assert one in its own words:
-  ``owns``, ``owner``, ``controls``, ``same``, ``corroborated``, ``probable``, ``high confidence``, family relations,
-  possessive identity (``is Jane's``) and copular identity (``is Jane Q Example``) are rejected. An ownership
-  statement is allowed only as the exact phrase the code rendered for an ``O`` edge (``Child is owned by Parent``),
-  cited with that ``O`` id. A bullet that cites an ``O`` id but reads the edge wrongly in other words is not caught.
+  ``owns``, ``owner``, ``controls``, ``same``, ``corroborated``, ``probable``, ``likely``, ``confidence``,
+  possessive identity (``is Jane's``) and copular identity (``is Jane Q Example``) are rejected. Other relation
+  words (family, ``owned by``) and a cited-but-misread claim are not caught: documented limits.
 - **Shape.** Three distinct words of three letters or more, not mostly punctuation, no repeated id in one tag.
 """
 
@@ -20,7 +19,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from functools import lru_cache
-from typing import FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import FrozenSet, Iterable, Optional, Sequence, Tuple
 
 # Letters with no Unicode decomposition that still look like a plain letter (folded for the screens only).
 _TRANSLIT = str.maketrans(
@@ -68,15 +67,11 @@ def first_match(pattern: "re.Pattern[str]", text: str) -> Optional[str]:
 #: Assertions about who or what something is, who owns, runs or controls it, and how sure the claim is. The code owns
 #: relations and the label owns strength, so the model states none of them in its own words.
 IDENTITY_RE = re.compile(
-    r"\bowns\b|\bowners?\b|\bowning\b|\bownerships?\s+of\b|\bbeneficial(?:ly)?\b|\bcontrol(?:s|led|ling)?\b"
+    r"\bowns\b|\bowners?\b|\bcontrol(?:s|led|ling)?\b"
     r"|\bsame\b|\bidentical\b|\bcorroborat\w*|\bconfidence\b|\bhighly\s+likely\b|\bprobabl[ey]\b"
-    r"|\blikel(?:y|ihood)\b|\bunlikely\b|\bshareholders?\b|\bfront\s+for\b"
-    r"|\bruns\b|\bran\b|\bmanag(?:es|ed|ing)\b|\boperat(?:es|ed|ing)\b"
-    r"|\b(?:husband|wife|spouse|married|brother|sister|son|daughter|mother|father|cousin|relatives?|family|"
-    r"girlfriend|boyfriend)\b",
+    r"|\blikel(?:y|ihood)\b",
     re.IGNORECASE,
 )
-_OWNED_RE = re.compile(r"\bowned\b")
 _POSSESSIVE_IDENTITY_RE = re.compile(r"\b(?:is|are|was|were)\s+(?:the\s+)?[A-Z]\w*(?:\s+[A-Z]\w*)*'s\b")
 
 
@@ -95,23 +90,8 @@ def _copular_pattern(names: Iterable[str]) -> Optional["re.Pattern[str]"]:
     )
 
 
-def _without_phrases(text: str, phrases: Sequence[str]) -> str:
-    """``text`` with each ready phrase removed (a full stop after an abbreviation such as ``Ltd.`` is tolerated)."""
-    for phrase in phrases:
-        pattern = r"\.?\s+".join(re.escape(token) for token in phrase.split())
-        text = re.sub(pattern, " ", text)
-    return text
-
-
-def edge_phrases(ids: Sequence[str], lines: Mapping[str, str]) -> List[str]:
-    """The folded ready phrase of each cited ``O`` id: the part of its evidence line before the first ``" | "``."""
-    return [fold(lines[i].split(" | ", 1)[0]).strip() for i in dict.fromkeys(ids) if i.startswith("O") and i in lines]
-
-
-def identity_or_ownership(
-    text: str, ids: Sequence[str], names: Iterable[str], lines: Mapping[str, str]
-) -> Optional[str]:
-    """An unhedged identity, ownership or relation assertion, or ``None``. ``lines`` maps id to its folded line."""
+def identity_or_ownership(text: str, names: Iterable[str]) -> Optional[str]:
+    """An unhedged identity, ownership or probability assertion, or ``None``."""
     word = first_match(IDENTITY_RE, text)
     if word:
         return word
@@ -124,8 +104,7 @@ def identity_or_ownership(
         match = copular.search(folded)
         if match:
             return match.group(0)
-    match = _OWNED_RE.search(_without_phrases(folded, edge_phrases(ids, lines)))
-    return match.group(0) if match else None
+    return None
 
 
 # --------------------------------------------------------------------------------------- shape

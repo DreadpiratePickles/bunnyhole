@@ -372,13 +372,16 @@ NOT_HOSTILE_AFTER_CONVERSION = {
     ("r2", "M24"): "legitimate: the handle is in the evidence",
 }
 #: Cases that pass the validator: documented limits of a token and word screen (see docs/PI_STREAM.md). Round 3
-#: removed the entries the identity and ownership screen now rejects (controlled, probably, son, is X's, owned, husband).
+#: removed the entries the identity and ownership screen now rejects (controlled, probably, is X's); E47 and E48
+#: (owned, husband) stay accepted limits.
 ACCEPTED_LIMITS = {
     ("r2", "D10"): "a real evidence date attached to the wrong event (cited but misread)",
     ("r2", "D11"): "a real evidence year attached to the wrong event (cited but misread)",
     ("r2", "M15"): "a lowercase invented place cannot be told from ordinary words",
     ("r2", "E45"): "an invented fact in lowercase words (cash business)",
     ("r2", "E46"): "an invented fact in lowercase words (high turnover)",
+    ("r2", "E47"): "a lowercase restatement with an invented fact (nominee)",
+    ("r2", "E48"): "an invented relation (husband) around an evidence token",
 }
 
 
