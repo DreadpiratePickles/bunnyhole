@@ -5,10 +5,13 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 from bunnyhole.engine.graph import InvestigationGraph
-from bunnyhole.engine.llm_providers import complete_with_fallback, configured_providers
+from bunnyhole.engine.llm_providers import complete_with_fallback, configured_providers, llm_max_tokens
 
 #: Direct providers tried in order for the narrative synthesis (OpenRouter is the council's per-seat route).
 SYNTHESIS_PROVIDERS: Tuple[str, ...] = ("gemini", "anthropic", "openai")
+
+#: Per-provider-attempt HTTP timeout. A thinking model with the shared token budget can legitimately take a while.
+SYNTHESIS_TIMEOUT_S = 120.0
 
 
 class InvestigativeSynthesizer:
@@ -66,6 +69,12 @@ class InvestigativeSynthesizer:
         receipts = self._collect_indexed_receipts()
         ach = self.graph.run_skeptic_network_analytics()
 
+        # Unique indexed receipts (the [R#] citations) vs. attachments: one receipt can sit on several nodes and
+        # edges, so the attachment count is larger. Same formula as graph.to_dict()["stats"]["total_receipts"].
+        attachment_count = sum(len(n.receipts) for n in self.graph.nodes.values()) + sum(
+            len(e.receipts) for e in self.graph.edges.values()
+        )
+
         pai_count = sum(1 for r in receipts if r["source_class"] == "PAI")
         cai_count = sum(1 for r in receipts if r["source_class"] == "CAI")
         cai_tools = sorted({r["tool"] for r in receipts if r["source_class"] == "CAI"})
@@ -87,7 +96,7 @@ class InvestigativeSynthesizer:
             f"### 1. Executive Intelligence Lead\n"
             f"Investigation **`{self.graph.case_id}`** into seed **`{self.graph.seed_query}`** mapped "
             f"**{len(self.graph.nodes)} entities**, **{len(self.graph.edges)} edges**, and "
-            f"**{len(receipts)} cryptographic SHA-256 receipts** across "
+            f"**{len(receipts)} unique SHA-256 receipts ({attachment_count} receipt attachments across nodes and edges)** across "
             f"**{len({n.domain.value for n in self.graph.nodes.values()})} intelligence domains**.\n\n"
             f"- **CIA ACH Verdict:** `{ach.winning_hypothesis}` — {ach.narrative_verdict}\n"
             f"- **Source Provenance (ODNI):** {pai_count} PAI (publicly available) · {cai_count} CAI (commercially acquired)."
@@ -220,8 +229,8 @@ class InvestigativeSynthesizer:
             system_prompt,
             f"Seed: {self.graph.seed_query}\n\nReceipts:\n{prompt_facts}",
             providers=SYNTHESIS_PROVIDERS,
-            max_tokens=700,
-            timeout=14.0,
+            max_tokens=llm_max_tokens(),
+            timeout=SYNTHESIS_TIMEOUT_S,
             graph=self.graph,
             purpose="investigative synthesis",
         )
