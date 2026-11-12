@@ -729,6 +729,7 @@ class PlaybookStep(BaseModel):
     cost: Literal["free", "free_key", "handoff"]
     legal_gate: str = ""
     stop_if: str = ""
+    stop_key: str = ""
 
 
 class Playbook(BaseModel):
@@ -745,11 +746,24 @@ class Playbook(BaseModel):
 
 
 def _steps(rows: List[tuple]) -> List[PlaybookStep]:
-    """Build ordered steps; each row is (action, sources, yield, cost, legal_gate, stop_if)."""
-    return [
-        PlaybookStep(order=i, action=a, sources=s, yield_level=y, cost=c, legal_gate=g, stop_if=stop)
-        for i, (a, s, y, c, g, stop) in enumerate(rows, start=1)
-    ]
+    """Build ordered steps; each row is (action, sources, yield, cost, legal_gate, stop_if[, stop_key])."""
+    steps: List[PlaybookStep] = []
+    for order, row in enumerate(rows, start=1):
+        action, sources, yield_level, cost, legal_gate, stop_if = row[:6]
+        stop_key = row[6] if len(row) > 6 else ""
+        steps.append(
+            PlaybookStep(
+                order=order,
+                action=action,
+                sources=sources,
+                yield_level=yield_level,
+                cost=cost,
+                legal_gate=legal_gate,
+                stop_if=stop_if,
+                stop_key=stop_key,
+            )
+        )
+    return steps
 
 
 _COURTS = ["PACER Case Locator", "CourtListener / RECAP", "Judyrecords", "UniCourt", "CanLII"]
@@ -893,7 +907,7 @@ _ASSET_SEARCH = Playbook(
         ("Screen every node for sanctions, applying the OFAC 50% rule through the ownership percentages.",
          _SANCTIONS + ["FATF High-Risk Jurisdictions"], "high", "free",
          "A hit is verified on the primary list; a 50% rule block is a compliance matter for counsel.",
-         "Any block or direct hit: stop and refer to compliance counsel."),
+         "Any block or direct hit: stop and refer to compliance counsel.", "sanctions_counsel"),
         ("Search real property, liens and secured debts: deeds, mortgages, UCC filings and bankruptcy "
          "dockets.", ["County recorders and registers of deeds", "Teranet / OnLand", "State UCC filing search",
                       "PACER Case Locator", "CourtListener / RECAP"], "high", "free",
@@ -908,7 +922,7 @@ _ASSET_SEARCH = Playbook(
          "deposit address at a KYC exchange.", ["Etherscan", "BscScan", "Blockchain.com Explorer", "Blockscout",
                                                 "mempool.space", "Arkham Intelligence", "Breadcrumbs"],
          "medium", "free_key", "Ledger data is public; attribution labels are leads, not identity.",
-         "A cash-out point is found: stop tracing and name the exchange as the custodian."),
+         "A cash-out point is found: stop tracing and name the exchange as the custodian.", "cash_out_found"),
         ("Compare visible lifestyle against declared income: luxury assets, travel and property signal hidden "
          "wealth. Treat every indicator as a lead.",
          ["Sherlock", "Google News", "Wayback Machine", "Google Earth", "Mapillary"], "low", "free",
@@ -961,7 +975,7 @@ _DUE_DILIGENCE = Playbook(
          "The chain ends before a person: list the unresolved node."),
         ("Screen sanctions and PEP status for every node, including the OFAC 50% rule.", _SANCTIONS, "high",
          "free", "A negative is absence from lists, not innocence; verify any hit on the primary list.",
-         "Any hit or block: stop and refer to compliance counsel."),
+         "Any hit or block: stop and refer to compliance counsel.", "sanctions_counsel"),
         ("Search litigation, enforcement and complaints.", ["CourtListener / RECAP", "PACER Case Locator",
                                                            "SEC EDGAR", "SAM.gov", "CFPB Consumer Complaints"],
          "medium", "free", "Consumer complaint narratives are unverified claims, never findings.",
@@ -1020,7 +1034,7 @@ _FRAUD_SCREEN = Playbook(
                                                                               "Arkham Intelligence",
                                                                               "OpenSanctions"],
          "medium", "free_key", "Ledger data is public; attribution labels are leads.",
-         "A KYC exchange deposit address is found: name it as the custodian."),
+         "A KYC exchange deposit address is found: name it as the custodian.", "cash_out_found"),
         ("Name custodians and legal instruments for non-public records: banks, exchanges, registered agents, "
          "carriers.", ["counsel"], "high", "handoff", "Counsel decides the process; never pretext.",
          "No lawful route exists: report the data as out of reach."),
@@ -1086,6 +1100,9 @@ _MISSING_PERSON = Playbook(
         "Deceased and unidentified: a match to unidentified remains.",
     ],
 )
+
+#: Machine keys for playbook step ``stop_if`` lines the casework loop can evaluate.
+STOP_KEYS: frozenset = frozenset({"sanctions_counsel", "cash_out_found"})
 
 #: Machine keys for playbook escalation items. pi_runtime.ESCALATION_EVALUATORS must define exactly this set.
 ESCALATION_KEYS: frozenset = frozenset({

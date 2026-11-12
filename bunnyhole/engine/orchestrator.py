@@ -6,8 +6,9 @@ import asyncio
 import ipaddress
 import math
 import re
+import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 from bunnyhole.agents.accountant import AccountantAgent
 from bunnyhole.agents.journalist import JournalistAgent
@@ -193,6 +194,13 @@ def classify_seed_type(seed: str) -> Tuple[str, EntityType, DomainCategory]:
 # person called Robin Cat is noise, not evidence), so PI mode does not run it for name-driven leads.
 _DEX_PI_SKIP = "token-name search is noise for company/person/handle leads; not run in PI mode"
 
+#: Source-call ceiling for one casework run. The plan's worked figure, used until a fixture p90 replaces it.
+DEFAULT_PI_BUDGET = 120
+PI_BUDGET_MIN = 10
+PI_BUDGET_MAX = 400
+MAX_FOLLOWUP_ROUNDS = 3
+PERSON_CASEWORK_NOTE = "person case types use the sweep in this release"
+
 
 class BunnyholeOrchestrator:
     """
@@ -214,6 +222,9 @@ class BunnyholeOrchestrator:
         intake_packet: Optional[CaseIntakePacket] = None,
         profile: Optional[InvestigatorProfile] = None,
         engagement: Optional[PIEngagement] = None,
+        pi_loop: str = "sweep",
+        pi_budget: int = DEFAULT_PI_BUDGET,
+        pi_guide: Optional[Any] = None,
     ) -> None:
         case_id = f"bh_{uuid.uuid4().hex[:8]}"
         self.seed_query = seed_query.strip()
@@ -309,6 +320,18 @@ class BunnyholeOrchestrator:
                 # Shadowed on the instance like the breach blockers above (setattr: mypy rejects assigning a plain
                 # function to a method attribute; the blocker's signature mirrors _run_local_arsenal_holehe).
                 setattr(self.osint, "_run_local_arsenal_holehe", make_holehe_blocker(self.pi_recorder))  # noqa: B010
+        # Casework knobs apply only to a PI engagement. A normal trace never reads them.
+        self.pi_loop = "sweep"
+        self.pi_budget = DEFAULT_PI_BUDGET
+        self._pi_case_board: Optional[Any] = None
+        self._pi_guide: Optional[Any] = None
+        self._pi_casework_skipped = False
+        self._pi_clock: Callable[[], float] = time.perf_counter
+        if self.engagement is not None:
+            if pi_loop in ("sweep", "casework"):
+                self.pi_loop = pi_loop
+            self.pi_budget = max(PI_BUDGET_MIN, min(PI_BUDGET_MAX, int(pi_budget)))
+            self._pi_guide = pi_guide
 
     def _pi_note_dropped_credentials(self, dropped: int) -> None:
         """Keep exactly ONE source-log entry for dropped credentials (the value is never echoed)."""
@@ -362,6 +385,248 @@ class BunnyholeOrchestrator:
             self.graph.pi_subject = SubjectAnchors.from_selectors(self._pi_selectors)
         values = [self.seed_query] + [v for lt, v in seed_tuples if lt not in ("credential", "document")]
         self._pi_prior_cases = run_conflict_check(self.case_store, values, self.graph.case_id, self.pi_recorder)
+
+    def _use_pi_casework(self) -> bool:
+        """Entity due diligence, asset search, and fraud screen, and only when the caller asked for casework.
+
+        A person subject, or any other case type, stays on the sweep. The skip is logged once.
+        """
+        if self.engagement is None or self.pi_loop != "casework":
+            return False
+        from bunnyhole.engine.pi import CaseType
+
+        entity_case = self.engagement.case_type in {
+            CaseType.DUE_DILIGENCE, CaseType.ASSET_SEARCH, CaseType.FRAUD_SCREEN,
+        }
+        if entity_case and not self.engagement.subject_is_person:
+            return True
+        if not self._pi_casework_skipped:
+            self._pi_casework_skipped = True
+            self._pi_skip("casework", self.engagement.case_type.value, PERSON_CASEWORK_NOTE)
+        return False
+
+    def _assemble_pi_snapshot(self) -> Any:
+        """The PI block ``compile_full_result`` will store, built from the graph as it stands now."""
+        if self.engagement is None or self.pi_recorder is None:
+            raise RuntimeError("PI snapshot requested outside a PI engagement")
+        mode: Literal["sweep", "casework"] = "casework" if self._pi_case_board is not None else "sweep"
+        return assemble_pi_block(
+            self.engagement,
+            self.graph.to_dict(),
+            self.pi_recorder.entries,
+            cross_case_prior=self._pi_prior_cases,
+            selectors=self._pi_selectors,
+            ownership_links=self._pi_ownership_links,
+            deep_run=self._pi_deep_run,
+            case_board=self._pi_case_board,
+            loop_mode=mode,
+        )
+
+    def _case_origin(self, target: str, root_nodes: Sequence[Tuple[str, str, GraphNode]]) -> str:
+        wanted = target.strip()
+        for _lead, value, node in root_nodes:
+            if value.strip() == wanted:
+                return node.id
+        return root_nodes[0][2].id
+
+    async def _run_case_tasks(
+        self, tasks: Sequence[Any], root_nodes: Sequence[Tuple[str, str, GraphNode]],
+    ) -> None:
+        """Run one step's tasks under the shared semaphore. Unknown sources are logged and not called."""
+        from bunnyhole.engine.pi_dispatch import PI_DISPATCH, refusal_reason
+
+        async def _one(task: Any) -> None:
+            async with self._sem:
+                reason = refusal_reason(task.source)
+                if reason:
+                    self._pi_skip(task.source, task.target, reason)
+                    return
+                origin = self._case_origin(task.target, root_nodes)
+                coro = PI_DISPATCH[task.source](self, task.target, origin, 1)
+                await self._pi_task(task.source, task.target, coro)
+
+        await self._gather_logged([_one(task) for task in tasks], "pi_case_tasks")
+
+    def _keep_board_progress(self, scored: Any, board: Any) -> Any:
+        """Scoring replaces hypothesis rows. Calls, the log, and the stop fields stay with the runner."""
+        return scored.model_copy(update={
+            "log": list(board.log),
+            "calls_used": board.calls_used,
+            "budget": board.budget,
+            "stop_reason": board.stop_reason,
+            "stop_detail": board.stop_detail,
+            "guide_name": board.guide_name,
+        })
+
+    async def _run_pi_casework(self, root_nodes: Sequence[Tuple[str, str, GraphNode]]) -> None:
+        """Work the playbook in order, then chase the board's own falsifiers. The sweep loop does not run."""
+        from bunnyhole.engine.pi import StopReason
+        from bunnyhole.engine.pi_casework import DONE_EVALUATORS, open_case_board
+        from bunnyhole.engine.pi_casework_guide import make_case_guide
+        from bunnyhole.engine.pi_reference import playbook_for
+
+        assert self.engagement is not None and self.pi_recorder is not None
+        playbook = playbook_for(self.engagement.case_type)
+        guide = self._pi_guide if self._pi_guide is not None else make_case_guide(self.graph)
+        board = open_case_board(self.engagement, playbook, budget=self.pi_budget)
+        board = board.model_copy(update={"guide_name": getattr(guide, "name", "playbook")})
+        done_tasks: set[str] = set()
+        subjects = [value for lead, value, _node in root_nodes if lead not in ("credential", "document") and value.strip()]
+        done_eval = DONE_EVALUATORS[self.engagement.case_type]
+        self.graph.log(
+            DomainCategory.SKEPTIC, "PI_CASE_START", self.engagement.case_type.value,
+            f"guide={board.guide_name} budget={board.budget} subjects={len(subjects)}",
+            level="discovery",
+        )
+        snapshot = self._assemble_pi_snapshot()
+        stopped = await self._casework_playbook(
+            board, playbook, subjects, root_nodes, done_tasks, guide, done_eval, snapshot,
+        )
+        board, snapshot = stopped
+        if board.stop_reason is None:
+            board, snapshot = await self._casework_followups(
+                board, snapshot, root_nodes, done_tasks, guide, done_eval,
+            )
+        if board.stop_reason is None:
+            reason = StopReason.DONE if done_eval(snapshot) else StopReason.DEAD_END
+            detail = "done-when check met" if reason is StopReason.DONE else "playbook finished with the done-when check unmet"
+            board = board.model_copy(update={"stop_reason": reason, "stop_detail": detail})
+        self._pi_case_board = board
+        self.graph.log(
+            DomainCategory.SKEPTIC, "PI_CASE_STOP", board.stop_reason.value,
+            board.stop_detail, level="anomaly" if board.stop_reason is StopReason.ESCALATED else "discovery",
+        )
+
+    async def _casework_playbook(
+        self, board: Any, playbook: Any, subjects: List[str],
+        root_nodes: Sequence[Tuple[str, str, GraphNode]], done_tasks: set[str], guide: Any,
+        done_eval: Callable[[Any], bool], snapshot: Any,
+    ) -> Tuple[Any, Any]:
+        from bunnyhole.engine.pi import CaseStepRecord
+        from bunnyhole.engine.pi_casework import playbook_tasks, score_hypotheses, step_stop_decision, stop_check
+        from bunnyhole.engine.pi_casework_guide import apply_guide, guide_may_stop
+
+        assert self.engagement is not None
+        for step in playbook.steps:
+            remaining = board.budget - board.calls_used
+            if remaining <= 0:
+                board = self._stop_board(board, stop_check(
+                    board, step, snapshot, snapshot.escalation_triggers, done_eval=done_eval,
+                ))
+                break
+            offered = [task for task in playbook_tasks(step, subjects) if task.task_id not in done_tasks][:remaining]
+            choose = await guide.advise(board=board, block=snapshot, offered=offered, phase=f"step:{step.order}")
+            tasks = apply_guide(offered, choose)[:remaining]
+            started = self._pi_clock()
+            before = {finding.node_id for finding in snapshot.findings}
+            await self._run_case_tasks(tasks, root_nodes)
+            done_tasks.update(task.task_id for task in tasks)
+            board = board.model_copy(update={"calls_used": board.calls_used + len(tasks)})
+            self._pi_case_board = board
+            snapshot = self._assemble_pi_snapshot()
+            scored, changed = score_hypotheses(board, snapshot, self.engagement.case_type)
+            board = self._keep_board_progress(scored, board)
+            review = await guide.advise(board=board, block=snapshot, offered=[], phase=f"review:{step.order}")
+            hard = stop_check(board, step, snapshot, snapshot.escalation_triggers, done_eval=done_eval)
+            decision, final = self._merge_stop(hard, review, guide_may_stop)
+            if decision == "continue":
+                decision = step_stop_decision(step, snapshot)
+            new_findings = len({finding.node_id for finding in snapshot.findings} - before)
+            counsel = " ".join(part for part in (choose.counsel, review.leading_read, review.counsel) if part)[:400]
+            board = self._append_step(board, CaseStepRecord(
+                order=step.order, label=step.action, tasks=[task.task_id for task in tasks],
+                new_findings=new_findings, hypotheses_changed=changed, decision=decision,
+                counsel=counsel, elapsed_s=round(self._pi_clock() - started, 3),
+            ))
+            self._log_case_step(step.order, decision, changed)
+            if final is not None:
+                board = self._stop_board(board, final)
+                break
+        return board, snapshot
+
+    async def _casework_followups(
+        self, board: Any, snapshot: Any, root_nodes: Sequence[Tuple[str, str, GraphNode]],
+        done_tasks: set[str], guide: Any, done_eval: Callable[[Any], bool],
+    ) -> Tuple[Any, Any]:
+        from bunnyhole.engine.pi import CaseStepRecord, StopReason
+        from bunnyhole.engine.pi_casework import follow_up_tasks, score_hypotheses, stop_check
+        from bunnyhole.engine.pi_casework_guide import apply_guide, guide_may_stop
+
+        assert self.engagement is not None
+        for round_no in range(1, MAX_FOLLOWUP_ROUNDS + 1):
+            remaining = board.budget - board.calls_used
+            offered = follow_up_tasks(snapshot, done_tasks, limit=max(remaining, 0))
+            choose = await guide.advise(board=board, block=snapshot, offered=offered, phase=f"followup:{round_no}")
+            tasks = apply_guide(offered, choose)[:max(remaining, 0)]
+            if not tasks:
+                reason = StopReason.DONE if done_eval(snapshot) else StopReason.DEAD_END
+                detail = "done-when check met" if reason is StopReason.DONE else "no further dispatchable lead"
+                return self._stop_board(board, (reason, detail)), snapshot
+            started = self._pi_clock()
+            before = {finding.node_id for finding in snapshot.findings}
+            await self._run_case_tasks(tasks, root_nodes)
+            done_tasks.update(task.task_id for task in tasks)
+            board = board.model_copy(update={"calls_used": board.calls_used + len(tasks)})
+            self._pi_case_board = board
+            snapshot = self._assemble_pi_snapshot()
+            scored, changed = score_hypotheses(board, snapshot, self.engagement.case_type)
+            board = self._keep_board_progress(scored, board)
+            new_findings = len({finding.node_id for finding in snapshot.findings} - before)
+            quiet = new_findings == 0 and not changed
+            hard = stop_check(
+                board, None, snapshot, snapshot.escalation_triggers, done_eval=done_eval, no_progress=quiet,
+            )
+            review = await guide.advise(board=board, block=snapshot, offered=[], phase=f"review-followup:{round_no}")
+            decision, final = self._merge_stop(hard, review, guide_may_stop)
+            label = "follow-up: " + " | ".join(f"{task.source} {task.why}" for task in tasks)
+            counsel = " ".join(part for part in (choose.counsel, review.leading_read, review.counsel) if part)[:400]
+            board = self._append_step(board, CaseStepRecord(
+                order=100 + round_no, label=label[:500], tasks=[task.task_id for task in tasks],
+                new_findings=new_findings, hypotheses_changed=changed,
+                decision=decision if final is None else self._decision_text(final[0]),
+                counsel=counsel, elapsed_s=round(self._pi_clock() - started, 3),
+            ))
+            self._log_case_step(100 + round_no, board.log[-1].decision, changed)
+            if final is not None:
+                return self._stop_board(board, final), snapshot
+        return board, snapshot
+
+    def _append_step(self, board: Any, record: Any) -> Any:
+        return board.model_copy(update={"log": [*board.log, record]})
+
+    def _stop_board(self, board: Any, final: Optional[Tuple[Any, str]]) -> Any:
+        if final is None or board.stop_reason is not None:
+            return board
+        reason, detail = final
+        return board.model_copy(update={"stop_reason": reason, "stop_detail": detail})
+
+    def _decision_text(self, reason: Any) -> str:
+        from bunnyhole.engine.pi import StopReason
+
+        if reason is StopReason.ESCALATED:
+            return "escalate:sanctions_or_50_rule"
+        return f"stop:{reason.value}"
+
+    def _merge_stop(
+        self, hard: Optional[Tuple[Any, str]], review: Any, guide_may_stop: Callable[..., Any],
+    ) -> Tuple[str, Optional[Tuple[Any, str]]]:
+        if hard is not None:
+            return self._decision_text(hard[0]), hard
+        soft = guide_may_stop(review, None)
+        if soft is not None:
+            detail = review.counsel or soft.value
+            return self._decision_text(soft), (soft, detail)
+        return "continue", None
+
+    def _log_case_step(self, order: int, decision: str, changed: List[str]) -> None:
+        assert self.engagement is not None
+        self.graph.log(
+            DomainCategory.SKEPTIC, "PI_CASE_STEP", f"step {order}", decision, level="discovery",
+        )
+        if changed:
+            self.graph.log(
+                DomainCategory.SKEPTIC, "PI_HYPOTHESIS_UPDATE", ",".join(changed), decision, level="discovery",
+            )
 
     def _is_primary_person_name(self, text: str) -> bool:
         """The first name the investigator gave, for a person subject, whatever its shape.
@@ -678,6 +943,10 @@ class BunnyholeOrchestrator:
                     )
                 )
 
+        if self._use_pi_casework():
+            await self._run_pi_casework(root_nodes)
+            return await self._finalize_and_persist_investigation()
+
         # Hop 1: Parallel expansion of all intake selectors
         await self._gather_logged(
             [self._execute_lead(lt, v, n.id, hop_depth=1) for lt, v, n in root_nodes],
@@ -761,6 +1030,10 @@ class BunnyholeOrchestrator:
             f"Launching recursive Breadth={self.initial_breadth} x Depth={self.max_depth} loop in {self.gear.value.upper()} gear",
             level="discovery",
         )
+
+        if self._use_pi_casework():
+            await self._run_pi_casework([(lead_type, self.seed_query, root_node)])
+            return await self._finalize_and_persist_investigation()
 
         # Hop 1: Initial Anchor Sweep
         await self._execute_lead(lead_type, self.seed_query, root_node.id, hop_depth=1)
@@ -967,15 +1240,7 @@ class BunnyholeOrchestrator:
             # Nodes the analytics tables left out (unanchored name-only records, platform accounts): the JSON keeps
             # them, and the CLI tables use this list to skip them.
             base["set_aside_node_ids"] = sorted(self.graph.analytics_excluded_ids)
-            base["pi"] = assemble_pi_block(
-                self.engagement,
-                base,
-                self.pi_recorder.entries,
-                cross_case_prior=self._pi_prior_cases,
-                selectors=self._pi_selectors,
-                ownership_links=self._pi_ownership_links,
-                deep_run=self._pi_deep_run,
-            ).model_dump(mode="json")
+            base["pi"] = self._assemble_pi_snapshot().model_dump(mode="json")
             if self._pi_redactions:  # safety net: no credential string survives anywhere in the PI result
                 base = redact_value(base, self._pi_redactions)
         elif self._credential_secrets:

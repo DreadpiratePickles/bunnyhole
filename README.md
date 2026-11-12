@@ -266,6 +266,12 @@ someone avoiding the client is refused in every case type. Refusals exit with co
 The category is attested, not verified, and the phrase screens have incomplete recall; you remain
 responsible for lawful use.
 
+`--pi-loop casework` works an entity due-diligence, asset-search, or fraud-screen case in playbook order
+and records why it stopped; `--pi-loop sweep` (the default) keeps today's single pass. `--pi-budget N`
+caps source calls (10–400). Both flags need `--pi`. A configured model can choose among the checks the
+playbook already allows; it cannot open a new source or override a sanctions stop. Person cases stay on
+the sweep.
+
 Three examples that pass the gates (a run needs network; each prints a PI SUMMARY and writes the report):
 
 ```bash

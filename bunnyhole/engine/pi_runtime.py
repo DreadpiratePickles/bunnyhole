@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Coroutine, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Coroutine, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple, cast
 
 from bunnyhole.engine.pi import (
     NOTICES,
@@ -998,6 +998,15 @@ def _custody(nodes: Sequence[Mapping[str, Any]], edges: Sequence[Mapping[str, An
     return entries
 
 
+def _casework_done_status(block: PIBlock) -> str:
+    """Automated done-when check. Imported inside the function so a sweep never loads the casework module."""
+    try:
+        from bunnyhole.engine.pi_casework import done_status_for
+    except ImportError:
+        return "not_evaluated"
+    return str(done_status_for(block))
+
+
 def assemble_pi_block(
     engagement: PIEngagement,
     graph_dict: Mapping[str, Any],
@@ -1009,6 +1018,8 @@ def assemble_pi_block(
     now_iso: Optional[str] = None,
     deep_run: bool = False,
     subject: str = "",
+    case_board: Any = None,
+    loop_mode: Literal["sweep", "casework"] = "sweep",
 ) -> PIBlock:
     """Build the ``result["pi"]`` block from a graph dict (``graph.to_dict()`` shape) and the source log.
 
@@ -1090,7 +1101,7 @@ def assemble_pi_block(
         public_listed_ids=_public_listed_ids(nodes, relevance),
     )
 
-    return PIBlock(
+    block = PIBlock(
         engagement=engagement,
         identifier_warnings=identifier_warnings(selectors_map, engagement.subject_is_person),
         prior_cases=[dict(p) for p in cross_case_prior],
@@ -1118,6 +1129,21 @@ def assemble_pi_block(
         entity_profile=entity_profile,
         sanctions=sanctions,
     )
+    # The three casework fields land with the case-board models. Until those fields exist, a sweep
+    # block is unchanged. ``done_status`` is filled only for a casework loop, and only from the block.
+    fields = PIBlock.model_fields
+    extras: Dict[str, Any] = {}
+    if "loop_mode" in fields:
+        extras["loop_mode"] = loop_mode
+    if "case_board" in fields:
+        extras["case_board"] = case_board
+    if "done_status" in fields:
+        extras["done_status"] = "not_evaluated"
+    if extras:
+        block = block.model_copy(update=cast(Any, extras))
+    if loop_mode == "casework" and "done_status" in fields:
+        block = block.model_copy(update=cast(Any, {"done_status": _casework_done_status(block)}))
+    return block
 
 
 __all__ = [

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Dict, List, Literal, Optional, Sequence
 from urllib.parse import urlsplit
 
@@ -63,6 +64,10 @@ __all__ = [
     "MOTIVE_RED_FLAGS",
     "NOTICES",
     "PURSUIT_EVASION_FLAGS",
+    "CaseBoard",
+    "CaseHypothesis",
+    "CaseStepRecord",
+    "CaseTask",
     "CaseType",
     "Contradiction",
     "CoverageRow",
@@ -70,8 +75,10 @@ __all__ = [
     "Custodian",
     "EntityProfile",
     "EscalationTrigger",
+    "EvidenceLink",
     "Finding",
     "FindingLabel",
+    "HypothesisStatus",
     "OwnershipBlock",
     "OwnershipEdge",
     "PIBlock",
@@ -83,6 +90,7 @@ __all__ = [
     "PurposeCategory",
     "RELATIONSHIP_TERM_CATEGORIES",
     "SanctionsScreening",
+    "StopReason",
     "SourceLogEntry",
     "count_independent_sources",
     "identifier_warnings",
@@ -270,6 +278,67 @@ class EscalationTrigger(BaseModel):
     why: str = ""
 
 
+class HypothesisStatus(str, Enum):
+    OPEN = "open"
+    SUPPORTED = "supported"
+    WEAKENED = "weakened"
+    RULED_OUT = "ruled_out"
+
+
+class EvidenceLink(BaseModel):
+    signal: str
+    direction: Literal["supports", "refutes"]
+    weight: float
+    detail: str
+    node_ids: List[str] = Field(default_factory=list)
+
+
+class CaseHypothesis(BaseModel):
+    key: str
+    text: str
+    status: HypothesisStatus = HypothesisStatus.OPEN
+    score: float = 0.0
+    evidence: List[EvidenceLink] = Field(default_factory=list)
+
+
+class CaseTask(BaseModel):
+    task_id: str
+    origin: Literal["playbook", "corroborate_lead", "extend_ownership", "resolve_contradiction"]
+    step_order: Optional[int] = None
+    source: str
+    target: str
+    why: str
+
+
+class CaseStepRecord(BaseModel):
+    order: int
+    label: str
+    tasks: List[str] = Field(default_factory=list)
+    new_findings: int = 0
+    hypotheses_changed: List[str] = Field(default_factory=list)
+    decision: str = "continue"
+    counsel: str = ""
+    elapsed_s: float = 0.0
+
+
+class StopReason(str, Enum):
+    DONE = "done"
+    ESCALATED = "escalated"
+    DEAD_END = "dead_end"
+    BUDGET = "budget_spent"
+    NO_PROGRESS = "no_progress"
+
+
+class CaseBoard(BaseModel):
+    hypotheses: List[CaseHypothesis]
+    log: List[CaseStepRecord] = Field(default_factory=list)
+    stop_reason: Optional[StopReason] = None
+    stop_detail: str = ""
+    calls_used: int = 0
+    budget: int
+    guide_name: str = "playbook"
+
+
 class PIBlock(BaseModel):
     """What goes in ``result["pi"]`` (``model_dump(mode="json")``)."""
 
@@ -294,6 +363,9 @@ class PIBlock(BaseModel):
     escalation_triggers: List[EscalationTrigger] = Field(default_factory=list)
     entity_profile: Optional[EntityProfile] = None
     sanctions: SanctionsScreening = Field(default_factory=SanctionsScreening)
+    loop_mode: Literal["sweep", "casework"] = "sweep"
+    case_board: Optional[CaseBoard] = None
+    done_status: Literal["met", "not_met", "not_evaluated"] = "not_evaluated"
 
 
 # --------------------------------------------------------------------------- labels and corroboration
