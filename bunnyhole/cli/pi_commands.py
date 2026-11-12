@@ -104,6 +104,24 @@ def _person_like_selector(
     return None
 
 
+def _validate_casework_flags(pi_loop: Optional[str], pi_budget: Optional[int]) -> None:
+    """Reject a ``--pi-loop`` or ``--pi-budget`` the orchestrator would not accept. ``None`` means unset."""
+    from bunnyhole.engine.orchestrator import PI_BUDGET_MAX, PI_BUDGET_MIN
+
+    if pi_loop is not None and pi_loop not in ("sweep", "casework"):
+        raise _refuse(
+            f"--pi-loop must be 'casework' or 'sweep' (got {pi_loop!r}).",
+            title="PI loop refused",
+        )
+    if pi_budget is not None and (
+        isinstance(pi_budget, bool) or not isinstance(pi_budget, int) or not PI_BUDGET_MIN <= pi_budget <= PI_BUDGET_MAX
+    ):
+        raise _refuse(
+            f"--pi-budget must be an integer from {PI_BUDGET_MIN} to {PI_BUDGET_MAX}.",
+            title="PI budget refused",
+        )
+
+
 def _refuse(message: str, title: str = "PI engagement refused") -> "typer.Exit":
     """Print ``message`` in a red panel (no markup interpretation) and return the exit-2 exception to raise."""
     console.print(Panel(Text(message), title=title, border_style="red"))
@@ -132,6 +150,8 @@ def resolve_pi_flags(
     domains: Optional[List[str]] = None,
     purpose_category: Optional[str] = None,
     extra_texts: Optional[Sequence[str]] = None,
+    pi_loop: Optional[str] = None,
+    pi_budget: Optional[int] = None,
 ) -> Tuple[Optional[PIEngagement], Optional[str]]:
     """Validate the PI flags of ``trace``/``intake`` and return ``(engagement, effective_persona)``.
 
@@ -164,6 +184,8 @@ def resolve_pi_flags(
         "--subject-type": subject_type,
         "--pi-jurisdiction": pi_jurisdiction,
         "--pi-report": pi_report,
+        "--pi-loop": pi_loop,
+        "--pi-budget": pi_budget,
     }
     if not pi:
         given = [flag for flag, value in pi_only.items() if value is not None]
@@ -177,6 +199,8 @@ def resolve_pi_flags(
                 title="PI option without --pi",
             )
         return None, persona
+
+    _validate_casework_flags(pi_loop, pi_budget)
 
     if cred:
         raise _refuse(
@@ -394,7 +418,26 @@ def render_pi_summary(result: Dict[str, Any]) -> None:
     ]
     for warning in (block.get("identifier_warnings", []) or [])[:3]:
         lines.append(f"[yellow]⚠ {_esc(warning)}[/yellow]")
+    board = block.get("case_board")
+    if isinstance(board, dict):
+        reason = board.get("stop_reason") or "—"
+        detail = str(board.get("stop_detail") or "")
+        stop = f"{reason} ({detail})" if detail else str(reason)
+        lines.append(
+            f"[bold cyan]Loop:[/bold cyan] casework · stop: {_esc(stop)} · "
+            f"calls {board.get('calls_used', 0)}/{board.get('budget', 0)}"
+        )
     console.print(Panel("\n".join(lines), title="🕵️ [bold white]PI SUMMARY[/bold white]", border_style="bright_blue"))
+    if isinstance(board, dict) and board.get("hypotheses"):
+        table = Table(title="Hypotheses", show_lines=False)
+        table.add_column("Key", style="bold white")
+        table.add_column("Status", style="cyan")
+        table.add_column("Score", justify="right")
+        for row in board.get("hypotheses") or []:
+            if not isinstance(row, dict):
+                continue
+            table.add_row(_esc(row.get("key", "")), _esc(row.get("status", "")), _esc(row.get("score", "")))
+        console.print(table)
 
 
 def _esc(value: Any) -> str:

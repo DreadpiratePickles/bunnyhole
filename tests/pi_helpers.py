@@ -118,7 +118,8 @@ def isolate_cli(
     monkeypatch.setattr(profile_mod, "load_profile", lambda *a, **k: profile_mod.InvestigatorProfile())
     if stub_render:
         monkeypatch.setattr(cli_main, "_render_investigation_results", lambda result: None)
-    wide = Console(width=240)
+    # Height is set too: a dumb terminal (pytest, CI) makes Rich ignore width unless height is also fixed.
+    wide = Console(width=240, height=50)
     monkeypatch.setattr(cli_main, "console", wide)
     monkeypatch.setattr(pi_commands, "console", wide)
 

@@ -199,7 +199,63 @@ def _says_no_anomalies(ach: Mapping[str, Any]) -> bool:
     return bool(_NO_ANOMALY_RE.search(text))
 
 
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def _case_board(block: PIBlock) -> Any:
+    return getattr(block, "case_board", None)
+
+
+def _hypothesis_rows(board: Any) -> List[List[Any]]:
+    rows: List[List[Any]] = []
+    for hypothesis in _field(board, "hypotheses", []) or []:
+        evidence = _field(hypothesis, "evidence", []) or []
+        rows.append([
+            _inline(_field(hypothesis, "text", "")),
+            _enum_value(_field(hypothesis, "status", "")),
+            _Raw(_evidence_cell(evidence, "supports")),
+            _Raw(_evidence_cell(evidence, "refutes")),
+            f"{float(_field(hypothesis, 'score', 0) or 0):g}",
+        ])
+    return rows
+
+
+def _evidence_cell(evidence: Sequence[Any], direction: str) -> str:
+    parts: List[str] = []
+    for link in evidence:
+        if _enum_value(_field(link, "direction", "")) != direction:
+            continue
+        node_ids = [str(node_id) for node_id in (_field(link, "node_ids", []) or []) if node_id]
+        cite = ", ".join(node_ids) or str(_field(link, "detail", "") or _field(link, "signal", ""))
+        parts.append(f"{_field(link, 'signal', '')} ({cite})" if cite else str(_field(link, "signal", "")))
+    return "; ".join(parts) or "none"
+
+
+def _case_theory_section(result: Mapping[str, Any], block: PIBlock, board: Any) -> List[str]:
+    """Playbook hypotheses. The generic H1/H2/H3 scores are the sweep's theory, not this one."""
+    lines: List[str] = []
+    hypothesis = _hypothesis(result)
+    if hypothesis:
+        lines += [f"- **Client theory:** {hypothesis}", ""]
+    rows = _hypothesis_rows(board)
+    lines += _table(["Hypothesis", "Status", "For", "Against", "Score"], rows) if rows else ["None."]
+    lines += ["", "Scores come from the fixed signal table. A high score is not a clearance."]
+    return lines
+
+
 def _theory_section(result: Mapping[str, Any], block: PIBlock) -> List[str]:
+    board = _case_board(block)
+    if board is not None and (_field(board, "hypotheses", []) or []):
+        return _case_theory_section(result, block, board)
     sanctions_hit = bool(_primary_hits(block.sanctions))
     hypothesis, ach = _hypothesis(result), _ach(result)
     if not hypothesis and not ach:
@@ -476,9 +532,81 @@ def _lead_summary(head: str, names: List[Tuple[bool, str]], lines: List[str]) ->
     )
 
 
+def _task_sources(board: Any, origin: str) -> List[str]:
+    sources: List[str] = []
+    for step in _field(board, "log", []) or []:
+        for task_id in _field(step, "tasks", []) or []:
+            parts = str(task_id).split(":")
+            if len(parts) >= 2 and parts[0] == origin:
+                sources.append(parts[1])
+    return sources
+
+
+def _falsifier_origin(text: str) -> Optional[str]:
+    folded = text.casefold()
+    if "single-source lead" in folded:
+        return "corroborate_lead"
+    if "ownership walk ended" in folded:
+        return "extend_ownership"
+    if "contradiction" in folded:
+        return "resolve_contradiction"
+    return None
+
+
+def _falsifier_hint(text: str) -> str:
+    parentheticals = re.findall(r"\(([^)]+)\)", text)
+    for item in reversed(parentheticals):
+        if ":" in item:
+            return item
+    return parentheticals[-1] if parentheticals else ""
+
+
+def _sources_for_hint(board: Any, hint: str) -> List[str]:
+    if not hint:
+        return []
+    sources: List[str] = []
+    for step in _field(board, "log", []) or []:
+        label = str(_field(step, "label", "") or "")
+        if hint not in label:
+            continue
+        body = label.split(":", 1)[-1]
+        for segment in body.split("|"):
+            segment = segment.strip()
+            if hint in segment and segment:
+                sources.append(segment.split(" ", 1)[0])
+    return sources
+
+
+def _source_outcome(block: PIBlock, source: str, hint: str) -> str:
+    entries = [entry for entry in block.source_log if entry.source == source]
+    if hint:
+        specific = [entry for entry in entries if hint in f"{entry.target} {entry.detail}"]
+        if specific:
+            entries = specific
+    if not entries:
+        return "no log entry"
+    return entries[-1].status
+
+
+def _mark_falsifier(text: str, block: PIBlock) -> str:
+    """Say whether casework tried the check this falsifier names. A sweep line is unchanged."""
+    board = _case_board(block)
+    origin = _falsifier_origin(text)
+    if board is None or origin is None:
+        return text
+    hint = _falsifier_hint(text)
+    sources = list(dict.fromkeys(_sources_for_hint(board, hint) or _task_sources(board, origin)))
+    if sources:
+        bits = [f"{source}, {_source_outcome(block, source, hint)}" for source in sources[:4]]
+        return f"{text} — attempted ({'; '.join(bits)})"
+    if _enum_value(_field(board, "stop_reason", "")) == "budget_spent":
+        return f"{text} — not attempted (budget spent)"
+    return f"{text} — not attempted (no dispatchable source)"
+
+
 def _falsifiers_section(block: PIBlock) -> List[str]:
     """Falsifier lines, repeats collapsed (see ``_falsifier_lines``), capped with a ``<n> more`` line."""
-    items = _falsifier_lines(block)
+    items = [_mark_falsifier(text, block) for text in _falsifier_lines(block)]
     if not items:
         return ["None."]
     lines = [f"- {text}" for text in items[:_MAX_FALSIFIER_LINES]]
@@ -487,20 +615,46 @@ def _falsifiers_section(block: PIBlock) -> List[str]:
     return lines
 
 
+def _step_decisions(board: Any) -> Dict[int, str]:
+    decisions: Dict[int, str] = {}
+    for step in _field(board, "log", []) or []:
+        order = _field(step, "order", None)
+        if isinstance(order, int):
+            decisions[order] = str(_field(step, "decision", "") or "")
+    return decisions
+
+
 def _playbook_section(block: PIBlock) -> List[str]:
+    board = _case_board(block)
     if not (block.done_when.strip() or block.playbook_progress or block.escalation_triggers):
         return ["None."]
     lines: List[str] = []
     if block.done_when.strip():
-        lines.append(f"Done when (judged by a human, not by Bunnyhole): {_inline(block.done_when)}")
+        if board is None:
+            lines.append(f"Done when (judged by a human, not by Bunnyhole): {_inline(block.done_when)}")
+        else:
+            met = "met" if str(getattr(block, "done_status", "")) == "met" else "not met"
+            detail = str(_field(board, "stop_detail", "") or "").strip() or block.done_when
+            lines.append(f"Done when: {met} (automated check) — {_inline(detail)}")
     if block.playbook_progress:
         steps = sorted(block.playbook_progress, key=lambda s: s.order)
-        rows = [
-            [s.order, s.action, _Raw(", ".join(_inline(x) for x in s.sources) or "none"),
-             _PLAYBOOK_STATUS.get(s.status, _inline(s.status).upper()), s.evidence]
-            for s in steps
-        ]
-        lines += ([""] if lines else []) + _table(["Step", "Action", "Sources", "Status", "Evidence"], rows)
+        decisions = _step_decisions(board)
+        if board is None:
+            rows = [
+                [s.order, s.action, _Raw(", ".join(_inline(x) for x in s.sources) or "none"),
+                 _PLAYBOOK_STATUS.get(s.status, _inline(s.status).upper()), s.evidence]
+                for s in steps
+            ]
+            header = ["Step", "Action", "Sources", "Status", "Evidence"]
+        else:
+            rows = [
+                [s.order, s.action, _Raw(", ".join(_inline(x) for x in s.sources) or "none"),
+                 _PLAYBOOK_STATUS.get(s.status, _inline(s.status).upper()), s.evidence,
+                 _inline(decisions.get(s.order, ""))]
+                for s in steps
+            ]
+            header = ["Step", "Action", "Sources", "Status", "Evidence", "Decision"]
+        lines += ([""] if lines else []) + _table(header, rows)
     if block.escalation_triggers:
         rows = [[t.trigger, "yes" if t.fired else "no", t.why] for t in block.escalation_triggers]
         lines += ([""] if lines else []) + ["**Escalation triggers:**", ""]
@@ -621,6 +775,34 @@ def _custody_section(block: PIBlock) -> List[str]:
     return table + ["", DIGEST_CAVEAT]
 
 
+def _investigation_log_section(block: PIBlock) -> List[str]:
+    board = _case_board(block)
+    log = _field(board, "log", []) or []
+    if not log:
+        return ["None."]
+    rows = [
+        [
+            _field(step, "order", ""),
+            _inline(_field(step, "label", "")),
+            len(_field(step, "tasks", []) or []),
+            _field(step, "new_findings", 0),
+            _Raw(", ".join(str(key) for key in (_field(step, "hypotheses_changed", []) or [])) or "none"),
+            _inline(_field(step, "decision", "")),
+            _inline(_field(step, "counsel", "")),
+            f"{float(_field(step, 'elapsed_s', 0) or 0):.3f}",
+        ]
+        for step in log
+    ]
+    lines = _table(
+        ["Order", "Step", "Tasks", "New findings", "Hypotheses changed", "Decision", "Counsel", "Seconds"],
+        rows,
+    )
+    reason = _enum_value(_field(board, "stop_reason", ""))
+    if reason:
+        lines += ["", f"Stop: {_inline(reason)} — {_inline(_field(board, 'stop_detail', ''))}"]
+    return lines
+
+
 def _notices_section(block: PIBlock) -> List[str]:
     notices = list(block.notices) or list(NOTICES)
     lines = [f"- {_inline(n)}" for n in notices]
@@ -662,6 +844,7 @@ def build_pi_report(result: Dict[str, Any]) -> str:
         ("What would change this conclusion", _falsifiers_section(block)),
         ("Coverage and negatives", _coverage_section(block)),
         ("Playbook progress", _playbook_section(block)),
+        *([("Investigation log", _investigation_log_section(block))] if _case_board(block) is not None else []),
         ("Custodians and next steps", _custodians_section(block)),
         ("Chain of custody", _custody_section(block)),
         ("Limitations & legal notices", _notices_section(block)),

@@ -462,8 +462,36 @@ def _next_step_bullet(block: PIBlock, labels: _Labels) -> str:
 # --------------------------------------------------------------------------- entry point
 
 
+def _case_bullet(block: PIBlock) -> str:
+    """Stop reason plus the leading supported hypothesis. Absent when the run has no case board."""
+    board = getattr(block, "case_board", None)
+    reason = getattr(getattr(board, "stop_reason", None), "value", getattr(board, "stop_reason", None))
+    if board is None or not reason:
+        return ""
+    hypotheses = list(getattr(board, "hypotheses", []) or [])
+    supported = [
+        item for item in hypotheses
+        if str(getattr(getattr(item, "status", ""), "value", getattr(item, "status", ""))) == "supported"
+    ]
+    if supported:
+        best = max(supported, key=lambda item: float(getattr(item, "score", 0) or 0))
+        text = f"stop {reason}; leading read: {getattr(best, 'text', '')} (score {float(getattr(best, 'score', 0) or 0):g})"
+    else:
+        open_keys = [
+            str(getattr(item, "key", "")) for item in hypotheses
+            if str(getattr(getattr(item, "status", ""), "value", getattr(item, "status", ""))) in ("open", "weakened")
+        ]
+        shown = ", ".join(key for key in open_keys if key) or "none"
+        text = f"stop {reason}; no hypothesis supported; open questions: {shown}"
+    return _bullet("Case", text)
+
+
 def bottom_line_lines(block: PIBlock, ranked: Ranked, names: Mapping[str, str]) -> List[str]:
-    """The Bottom line bullets, sanctions first: at most six one-line ``- **Label:** text`` entries."""
+    """The Bottom line bullets, sanctions first: at most six one-line ``- **Label:** text`` entries.
+
+    A casework board with a stop reason adds a Case bullet in front and the list is cut back to six.
+    A sweep block is unchanged.
+    """
     labels = _Labels(block, names)
     bullets = [
         _sanctions_bullet(block, labels),
@@ -473,7 +501,11 @@ def bottom_line_lines(block: PIBlock, ranked: Ranked, names: Mapping[str, str]) 
         _not_covered_bullet(block),
         _next_step_bullet(block, labels),
     ]
-    return [bullet for bullet in bullets if bullet]
+    kept = [bullet for bullet in bullets if bullet]
+    case_line = _case_bullet(block)
+    if case_line:
+        return [case_line, *kept][:6]
+    return kept
 
 
 __all__ = ["MAX_BULLET_CHARS", "NO_ESCALATION", "NO_ESCALATION_ENTITY", "bottom_line_lines"]

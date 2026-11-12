@@ -48,6 +48,13 @@ jobs:
       - name: Tests (hermetic, no live network)
         run: uv run --locked pytest -q -o addopts=""
 
+      - name: Case board JSON is byte-identical across two runs
+        run: |
+          uv run --locked pytest -q -o addopts="" tests/test_pi_casework_runtime.py::test_case_board_json_is_byte_identical
+          cp /tmp/pi_case_board.json /tmp/pi_case_board_a.json
+          uv run --locked pytest -q -o addopts="" tests/test_pi_casework_runtime.py::test_case_board_json_is_byte_identical
+          diff -u /tmp/pi_case_board_a.json /tmp/pi_case_board.json
+
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -49,11 +49,25 @@ register_ask(app)  # `bunnyhole ask "<question>"`: bunnyhole/cli/ask_command.py
 
 class _EngagementKwargs(TypedDict, total=False):
     engagement: PIEngagement
+    pi_loop: str
+    pi_budget: int
 
 
-def _engagement_kwargs(engagement: Optional[PIEngagement]) -> _EngagementKwargs:
-    """``engagement=`` only in PI mode: a non-PI run never passes the keyword (the orchestrator default stays)."""
-    return {"engagement": engagement} if engagement is not None else {}
+def _engagement_kwargs(
+    engagement: Optional[PIEngagement],
+    *,
+    pi_loop: Optional[str] = None,
+    pi_budget: Optional[int] = None,
+) -> _EngagementKwargs:
+    """``engagement=`` only in PI mode. Loop and budget are passed only when the caller set those flags."""
+    if engagement is None:
+        return {}
+    kwargs: _EngagementKwargs = {"engagement": engagement}
+    if pi_loop is not None:
+        kwargs["pi_loop"] = pi_loop
+    if pi_budget is not None:
+        kwargs["pi_budget"] = pi_budget
+    return kwargs
 
 
 def _version_callback(value: bool) -> None:
@@ -331,6 +345,8 @@ def intake_command(
     pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
     no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: leave the AI-written analysis section out of --pi-report (no LLM call is made). The section is only added when a provider key is configured. Needs --pi-report."),
     confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
+    pi_loop: Optional[str] = typer.Option(None, "--pi-loop", help="PI: casework works an entity due-diligence, asset-search, or fraud-screen playbook in order; sweep (the default) is the single pass. Needs --pi."),
+    pi_budget: Optional[int] = typer.Option(None, "--pi-budget", help="PI: source-call cap for casework, an integer from 10 to 400 (default 120, not a measured percentile). Needs --pi."),
 ) -> None:
     """Run a Dual-Mode Case Intake investigation combining a Working Hypothesis with multiple known credentials/selectors."""
     def _on_event(evt: dict) -> None:
@@ -349,6 +365,7 @@ def intake_command(
             hypothesis or "", dump or "", *(username or []), *(phone or []), *(wallet or []),
             *(exclude or []), *(doc or []),
         ],
+        pi_loop=pi_loop, pi_budget=pi_budget,
     )
     report_builder = pi_commands.load_report_builder(pi_report)
     prof, gear, depth, breadth, exclusions = _personalize(ctx, gear, depth, breadth, list(exclude or []), persona)
@@ -393,7 +410,7 @@ def intake_command(
         event_callback=_on_event,
         intake_packet=normalized,
         profile=prof,
-        **_engagement_kwargs(engagement),
+        **_engagement_kwargs(engagement, pi_loop=pi_loop, pi_budget=pi_budget),
     )
     result = asyncio.run(orch.run_intake_investigation(normalized))
     _render_investigation_results(result)
@@ -441,6 +458,8 @@ def trace_command(
     pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
     no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: leave the AI-written analysis section out of --pi-report (no LLM call is made). The section is only added when a provider key is configured. Needs --pi-report."),
     confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
+    pi_loop: Optional[str] = typer.Option(None, "--pi-loop", help="PI: casework works an entity due-diligence, asset-search, or fraud-screen playbook in order; sweep (the default) is the single pass. Needs --pi."),
+    pi_budget: Optional[int] = typer.Option(None, "--pi-budget", help="PI: source-call cap for casework, an integer from 10 to 400 (default 120, not a measured percentile). Needs --pi."),
 ) -> None:
     """Run an autonomous multi-domain Bunnyhole investigation down the rabbit hole.
 
@@ -480,6 +499,8 @@ def trace_command(
             pi_report=pi_report,
             no_ai_analysis=no_ai_analysis,
             confirm_entity=confirm_entity,
+            pi_loop=pi_loop,
+            pi_budget=pi_budget,
         )
         return
 
@@ -493,6 +514,7 @@ def trace_command(
         pi=pi, case_type=case_type, purpose=purpose, client=client, matter_ref=matter_ref,
         subject_type=subject_type, pi_jurisdiction=pi_jurisdiction, pi_report=pi_report, persona=persona,
         cred=cred, confirm_entity=confirm_entity, seed=seed, purpose_category=purpose_category,
+        pi_loop=pi_loop, pi_budget=pi_budget,
     )
     report_builder = pi_commands.load_report_builder(pi_report)
     prof, gear, depth, breadth, _exclusions = _personalize(ctx, gear, depth, breadth, list(exclude or []), persona)
@@ -503,7 +525,7 @@ def trace_command(
         initial_breadth=breadth,
         event_callback=_on_event,
         profile=prof,
-        **_engagement_kwargs(engagement),
+        **_engagement_kwargs(engagement, pi_loop=pi_loop, pi_budget=pi_budget),
     )
     result = asyncio.run(orch.run_investigation())
     _render_investigation_results(result)
@@ -1139,6 +1161,7 @@ def menu_command(ctx: typer.Context) -> None:
                 anchor_mode=AnchorMode.CONVERGENCE, out=None, json_out=None,
                 pi=False, case_type=None, purpose=None, purpose_category=None, client=None, matter_ref=None,
                 subject_type=None, pi_jurisdiction=None, pi_report=None, no_ai_analysis=False, confirm_entity=False,
+                pi_loop=None, pi_budget=None,
             )
         elif choice == "2":
             ea = Prompt.ask("Enter Entity A", default="vitalik.eth")

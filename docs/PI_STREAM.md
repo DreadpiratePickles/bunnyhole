@@ -11,6 +11,7 @@ a replacement for a licensed investigator or counsel. Output is leads, not verdi
 legal advice. Read [`ACCEPTABLE_USE.md`](../ACCEPTABLE_USE.md) first; it has a PI addendum.
 
 Design spec: [`superpowers/specs/2026-11-09-pi-stream-design.md`](superpowers/specs/2026-11-09-pi-stream-design.md).
+Casework loop (supersedes that spec's single-pass sentence): [`superpowers/specs/2026-11-12-pi-casework-design.md`](superpowers/specs/2026-11-12-pi-casework-design.md).
 Research basis: [`research/12_pi_methodology_and_free_sources.md`](../research/12_pi_methodology_and_free_sources.md).
 
 ---
@@ -233,8 +234,12 @@ catalog: verify with the Ministry of the Solicitor General and counsel.
 
 ## 6. Case-type playbooks
 
-Reference material from `bunnyhole pi playbook <type>`. The live run uses only the objective; the order,
-stop-ifs and escalation triggers guide the human.
+Reference material from `bunnyhole pi playbook <type>`. For an entity `due_diligence`, `asset_search`, or
+`fraud_screen` run with `--pi-loop casework`, Bunnyhole opens a hypothesis board from the playbook, runs
+each playbook step's mapped sources, re-scores the board, and stops with one of five reasons (`done`,
+`escalated`, `dead_end`, `budget_spent`, `no_progress`). Person subjects and the other case types stay on
+the single sweep. `--pi-budget` caps source calls (an integer from 10 to 400). A configured model may
+narrow which offered checks to spend the budget on; sanctions stops and the source list stay in code.
 
 | Case type | Done when | Order of work | Escalate when |
 |---|---|---|---|
@@ -252,7 +257,7 @@ nominee holdings, dissipation or transfer, genuinely judgment-proof).
 
 ## 7. Report anatomy
 
-`--pi-report` writes sixteen sections in this order (the list below is the heading list the code emits). Sections
+`--pi-report` writes sixteen sections in this order on a sweep (the list below is the heading list the code emits). A casework result adds **Investigation log** after Playbook progress, and its bottom line leads with the stop reason. Sections
 with nothing to show say `None.`; where absence is worth stating it reads "None found in the evidence collected
 (this is not proof that none exist)."
 
