@@ -20,6 +20,15 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from pydantic import ValidationError
 
 from bunnyhole.engine.pi import NOTICES, Finding, FindingLabel, PIBlock
+from bunnyhole.engine.pi_case_report import (
+    REPORT_HEADING,
+    Narrative,
+    has_case_file,
+    lead_sheet_section,
+    log_section,
+    narrative_section,
+    questions_section,
+)
 from bunnyhole.engine.pi_escalation import FIFTY_RULE_NOT_EVALUABLE, fifty_rule_not_evaluable
 from bunnyhole.engine.pi_report_bottom import bottom_line_lines
 from bunnyhole.engine.pi_report_common import (
@@ -588,12 +597,44 @@ def _source_outcome(block: PIBlock, source: str, hint: str) -> str:
     return entries[-1].status
 
 
+_FALSIFIER_KINDS = {
+    "corroborate_lead": ("corroborate", "ownership", "pivot"),
+    "extend_ownership": ("ownership",),
+    "resolve_contradiction": ("contradiction",),
+}
+
+
+def _mark_from_sheet(text: str, origin: str, board: Any) -> Optional[str]:
+    """The falsifier line marked from the lead sheet, or ``None`` when the board has no sheet (an older result)."""
+    leads = list(_field(board, "leads", []) or [])
+    if not leads:
+        return None
+    hint = _falsifier_hint(text)
+    matched = [
+        lead for lead in leads
+        if _field(lead, "kind", "") in _FALSIFIER_KINDS[origin]
+        and (
+            (hint and hint == str(_field(lead, "node_id", "")))
+            or str(_field(lead, "target", "") or "\x00").casefold() in text.casefold()
+        )
+    ]
+    if matched:
+        bits = [f"{_field(lead, 'lead_id', '')}, {str(_field(lead, 'status', '')).replace('_', ' ')}" for lead in matched[:4]]
+        return f"{text} — attempted ({'; '.join(bits)})"
+    if _enum_value(_field(board, "stop_reason", "")) == "budget_spent":
+        return f"{text} — not attempted (budget spent)"
+    return f"{text} — not attempted (no lead on the sheet covers it)"
+
+
 def _mark_falsifier(text: str, block: PIBlock) -> str:
     """Say whether casework tried the check this falsifier names. A sweep line is unchanged."""
     board = _case_board(block)
     origin = _falsifier_origin(text)
     if board is None or origin is None:
         return text
+    from_sheet = _mark_from_sheet(text, origin, board)
+    if from_sheet is not None:
+        return from_sheet
     hint = _falsifier_hint(text)
     sources = list(dict.fromkeys(_sources_for_hint(board, hint) or _task_sources(board, origin)))
     if sources:
@@ -777,6 +818,8 @@ def _custody_section(block: PIBlock) -> List[str]:
 
 def _investigation_log_section(block: PIBlock) -> List[str]:
     board = _case_board(block)
+    if board is not None and (_field(board, "notes", []) or []):
+        return log_section(block)  # the investigator's log; the step table below is for results without one
     log = _field(board, "log", []) or []
     if not log:
         return ["None."]
@@ -803,20 +846,40 @@ def _investigation_log_section(block: PIBlock) -> List[str]:
     return lines
 
 
-def _notices_section(block: PIBlock) -> List[str]:
+def _notices_section(block: PIBlock, narrative: Optional[Narrative] = None) -> List[str]:
     notices = list(block.notices) or list(NOTICES)
     lines = [f"- {_inline(n)}" for n in notices]
-    lines.append(
-        "- Generated deterministically from the recorded data: no model scored, labelled or wrote any finding."
-    )
+    board = _case_board(block)
+    if board is not None and _field(board, "guide_name", "") == "llm":
+        lines.append(
+            "- An AI case officer ran this investigation: it chose the order of work, opened leads and wrote the "
+            "readings marked AI-written. Code limited it to names already in the evidence and to the fixed list of "
+            "lawful, passive sources, and it could not waive a sanctions stop. Every finding, label, sanctions "
+            "line, question answer and stop decision was built by code from the recorded data."
+        )
+    else:
+        lines.append(
+            "- Generated deterministically from the recorded data: no model scored, labelled or wrote any finding."
+        )
+    if narrative is not None and narrative.source == "ai":
+        lines.append(
+            "- The Investigation report section is AI-written. Code checked it for names and numbers that are not "
+            "in the case file and for wording that clears the subject; it did not check that each sentence reads "
+            "the evidence correctly. Where it and the code-built sections differ, the code-built sections govern."
+        )
     return lines
 
 
 # --------------------------------------------------------------------------- entry point
 
 
-def build_pi_report(result: Dict[str, Any]) -> str:
-    """Render ``result["pi"]`` as a Markdown PI report; a short note when the PI block is missing or invalid."""
+def build_pi_report(result: Dict[str, Any], narrative: Optional[Narrative] = None) -> str:
+    """Render ``result["pi"]`` as a Markdown PI report; a short note when the PI block is missing or invalid.
+
+    A result with a case file leads with the written account (``narrative`` when a model wrote one that passed
+    the checks, otherwise the account code writes from the same case file), then the questions answered one by
+    one, and carries the lead sheet and the investigator's log. A sweep result is unchanged.
+    """
     data: Mapping[str, Any] = result if isinstance(result, Mapping) else {}
     try:
         block = PIBlock.model_validate(data.get("pi"))
@@ -830,8 +893,13 @@ def build_pi_report(result: Dict[str, Any]) -> str:
     names = _node_names(data)
     ranked = _ranked_findings(block.findings)
     seed = _inline(data.get("seed") or data.get("seed_query")) or _inline(block.engagement.engagement_id)
+    case_file = has_case_file(block)
     sections: List[Tuple[str, List[str]]] = [
         ("Bottom line", bottom_line_lines(block, ranked, names)),
+        *([
+            (REPORT_HEADING, narrative_section(block, str(data.get("seed") or data.get("seed_query") or ""), narrative)),
+            ("Case questions and answers", questions_section(block)),
+        ] if case_file else []),
         ("Engagement & scope", _engagement_section(block, data)),
         ("Entity profile", _entity_profile_section(block)),
         ("Client theory vs. evidence", _theory_section(data, block)),
@@ -844,10 +912,11 @@ def build_pi_report(result: Dict[str, Any]) -> str:
         ("What would change this conclusion", _falsifiers_section(block)),
         ("Coverage and negatives", _coverage_section(block)),
         ("Playbook progress", _playbook_section(block)),
+        *([("Lead sheet", lead_sheet_section(block))] if case_file else []),
         *([("Investigation log", _investigation_log_section(block))] if _case_board(block) is not None else []),
         ("Custodians and next steps", _custodians_section(block)),
         ("Chain of custody", _custody_section(block)),
-        ("Limitations & legal notices", _notices_section(block)),
+        ("Limitations & legal notices", _notices_section(block, narrative)),
     ]
     lines = [f"# Bunnyhole PI report: {seed}", ""]
     for heading, body in sections:

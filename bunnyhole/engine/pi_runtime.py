@@ -81,7 +81,7 @@ from bunnyhole.engine.pi_recorder import (
     make_holehe_blocker,
 )
 from bunnyhole.engine.pi_reference import playbook_for
-from bunnyhole.engine.pi_relevance import score_subject_relevance
+from bunnyhole.engine.pi_relevance import name_match_level, score_subject_relevance
 from bunnyhole.engine.pi_ubo import (
     OwnerLink,
     apply_50_percent_rule,
@@ -665,6 +665,9 @@ def _relevance_map(
 
     Pass one scores names. Pass two re-scores nodes joined by an ownership or officer edge (or an ownership link)
     to a node that is the subject or the seed anchor: a company's officer or parent is related whatever its name.
+    Pass three walks the ownership chain upward: the owner of an owner is in the subject's chain whatever it is
+    called. Pass four keeps a sanctions or PEP listing whose listed name matches a party in that chain: screening
+    every node of the chain is pointless if a hit on a parent is discarded for not resembling the subject.
     """
     out: Dict[str, Tuple[str, str]] = {}
     anchors = {str(n.get("id")) for n in nodes if _is_anchor(n)}
@@ -686,7 +689,56 @@ def _relevance_map(
     for node_id in linked:
         if node_id in out and out[node_id][0] in ("unrelated", "unknown") and node_id in by_id:
             out[node_id] = _score_node(names, by_id[node_id], True)
+
+    owners: List[Tuple[str, str]] = []  # (child, parent)
+    for edge in edges:
+        relation = str(_val(edge.get("relation")))
+        if relation in _PARENT_IS_SOURCE:
+            owners.append((str(edge.get("target_id")), str(edge.get("source_id"))))
+        elif relation in _PARENT_IS_TARGET:
+            owners.append((str(edge.get("source_id")), str(edge.get("target_id"))))
+    owners += [(str(_dict(l).get("child_id") or ""), str(_dict(l).get("parent_id") or "")) for l in ownership_links]
+    chain: Set[str] = set()
+    scope = set(subject_ids)
+    grew = True
+    while grew:
+        grew = False
+        for child, parent in owners:
+            if child in scope and parent and parent not in scope:
+                scope.add(parent)
+                chain.add(parent)
+                grew = True
+    for node_id in chain - linked:
+        if node_id in out and out[node_id][0] in ("unrelated", "unknown"):
+            out[node_id] = ("related", f"{out[node_id][1]}; in the ownership chain above the subject")
+
+    parties = [by_id[node_id] for node_id in sorted(linked | chain) if node_id in by_id]
+    for node in nodes if parties else []:
+        node_id = str(node.get("id"))
+        if out.get(node_id, ("subject", ""))[0] not in ("unrelated", "unknown") or not _is_listing(node):
+            continue
+        listed = _clean_label(str(node.get("label") or node_id))
+        for party in parties:
+            party_name = _display_name(str(party.get("label") or party.get("id")))
+            level = name_match_level(party_name, listed, attributes=node.get("attributes") or {})
+            if level in ("exact", "strong") and _is_person_node(party) == _is_person_node(node):
+                out[node_id] = (
+                    "related",
+                    f"the listed name matches '{party_name}', a party in the subject's ownership chain",
+                )
+                break
     return out
+
+
+def _is_person_node(node: Mapping[str, Any]) -> bool:
+    return str(_val(node.get("entity_type"))) == "Person"
+
+
+def _is_listing(node: Mapping[str, Any]) -> bool:
+    """A node a sanctions or PEP list produced (not an entity that merely matches one)."""
+    return any(
+        marker in str(r.get("tool") or "").lower() for r in _receipts(node) for marker in _LISTING_TOOL_MARKERS
+    )
 
 
 _NAME_SEED_TYPES = frozenset({"company", "person"})

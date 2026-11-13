@@ -8,7 +8,7 @@ import math
 import re
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 from bunnyhole.agents.accountant import AccountantAgent
 from bunnyhole.agents.journalist import JournalistAgent
@@ -198,8 +198,8 @@ _DEX_PI_SKIP = "token-name search is noise for company/person/handle leads; not 
 DEFAULT_PI_BUDGET = 120
 PI_BUDGET_MIN = 10
 PI_BUDGET_MAX = 400
-MAX_FOLLOWUP_ROUNDS = 3
-PERSON_CASEWORK_NOTE = "person case types use the sweep in this release"
+#: Extra source calls each time the investigator chases leads after the case first stopped.
+CHASE_ROUND_BUDGET = 40
 
 
 class BunnyholeOrchestrator:
@@ -222,7 +222,7 @@ class BunnyholeOrchestrator:
         intake_packet: Optional[CaseIntakePacket] = None,
         profile: Optional[InvestigatorProfile] = None,
         engagement: Optional[PIEngagement] = None,
-        pi_loop: str = "sweep",
+        pi_loop: str = "casework",
         pi_budget: int = DEFAULT_PI_BUDGET,
         pi_guide: Optional[Any] = None,
     ) -> None:
@@ -320,16 +320,22 @@ class BunnyholeOrchestrator:
                 # Shadowed on the instance like the breach blockers above (setattr: mypy rejects assigning a plain
                 # function to a method attribute; the blocker's signature mirrors _run_local_arsenal_holehe).
                 setattr(self.osint, "_run_local_arsenal_holehe", make_holehe_blocker(self.pi_recorder))  # noqa: B010
-        # Casework knobs apply only to a PI engagement. A normal trace never reads them.
+        # Casework knobs apply only to a PI engagement. A normal trace never reads them. A PI engagement works
+        # the case file unless the caller asks for the single sweep.
         self.pi_loop = "sweep"
         self.pi_budget = DEFAULT_PI_BUDGET
         self._pi_case_board: Optional[Any] = None
         self._pi_guide: Optional[Any] = None
-        self._pi_casework_skipped = False
         self._pi_clock: Callable[[], float] = time.perf_counter
+        # The open case file's working state (set by _open_pi_case, reused when leads are chased).
+        self._case_roots: List[Tuple[str, str, GraphNode]] = []
+        self._case_subjects: List[Any] = []
+        self._case_guide: Any = None
+        self._case_done: Set[Tuple[str, str]] = set()
+        self._case_seq = 0
+        self._case_view: Tuple[Any, Any] = (None, None)
         if self.engagement is not None:
-            if pi_loop in ("sweep", "casework"):
-                self.pi_loop = pi_loop
+            self.pi_loop = pi_loop if pi_loop in ("sweep", "casework") else "casework"
             self.pi_budget = max(PI_BUDGET_MIN, min(PI_BUDGET_MAX, int(pi_budget)))
             self._pi_guide = pi_guide
 
@@ -387,32 +393,17 @@ class BunnyholeOrchestrator:
         self._pi_prior_cases = run_conflict_check(self.case_store, values, self.graph.case_id, self.pi_recorder)
 
     def _use_pi_casework(self) -> bool:
-        """Entity due diligence, asset search, and fraud screen, and only when the caller asked for casework.
+        """A PI engagement works the case file unless the caller asked for the single sweep."""
+        return self.engagement is not None and self.pi_loop == "casework"
 
-        A person subject, or any other case type, stays on the sweep. The skip is logged once.
-        """
-        if self.engagement is None or self.pi_loop != "casework":
-            return False
-        from bunnyhole.engine.pi import CaseType
-
-        entity_case = self.engagement.case_type in {
-            CaseType.DUE_DILIGENCE, CaseType.ASSET_SEARCH, CaseType.FRAUD_SCREEN,
-        }
-        if entity_case and not self.engagement.subject_is_person:
-            return True
-        if not self._pi_casework_skipped:
-            self._pi_casework_skipped = True
-            self._pi_skip("casework", self.engagement.case_type.value, PERSON_CASEWORK_NOTE)
-        return False
-
-    def _assemble_pi_snapshot(self) -> Any:
+    def _assemble_pi_snapshot(self, graph_dict: Optional[Dict[str, Any]] = None) -> Any:
         """The PI block ``compile_full_result`` will store, built from the graph as it stands now."""
         if self.engagement is None or self.pi_recorder is None:
             raise RuntimeError("PI snapshot requested outside a PI engagement")
         mode: Literal["sweep", "casework"] = "casework" if self._pi_case_board is not None else "sweep"
         return assemble_pi_block(
             self.engagement,
-            self.graph.to_dict(),
+            graph_dict if graph_dict is not None else self.graph.to_dict(),
             self.pi_recorder.entries,
             cross_case_prior=self._pi_prior_cases,
             selectors=self._pi_selectors,
@@ -422,17 +413,26 @@ class BunnyholeOrchestrator:
             loop_mode=mode,
         )
 
-    def _case_origin(self, target: str, root_nodes: Sequence[Tuple[str, str, GraphNode]]) -> str:
-        wanted = target.strip()
+    def _case_snapshot(self) -> Tuple[Any, Any]:
+        """The PI block and the graph view the case file reads, from one pass over the graph."""
+        from bunnyhole.engine.pi_casefile import GraphView
+
+        graph_dict = self.graph.to_dict()
+        view = GraphView.from_graph(graph_dict, [lead.model_dump() for lead in self.graph.leads.values()])
+        return self._assemble_pi_snapshot(graph_dict), view
+
+    def _case_origin(self, lead: Any, root_nodes: Sequence[Tuple[str, str, GraphNode]]) -> str:
+        """The node a lead's results hang off: the node the lead is about, else the matching client anchor."""
+        if lead.node_id and lead.node_id in self.graph.nodes:
+            return str(lead.node_id)
+        wanted = lead.target.strip()
         for _lead, value, node in root_nodes:
             if value.strip() == wanted:
                 return node.id
         return root_nodes[0][2].id
 
-    async def _run_case_tasks(
-        self, tasks: Sequence[Any], root_nodes: Sequence[Tuple[str, str, GraphNode]],
-    ) -> None:
-        """Run one step's tasks under the shared semaphore. Unknown sources are logged and not called."""
+    async def _run_case_tasks(self, tasks: Sequence[Any], origin: str, hop: int) -> None:
+        """Run one lead's source calls under the shared semaphore. Unknown sources are logged and not called."""
         from bunnyhole.engine.pi_dispatch import PI_DISPATCH, refusal_reason
 
         async def _one(task: Any) -> None:
@@ -441,158 +441,346 @@ class BunnyholeOrchestrator:
                 if reason:
                     self._pi_skip(task.source, task.target, reason)
                     return
-                origin = self._case_origin(task.target, root_nodes)
-                coro = PI_DISPATCH[task.source](self, task.target, origin, 1)
+                coro = PI_DISPATCH[task.source](self, task.target, origin, hop)
                 await self._pi_task(task.source, task.target, coro)
 
         await self._gather_logged([_one(task) for task in tasks], "pi_case_tasks")
 
-    def _keep_board_progress(self, scored: Any, board: Any) -> Any:
-        """Scoring replaces hypothesis rows. Calls, the log, and the stop fields stay with the runner."""
-        return scored.model_copy(update={
-            "log": list(board.log),
-            "calls_used": board.calls_used,
-            "budget": board.budget,
-            "stop_reason": board.stop_reason,
-            "stop_detail": board.stop_detail,
-            "guide_name": board.guide_name,
-        })
+    def _set_aside_excluded(self, leads: Sequence[Any]) -> List[Any]:
+        """A target the client excluded is written on the sheet as set aside, never worked."""
+        return [
+            lead.model_copy(update={
+                "status": "set_aside", "outcome": "Set aside: excluded by the client's instructions.",
+            }) if lead.status == "open" and self.graph.is_excluded(lead.target) else lead
+            for lead in leads
+        ]
+
+    def _mark_pivots_explored(self, leads: Sequence[Any]) -> None:
+        """A pivot the case file adopted leaves the graph's own queue, so nothing offers it twice."""
+        adopted = {(lead.target_type, lead.target.lower().strip()) for lead in leads if lead.kind == "pivot"}
+        for queued in self.graph.leads.values():
+            key = (queued.lead_type, queued.seed_value.lower().strip())
+            if key in adopted:
+                queued.explored = True
+                self.graph.explored_seeds.add(f"{key[0]}:{key[1]}")
 
     async def _run_pi_casework(self, root_nodes: Sequence[Tuple[str, str, GraphNode]]) -> None:
-        """Work the playbook in order, then chase the board's own falsifiers. The sweep loop does not run."""
-        from bunnyhole.engine.pi import StopReason
-        from bunnyhole.engine.pi_casework import DONE_EVALUATORS, open_case_board
+        """Work the case the way an investigator does: one lead at a time, each result deciding the next.
+
+        The lead sheet opens with the playbook's order of work on what the client supplied. After every lead the
+        evidence is re-read: the questions are answered again, the hypotheses re-scored, and new leads opened off
+        what came back (the next owner up the chain, a controlling person to screen, a wallet a record named).
+        With a provider key an AI case officer runs this: it reads each result, opens leads of its own, sets leads
+        aside and picks the next one, inside the limits code enforces. The case stops when the questions are
+        settled, when a sanctions hit sends it to counsel, when the leads or the call budget run out, or when
+        optional leads stop producing anything. The sweep loop does not run.
+        """
+        self._open_pi_case(root_nodes)
+        await self._work_pi_case(first_round=True)
+
+    def _open_pi_case(self, root_nodes: Sequence[Tuple[str, str, GraphNode]]) -> None:
+        """Open the case file: the questions, the hypotheses and the opening lead sheet."""
+        from bunnyhole.engine.pi_casefile import answer_questions, open_questions, plan_leads, subjects_from_roots
+        from bunnyhole.engine.pi_casework import open_case_board
         from bunnyhole.engine.pi_casework_guide import make_case_guide
+        from bunnyhole.engine.pi_dispatch import NOT_DISPATCHABLE
         from bunnyhole.engine.pi_reference import playbook_for
 
         assert self.engagement is not None and self.pi_recorder is not None
-        playbook = playbook_for(self.engagement.case_type)
+        engagement = self.engagement
+        playbook = playbook_for(engagement.case_type)
         guide = self._pi_guide if self._pi_guide is not None else make_case_guide(self.graph)
-        board = open_case_board(self.engagement, playbook, budget=self.pi_budget)
-        board = board.model_copy(update={"guide_name": getattr(guide, "name", "playbook")})
-        done_tasks: set[str] = set()
-        subjects = [value for lead, value, _node in root_nodes if lead not in ("credential", "document") and value.strip()]
-        done_eval = DONE_EVALUATORS[self.engagement.case_type]
+        subjects = subjects_from_roots(root_nodes)
+        planned, blocked = plan_leads(playbook, subjects, engagement)
+        for source, target in blocked:
+            self._pi_skip(source, target, NOT_DISPATCHABLE)
+        board = open_case_board(engagement, playbook, budget=self.pi_budget).model_copy(update={
+            "guide_name": getattr(guide, "name", "playbook"),
+            "questions": open_questions(engagement.case_type, engagement.subject_is_person),
+            "leads": self._set_aside_excluded(planned),
+        })
+        self._pi_case_board = board
+        self._case_roots = list(root_nodes)
+        self._case_subjects = subjects
+        self._case_guide = guide
+        self._case_done = set()
+        self._case_seq = 0
         self.graph.log(
-            DomainCategory.SKEPTIC, "PI_CASE_START", self.engagement.case_type.value,
-            f"guide={board.guide_name} budget={board.budget} subjects={len(subjects)}",
+            DomainCategory.SKEPTIC, "PI_CASE_START", engagement.case_type.value,
+            f"case officer={board.guide_name} budget={board.budget} subjects={len(subjects)} "
+            f"questions={len(board.questions)} opening leads={len(board.leads)}",
             level="discovery",
         )
-        snapshot = self._assemble_pi_snapshot()
-        stopped = await self._casework_playbook(
-            board, playbook, subjects, root_nodes, done_tasks, guide, done_eval, snapshot,
+        snapshot, view = self._case_snapshot()
+        questions, _moved = answer_questions(board.questions, snapshot, view, subjects, self._pi_selectors)
+        self._pi_case_board = board.model_copy(update={"questions": questions})
+        self._case_view = (snapshot, view)
+
+    async def _officer(self, phase: str, last: Optional[Any] = None) -> Any:
+        """Ask the case officer what to do next, then apply what code allows of its answer.
+
+        Returns the decision. Leads it proposed and code admitted are on the sheet when this returns; the ones
+        code refused are logged with the reason. With the playbook as officer this is a no-op.
+        """
+        from bunnyhole.engine.pi_case_report import screen_reading
+        from bunnyhole.engine.pi_casefile import (
+            OFFERED_LEADS,
+            Proposal,
+            admit_proposals,
+            known_targets,
+            lead_offer,
+            open_leads,
+            set_aside_leads,
         )
-        board, snapshot = stopped
-        if board.stop_reason is None:
-            board, snapshot = await self._casework_followups(
-                board, snapshot, root_nodes, done_tasks, guide, done_eval,
+
+        board = self._pi_case_board
+        assert board is not None
+        snapshot, view = self._case_view
+        offers = [lead_offer(lead) for lead in open_leads(board)[:OFFERED_LEADS]]
+        targets = list(known_targets(snapshot, view, self._case_subjects).values())
+        decision = await self._case_guide.advise(
+            board=board, block=snapshot, offered=offers, phase=phase, targets=targets, last=last,
+        )
+        opened_by = last.lead_id if last is not None else "intake"
+        proposals = [Proposal(item.target, tuple(item.sources), item.why) for item in decision.new_leads]
+        admitted, refused = admit_proposals(
+            board, proposals, snapshot, view, self._case_subjects, self._case_done, opened_by=opened_by,
+        )
+        admitted = self._set_aside_excluded(admitted)
+        board = board.model_copy(update={"leads": [*board.leads, *admitted]})
+        board, set_aside = set_aside_leads(board, decision.set_aside)
+        for reason in refused:
+            self.graph.log(DomainCategory.SKEPTIC, "PI_OFFICER_REFUSED", phase, reason, level="warning")
+        if last is not None and (decision.read or decision.counsel or admitted or set_aside):
+            extra: List[str] = []
+            if admitted:
+                extra.append("Case officer opened " + ", ".join(
+                    f"{lead.lead_id} ({lead.target_type}: {lead.target})" for lead in admitted
+                ) + ".")
+            if set_aside:
+                extra.append("Case officer set aside " + ", ".join(set_aside) + ".")
+            if refused:
+                extra.append(f"{len(refused)} proposed lead(s) were refused by the scope rules.")
+            read = screen_reading(
+                " ".join(part for part in (decision.read, decision.counsel, decision.leading_read) if part)
             )
-        if board.stop_reason is None:
-            reason = StopReason.DONE if done_eval(snapshot) else StopReason.DEAD_END
-            detail = "done-when check met" if reason is StopReason.DONE else "playbook finished with the done-when check unmet"
-            board = board.model_copy(update={"stop_reason": reason, "stop_detail": detail})
+            note = last.model_copy(update={
+                "counsel": read[:1200],
+                "next": " ".join([last.next if last.next != "No new lead." or not extra else "", *extra]).strip(),
+            })
+            board = board.model_copy(update={
+                "notes": [note if item.seq == note.seq else item for item in board.notes],
+            })
         self._pi_case_board = board
+        return decision
+
+    def _pick_lead(self, queue: Sequence[Any], decision: Any) -> Any:
+        """The officer's choice when it named an open lead, otherwise the top of the sheet."""
+        wanted = [str(item).strip().upper() for item in decision.run_task_ids]
+        for lead_id in wanted:
+            for lead in queue:
+                if lead.lead_id.upper() == lead_id:
+                    return lead
+        return queue[0]
+
+    async def _work_pi_case(self, *, first_round: bool) -> None:
+        """Work the open leads until the case stops. Re-entered when the investigator chases more leads."""
+        from bunnyhole.engine.pi import CaseStepRecord, StopReason
+        from bunnyhole.engine.pi_casefile import (
+            QUIET_STREAK_LIMIT,
+            answer_questions,
+            close_remaining,
+            develop_leads,
+            lead_tasks,
+            norm,
+            open_leads,
+            questions_settled,
+            replace_lead,
+            retire_unneeded,
+            settle_lead,
+            stop_summary,
+            write_note,
+        )
+        from bunnyhole.engine.pi_casework import CASE_ENDING_STOP_KEYS, score_hypotheses, step_stop_decision, stop_check
+        from bunnyhole.engine.pi_casework_guide import GuideDecision, guide_may_stop
+        from bunnyhole.engine.pi_reference import playbook_for
+
+        assert self.engagement is not None and self._pi_case_board is not None
+        engagement = self.engagement
+        playbook = playbook_for(engagement.case_type)
+        subjects = self._case_subjects
+        done = self._case_done
+        steps = {step.order: step for step in playbook.steps}
+        sanctions_step = next((step for step in playbook.steps if step.stop_key in CASE_ENDING_STOP_KEYS), None)
+        quiet = 0
+        cut_short = False
+        decision = await self._officer("plan") if first_round else GuideDecision()
+        while self._pi_case_board.stop_reason is None:
+            board = retire_unneeded(self._pi_case_board)
+            queue = open_leads(board)
+            if not queue:
+                self._pi_case_board = board
+                break
+            soft = guide_may_stop(decision, None)
+            if soft is not None and not any(item.mandatory for item in queue):
+                board = close_remaining(board, f"Not worked: the case officer recommended stopping ({soft.value}).")
+                self._pi_case_board = self._stop_board(
+                    board, (soft, f"the case officer recommended stopping ({stop_summary(board)})"),
+                )
+                break
+            lead = self._pick_lead(queue, decision)
+            tasks = lead_tasks(lead, done)
+            remaining = board.budget - board.calls_used
+            if tasks and remaining <= 0:
+                board = close_remaining(board, "Not worked: the source-call budget was spent.")
+                self._pi_case_board = self._stop_board(
+                    board, (StopReason.BUDGET, f"calls {board.calls_used}/{board.budget}"),
+                )
+                break
+            self._case_seq += 1
+            seq = self._case_seq
+            run_now = tasks[:remaining]
+            started = self._pi_clock()
+            snapshot, view = self._case_view
+            seen = {finding.node_id for finding in snapshot.findings}
+            asked = list(board.questions)
+            await self._run_case_tasks(run_now, self._case_origin(lead, self._case_roots), lead.depth + 1)
+            done |= {(task.source, norm(task.target)) for task in run_now}
+            board = board.model_copy(update={"calls_used": board.calls_used + len(run_now)})
+            self._pi_case_board = board
+            snapshot, view = self._case_snapshot()
+            self._case_view = (snapshot, view)
+            board, changed = score_hypotheses(board, snapshot, engagement.case_type)
+            questions, moved = answer_questions(board.questions, snapshot, view, subjects, self._pi_selectors)
+            board = board.model_copy(update={"questions": questions})
+            fresh = [finding for finding in snapshot.findings if finding.node_id not in seen]
+            relevant = [finding for finding in fresh if finding.relevance in ("subject", "related")]
+            settled = settle_lead(lead, snapshot.source_log, relevant_new=len(relevant), moved=bool(moved))
+            board = replace_lead(board, settled)
+            opened = self._set_aside_excluded(
+                develop_leads(board, snapshot, view, subjects, done, opened_by=lead.lead_id)
+            )
+            self._mark_pivots_explored(opened)
+            board = board.model_copy(update={"leads": [*board.leads, *opened]})
+            step = steps.get(lead.step_order) if lead.step_order is not None else (
+                sanctions_step if lead.kind == "screen" else None
+            )
+            hard = stop_check(board, step, snapshot, snapshot.escalation_triggers, done_eval=lambda _block: False)
+            short = len(run_now) < len(tasks)
+            if hard is not None and hard[0] is StopReason.BUDGET and not short:
+                hard = None  # the budget only ends the case when a lead still has calls to make
+            if hard is None and short:
+                hard = (StopReason.BUDGET, f"calls {board.calls_used}/{board.budget}")
+            verdict = self._decision_text(hard[0]) if hard is not None else "continue"
+            if hard is None and step is not None and step_stop_decision(step, snapshot) != "continue":
+                verdict = step_stop_decision(step, snapshot)
+                board = self._stop_ledger_tracing(board)
+            note = write_note(
+                seq, settled, ran=run_now, log=snapshot.source_log, new_relevant=relevant, new_total=len(fresh),
+                before=asked, after=questions,
+                hypotheses_changed=[(h.text, h.status.value) for h in board.hypotheses if h.key in changed],
+                opened=opened,
+            )
+            record = CaseStepRecord(
+                order=lead.step_order if lead.step_order is not None else 100 + seq,
+                label=f"{lead.lead_id} {lead.kind}: {lead.target}"[:500], tasks=[task.task_id for task in run_now],
+                new_findings=len(fresh), hypotheses_changed=changed, decision=verdict,
+                elapsed_s=round(self._pi_clock() - started, 3),
+            )
+            board = board.model_copy(update={"notes": [*board.notes, note], "log": [*board.log, record]})
+            self._pi_case_board = board
+            self._log_case_lead(settled, verdict, changed, moved)
+            if hard is not None:
+                why = "refer to compliance counsel" if hard[0] is StopReason.ESCALATED else "the source-call budget was spent"
+                self._pi_case_board = self._stop_board(
+                    close_remaining(board, f"Not worked: the case stopped ({why})."), hard,
+                )
+                break
+            if not lead.mandatory:
+                quiet = quiet + 1 if settled.status in ("negative", "not_reached") and not moved else 0
+            if quiet >= QUIET_STREAK_LIMIT and not cut_short:
+                cut_short = True
+                self._pi_case_board = close_remaining(
+                    board,
+                    f"Not worked: {QUIET_STREAK_LIMIT} optional leads in a row added nothing, so the rest were not "
+                    "worth the calls.",
+                    keep_mandatory=True,
+                )
+            decision = await self._officer(f"debrief:{lead.lead_id}", last=note)
+            counsel = self._pi_case_board.notes[-1].counsel if self._pi_case_board.notes else ""
+            if counsel:
+                log = [*self._pi_case_board.log]
+                log[-1] = log[-1].model_copy(update={"counsel": counsel[:400]})
+                self._pi_case_board = self._pi_case_board.model_copy(update={"log": log})
+        board = self._pi_case_board
+        if board.stop_reason is None:
+            summary = stop_summary(board)
+            if questions_settled(board.questions):
+                final = (StopReason.DONE, f"every question is answered or documented as out of reach ({summary})")
+            elif cut_short:
+                final = (StopReason.NO_PROGRESS, f"optional leads stopped producing ({summary})")
+            else:
+                final = (StopReason.DEAD_END, f"every lead is worked and the free public record is exhausted ({summary})")
+            board = self._stop_board(board, final)
+        self._pi_case_board = board
+        assert board.stop_reason is not None
         self.graph.log(
             DomainCategory.SKEPTIC, "PI_CASE_STOP", board.stop_reason.value,
             board.stop_detail, level="anomaly" if board.stop_reason is StopReason.ESCALATED else "discovery",
         )
 
-    async def _casework_playbook(
-        self, board: Any, playbook: Any, subjects: List[str],
-        root_nodes: Sequence[Tuple[str, str, GraphNode]], done_tasks: set[str], guide: Any,
-        done_eval: Callable[[Any], bool], snapshot: Any,
-    ) -> Tuple[Any, Any]:
-        from bunnyhole.engine.pi import CaseStepRecord
-        from bunnyhole.engine.pi_casework import playbook_tasks, score_hypotheses, step_stop_decision, stop_check
-        from bunnyhole.engine.pi_casework_guide import apply_guide, guide_may_stop
+    def pi_chaseable_leads(self) -> List[Any]:
+        """Leads on the sheet the investigator may still chase (suggested, not worked, or never reached)."""
+        from bunnyhole.engine.pi_casefile import chaseable_leads
 
-        assert self.engagement is not None
-        for step in playbook.steps:
-            remaining = board.budget - board.calls_used
-            if remaining <= 0:
-                board = self._stop_board(board, stop_check(
-                    board, step, snapshot, snapshot.escalation_triggers, done_eval=done_eval,
-                ))
-                break
-            offered = [task for task in playbook_tasks(step, subjects) if task.task_id not in done_tasks][:remaining]
-            choose = await guide.advise(board=board, block=snapshot, offered=offered, phase=f"step:{step.order}")
-            tasks = apply_guide(offered, choose)[:remaining]
-            started = self._pi_clock()
-            before = {finding.node_id for finding in snapshot.findings}
-            await self._run_case_tasks(tasks, root_nodes)
-            done_tasks.update(task.task_id for task in tasks)
-            board = board.model_copy(update={"calls_used": board.calls_used + len(tasks)})
-            self._pi_case_board = board
-            snapshot = self._assemble_pi_snapshot()
-            scored, changed = score_hypotheses(board, snapshot, self.engagement.case_type)
-            board = self._keep_board_progress(scored, board)
-            review = await guide.advise(board=board, block=snapshot, offered=[], phase=f"review:{step.order}")
-            hard = stop_check(board, step, snapshot, snapshot.escalation_triggers, done_eval=done_eval)
-            decision, final = self._merge_stop(hard, review, guide_may_stop)
-            if decision == "continue":
-                decision = step_stop_decision(step, snapshot)
-            new_findings = len({finding.node_id for finding in snapshot.findings} - before)
-            counsel = " ".join(part for part in (choose.counsel, review.leading_read, review.counsel) if part)[:400]
-            board = self._append_step(board, CaseStepRecord(
-                order=step.order, label=step.action, tasks=[task.task_id for task in tasks],
-                new_findings=new_findings, hypotheses_changed=changed, decision=decision,
-                counsel=counsel, elapsed_s=round(self._pi_clock() - started, 3),
-            ))
-            self._log_case_step(step.order, decision, changed)
-            if final is not None:
-                board = self._stop_board(board, final)
-                break
-        return board, snapshot
+        return chaseable_leads(self._pi_case_board) if self._pi_case_board is not None else []
 
-    async def _casework_followups(
-        self, board: Any, snapshot: Any, root_nodes: Sequence[Tuple[str, str, GraphNode]],
-        done_tasks: set[str], guide: Any, done_eval: Callable[[Any], bool],
-    ) -> Tuple[Any, Any]:
-        from bunnyhole.engine.pi import CaseStepRecord, StopReason
-        from bunnyhole.engine.pi_casework import follow_up_tasks, score_hypotheses, stop_check
-        from bunnyhole.engine.pi_casework_guide import apply_guide, guide_may_stop
+    async def chase_pi_leads(self, lead_ids: Sequence[str], extra_budget: int = CHASE_ROUND_BUDGET) -> Dict[str, Any]:
+        """Reopen the named leads, work them and whatever they open, and return the updated result.
 
-        assert self.engagement is not None
-        for round_no in range(1, MAX_FOLLOWUP_ROUNDS + 1):
-            remaining = board.budget - board.calls_used
-            offered = follow_up_tasks(snapshot, done_tasks, limit=max(remaining, 0))
-            choose = await guide.advise(board=board, block=snapshot, offered=offered, phase=f"followup:{round_no}")
-            tasks = apply_guide(offered, choose)[:max(remaining, 0)]
-            if not tasks:
-                reason = StopReason.DONE if done_eval(snapshot) else StopReason.DEAD_END
-                detail = "done-when check met" if reason is StopReason.DONE else "no further dispatchable lead"
-                return self._stop_board(board, (reason, detail)), snapshot
-            started = self._pi_clock()
-            before = {finding.node_id for finding in snapshot.findings}
-            await self._run_case_tasks(tasks, root_nodes)
-            done_tasks.update(task.task_id for task in tasks)
-            board = board.model_copy(update={"calls_used": board.calls_used + len(tasks)})
-            self._pi_case_board = board
-            snapshot = self._assemble_pi_snapshot()
-            scored, changed = score_hypotheses(board, snapshot, self.engagement.case_type)
-            board = self._keep_board_progress(scored, board)
-            new_findings = len({finding.node_id for finding in snapshot.findings} - before)
-            quiet = new_findings == 0 and not changed
-            hard = stop_check(
-                board, None, snapshot, snapshot.escalation_triggers, done_eval=done_eval, no_progress=quiet,
+        Only leads still on the sheet as suggested, not worked or not reached can be chased. A lead set aside on
+        scope grounds stays set aside, and a case that stopped for compliance counsel is not reopened. Each round
+        adds ``extra_budget`` source calls. Raises ``ValueError`` when nothing named can be chased.
+        """
+        from bunnyhole.engine.pi import StopReason
+        from bunnyhole.engine.pi_casefile import reopen_leads
+
+        board = self._pi_case_board
+        if self.engagement is None or board is None:
+            raise ValueError("There is no PI case file to chase leads on (run a casework engagement first).")
+        if board.stop_reason is StopReason.ESCALATED:
+            raise ValueError(
+                "This case stopped on a sanctions hit or a 50% rule block and was referred to compliance counsel. "
+                "It is not reopened."
             )
-            review = await guide.advise(board=board, block=snapshot, offered=[], phase=f"review-followup:{round_no}")
-            decision, final = self._merge_stop(hard, review, guide_may_stop)
-            label = "follow-up: " + " | ".join(f"{task.source} {task.why}" for task in tasks)
-            counsel = " ".join(part for part in (choose.counsel, review.leading_read, review.counsel) if part)[:400]
-            board = self._append_step(board, CaseStepRecord(
-                order=100 + round_no, label=label[:500], tasks=[task.task_id for task in tasks],
-                new_findings=new_findings, hypotheses_changed=changed,
-                decision=decision if final is None else self._decision_text(final[0]),
-                counsel=counsel, elapsed_s=round(self._pi_clock() - started, 3),
-            ))
-            self._log_case_step(100 + round_no, board.log[-1].decision, changed)
-            if final is not None:
-                return self._stop_board(board, final), snapshot
-        return board, snapshot
+        board, reopened, refused = reopen_leads(board, lead_ids)
+        if not reopened:
+            raise ValueError("No lead to chase: " + ("; ".join(refused) or "nothing was named"))
+        extra = max(PI_BUDGET_MIN, min(PI_BUDGET_MAX, int(extra_budget)))
+        self._pi_case_board = board.model_copy(update={
+            "stop_reason": None, "stop_detail": "", "budget": board.budget + extra,
+            "chase_rounds": board.chase_rounds + 1,
+        })
+        self._sem = asyncio.Semaphore(5)  # a new event loop may be running this round
+        self.graph.log(
+            DomainCategory.SKEPTIC, "PI_CASE_CHASE", ",".join(lead.lead_id for lead in reopened),
+            f"investigator reopened {len(reopened)} lead(s); +{extra} calls"
+            + (f"; refused: {'; '.join(refused)}" if refused else ""),
+            level="discovery",
+        )
+        await self._work_pi_case(first_round=False)
+        return await self._finalize_and_persist_investigation()
 
-    def _append_step(self, board: Any, record: Any) -> Any:
-        return board.model_copy(update={"log": [*board.log, record]})
+    def _stop_ledger_tracing(self, board: Any) -> Any:
+        """A cash-out point ends the ledger trace, not the case: open wallet pivots are closed."""
+        leads = [
+            lead.model_copy(update={
+                "status": "not_worked",
+                "outcome": "Not worked: a cash-out point was found, so tracing stops at the custodian.",
+            }) if lead.status == "open" and lead.kind == "pivot" and lead.target_type in ("wallet", "bitcoin") else lead
+            for lead in board.leads
+        ]
+        return board.model_copy(update={"leads": leads})
 
     def _stop_board(self, board: Any, final: Optional[Tuple[Any, str]]) -> Any:
         if final is None or board.stop_reason is not None:
@@ -607,22 +795,15 @@ class BunnyholeOrchestrator:
             return "escalate:sanctions_or_50_rule"
         return f"stop:{reason.value}"
 
-    def _merge_stop(
-        self, hard: Optional[Tuple[Any, str]], review: Any, guide_may_stop: Callable[..., Any],
-    ) -> Tuple[str, Optional[Tuple[Any, str]]]:
-        if hard is not None:
-            return self._decision_text(hard[0]), hard
-        soft = guide_may_stop(review, None)
-        if soft is not None:
-            detail = review.counsel or soft.value
-            return self._decision_text(soft), (soft, detail)
-        return "continue", None
-
-    def _log_case_step(self, order: int, decision: str, changed: List[str]) -> None:
+    def _log_case_lead(self, lead: Any, decision: str, changed: List[str], moved: List[str]) -> None:
+        """One live line per lead worked, so the operator watches the case move instead of waiting for the end."""
         assert self.engagement is not None
-        self.graph.log(
-            DomainCategory.SKEPTIC, "PI_CASE_STEP", f"step {order}", decision, level="discovery",
-        )
+        detail = f"{lead.kind} on '{lead.target}': {lead.status}"
+        if moved:
+            detail += f"; questions moved: {', '.join(moved)}"
+        if decision != "continue":
+            detail += f"; {decision}"
+        self.graph.log(DomainCategory.SKEPTIC, "PI_LEAD", lead.lead_id, detail, level="discovery")
         if changed:
             self.graph.log(
                 DomainCategory.SKEPTIC, "PI_HYPOTHESIS_UPDATE", ",".join(changed), decision, level="discovery",

@@ -1,31 +1,28 @@
-"""Pure casework over a PI block: hypotheses, follow-up tasks, and stop decisions.
+"""Pure casework over a PI block: the hypothesis board and the stop decisions.
 
 No I/O, no clock, no network. Every function returns a new model and leaves its inputs unchanged.
-Signals are derived only from the fields already on :class:`PIBlock`.
+Signals are derived only from the fields already on :class:`PIBlock`. The questions, the lead sheet and the
+investigator's log live in :mod:`bunnyhole.engine.pi_casefile`.
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
 from typing import Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
 
 from bunnyhole.engine.pi import (
     CaseBoard,
     CaseHypothesis,
-    CaseTask,
     CaseType,
     EscalationTrigger,
     EvidenceLink,
     Finding,
-    FindingLabel,
     HypothesisStatus,
     PIBlock,
     PIEngagement,
     StopReason,
 )
 from bunnyhole.engine.pi_analysis import expected_source_classes
-from bunnyhole.engine.pi_notes import PLAYBOOK_SOURCE_MAP
 from bunnyhole.engine.pi_reference import Playbook, PlaybookStep, playbook_for
 from bunnyhole.engine.pi_runtime import SECRECY_JURISDICTION_CODES
 from bunnyhole.engine.pi_ubo import unresolved_node_id
@@ -33,7 +30,6 @@ from bunnyhole.engine.pi_ubo import unresolved_node_id
 Direction = Literal["supports", "refutes"]
 SignalResult = Optional[Tuple[str, List[str]]]
 SignalFn = Callable[[PIBlock], SignalResult]
-TaskOrigin = Literal["playbook", "corroborate_lead", "extend_ownership", "resolve_contradiction"]
 
 # Verbatim Playbook.typical_hypotheses -> stable keys. Anything else is slugified.
 _HYPOTHESIS_KEYS: Dict[CaseType, Dict[str, str]] = {
@@ -54,6 +50,12 @@ _HYPOTHESIS_KEYS: Dict[CaseType, Dict[str, str]] = {
         "A poorly run but legitimate business.": "fs_poorly_run",
         "A cloned or impersonated entity (lookalike domain, borrowed identity).": "fs_cloned",
     },
+    CaseType.LOCATE: {
+        "The hits belong to a different person with the same name.": "lo_different_person",
+    },
+    CaseType.BACKGROUND: {
+        "The records belong to a different person with the same name.": "bg_different_person",
+    },
 }
 
 HYPOTHESIS_SIGNALS: Dict[CaseType, Dict[str, List[Tuple[str, Direction, float]]]] = {
@@ -66,6 +68,7 @@ HYPOTHESIS_SIGNALS: Dict[CaseType, Dict[str, List[Tuple[str, Direction, float]]]
             ("registered_agent_only_address", "refutes", 0.3),
         ],
         "dd_shell_nominee": [
+            ("chain_ends_at_nominee_or_secrecy", "supports", 0.5),
             ("ownership_unresolved_at_nominee", "supports", 0.5),
             ("nominee_officer_flag", "supports", 0.4),
             ("registered_agent_only_address", "supports", 0.3),
@@ -81,6 +84,7 @@ HYPOTHESIS_SIGNALS: Dict[CaseType, Dict[str, List[Tuple[str, Direction, float]]]
     },
     CaseType.ASSET_SEARCH: {
         "as_nominee_abroad": [
+            ("chain_ends_at_nominee_or_secrecy", "supports", 0.5),
             ("ownership_unresolved_at_nominee", "supports", 0.5),
             ("secrecy_jurisdiction_node", "supports", 0.4),
             ("offshore_leaks_hit", "supports", 0.4),
@@ -118,6 +122,24 @@ HYPOTHESIS_SIGNALS: Dict[CaseType, Dict[str, List[Tuple[str, Direction, float]]]
             ("registry_active", "refutes", 0.3),
         ],
     },
+    # A person case keeps one hypothesis scored: that the records are someone else's. The others stay open for
+    # the investigator, because no free source can test them.
+    CaseType.LOCATE: {
+        "lo_different_person": [
+            ("subject_name_only", "supports", 0.5),
+            ("same_name_records_not_one_person", "supports", 0.5),
+            ("weak_name_matches_set_aside", "supports", 0.3),
+            ("second_anchor_agrees", "refutes", 0.6),
+        ],
+    },
+    CaseType.BACKGROUND: {
+        "bg_different_person": [
+            ("subject_name_only", "supports", 0.5),
+            ("same_name_records_not_one_person", "supports", 0.5),
+            ("weak_name_matches_set_aside", "supports", 0.3),
+            ("second_anchor_agrees", "refutes", 0.6),
+        ],
+    },
 }
 
 # A clear sanctions screen is a small refute only. It is never in this map.
@@ -136,9 +158,6 @@ _DISSOLVED_MARKERS = ("dissolved", "struck off", "struck-off", "liquidation")
 _ASSET_NODE_PREFIXES = ("wallet:", "btc:", "bitcoin:", "aircraft:")
 _ORG_NODE_PREFIXES = ("company:", "org:", "lei:", "psc:", "organization:")
 _ORG_LABEL_MARKERS = ("Ltd", "Inc", "LLC", "Limited", "PLC", "GmbH", "Corp")
-_CORROBORATE_SKIP_PREFIXES = ("person:", "sanction:", "article:", "seed:", "profile:")
-_CORROBORATE_SOURCES = ("gleif", "uk_psc", "sec_edgar", "news_narrative")
-_EXTEND_SOURCES = ("uk_psc", "gleif")
 _DUE_DILIGENCE_DONE_CLASSES = (
     "corporate_registry",
     "beneficial_ownership",
@@ -282,6 +301,16 @@ def ownership_unresolved_at_nominee(block: PIBlock) -> SignalResult:
         return None
     ids = [unresolved_node_id(entry) for entry in unresolved]
     return (f"unresolved at nominee or secrecy: {', '.join(ids)}", ids)
+
+
+def chain_ends_at_nominee_or_secrecy(block: PIBlock) -> SignalResult:
+    """The playbook's own trigger, evaluated from node flags and jurisdictions the block does not carry."""
+    playbook = playbook_for(block.engagement.case_type)
+    for trigger in block.escalation_triggers:
+        if trigger.fired and playbook.escalate_keys.get(trigger.trigger) == "unresolved_ownership":
+            ids = [unresolved_node_id(entry) for entry in block.ownership.unresolved]
+            return (trigger.why, ids)
+    return None
 
 
 def ubo_natural_person_reached(block: PIBlock) -> SignalResult:
@@ -514,7 +543,41 @@ def registry_mismatch(block: PIBlock) -> SignalResult:
     return detail, _unique(node_id for item in matched for node_id in item.node_ids)
 
 
+def subject_name_only(block: PIBlock) -> SignalResult:
+    matched = [warning for warning in block.identifier_warnings if "anchor" in warning.casefold()]
+    if not matched:
+        return None
+    return ("; ".join(matched), [])
+
+
+def same_name_records_not_one_person(block: PIBlock) -> SignalResult:
+    matched = [note for note in block.identity_notes if "not established as one person" in note.casefold()]
+    if not matched:
+        return None
+    return ("; ".join(matched), [])
+
+
+def weak_name_matches_set_aside(block: PIBlock) -> SignalResult:
+    matched = [note for note in block.identity_notes if "weak name match" in note.casefold()]
+    weak = [str(item.get("name") or "") for item in block.sanctions.weak_matches if isinstance(item, dict)]
+    if not matched and not weak:
+        return None
+    return ("; ".join([*matched, *(f"weak listing match {name}" for name in weak if name)]), [])
+
+
+def second_anchor_agrees(block: PIBlock) -> SignalResult:
+    matched = [note for note in block.identity_notes if "probable same person" in note.casefold()]
+    if not matched:
+        return None
+    return ("; ".join(matched), [])
+
+
 SIGNAL_FUNCTIONS: Dict[str, SignalFn] = {
+    "chain_ends_at_nominee_or_secrecy": chain_ends_at_nominee_or_secrecy,
+    "subject_name_only": subject_name_only,
+    "same_name_records_not_one_person": same_name_records_not_one_person,
+    "weak_name_matches_set_aside": weak_name_matches_set_aside,
+    "second_anchor_agrees": second_anchor_agrees,
     "registry_active": registry_active,
     "registry_dissolved": registry_dissolved,
     "lei_issued": lei_issued,
@@ -596,123 +659,6 @@ def score_hypotheses(
 
 
 # ----------------------------------------------------------------------------------------------
-# Tasks
-# ----------------------------------------------------------------------------------------------
-
-
-def task_id(origin: str, source: str, target: str) -> str:
-    digest = hashlib.sha1(target.encode()).hexdigest()[:8]
-    return f"{origin}:{source}:{digest}"
-
-
-def _task(origin: TaskOrigin, source: str, target: str, why: str, *, step_order: Optional[int] = None) -> CaseTask:
-    return CaseTask(
-        task_id=task_id(origin, source, target),
-        origin=origin,
-        step_order=step_order,
-        source=source,
-        target=target,
-        why=why,
-    )
-
-
-def playbook_tasks(step: PlaybookStep, subject_values: Sequence[str]) -> List[CaseTask]:
-    """One task per mapped recorder name. Unmapped playbook sources produce nothing."""
-    tasks: List[CaseTask] = []
-    seen: Set[str] = set()
-    for raw in subject_values:
-        target = raw.strip()
-        if not target:
-            continue
-        recorders_for_target: Set[str] = set()
-        for source_name in step.sources:
-            recorders = PLAYBOOK_SOURCE_MAP.get(source_name)
-            if not recorders:
-                continue
-            for recorder in recorders:
-                if recorder in recorders_for_target:
-                    continue
-                recorders_for_target.add(recorder)
-                identifier = task_id("playbook", recorder, target)
-                if identifier in seen:
-                    continue
-                seen.add(identifier)
-                tasks.append(_task("playbook", recorder, target, step.action, step_order=step.order))
-    return tasks
-
-
-def _label_for(block: PIBlock, node_id: str) -> str:
-    for finding in block.findings:
-        if finding.node_id == node_id:
-            return _plain_label(finding.label) or node_id
-    return node_id
-
-
-def _org_like(finding: Finding) -> bool:
-    if finding.node_id.startswith(_CORROBORATE_SKIP_PREFIXES):
-        return False
-    if finding.node_id.startswith(_ORG_NODE_PREFIXES):
-        return True
-    return any(marker in finding.label for marker in _ORG_LABEL_MARKERS)
-
-
-def _corroborate_leads(block: PIBlock) -> List[Finding]:
-    leads = [
-        finding
-        for finding in block.findings
-        if finding.finding_label == FindingLabel.LEAD
-        and finding.relevance in ("subject", "related")
-        and _org_like(finding)
-    ]
-    ranked = list(enumerate(leads))
-    ranked.sort(key=lambda item: (0 if item[1].relevance == "subject" else 1, item[1].label, item[0]))
-    return [finding for _index, finding in ranked]
-
-
-def _contradiction_source(node_ids: Sequence[str]) -> str:
-    if any(node_id.startswith("lei:") for node_id in node_ids):
-        return "gleif"
-    if any(node_id.startswith(("company:", "psc:")) for node_id in node_ids):
-        return "uk_psc"
-    return "sec_edgar"
-
-
-def follow_up_tasks(block: PIBlock, done: Set[str], *, limit: int) -> List[CaseTask]:
-    """Extend ownership, then corroborate leads, then resolve contradictions. ``done`` ids are skipped."""
-    if limit <= 0:
-        return []
-    chosen: List[CaseTask] = []
-    seen: Set[str] = set(done)
-
-    def add(task: CaseTask) -> None:
-        if len(chosen) >= limit or task.task_id in seen:
-            return
-        seen.add(task.task_id)
-        chosen.append(task)
-
-    for entry in block.ownership.unresolved:
-        node_id = unresolved_node_id(entry)
-        target = _label_for(block, node_id)
-        why = f"extend the ownership walk for unresolved node {node_id}"
-        for source in _EXTEND_SOURCES:
-            add(_task("extend_ownership", source, target, why))
-
-    for finding in _corroborate_leads(block):
-        target = _plain_label(finding.label) or finding.node_id
-        why = f"corroborate single-source lead '{finding.label}' ({finding.node_id})"
-        for source in _CORROBORATE_SOURCES:
-            add(_task("corroborate_lead", source, target, why))
-
-    for contradiction in block.contradictions:
-        if not contradiction.node_ids:
-            continue
-        target = contradiction.node_ids[0]
-        source = _contradiction_source(contradiction.node_ids)
-        add(_task("resolve_contradiction", source, target, f"resolve contradiction {contradiction.kind}"))
-    return chosen
-
-
-# ----------------------------------------------------------------------------------------------
 # Done and stop
 # ----------------------------------------------------------------------------------------------
 
@@ -781,6 +727,16 @@ DONE_EVALUATORS: Dict[CaseType, Callable[[PIBlock], bool]] = {
 
 
 def done_status_for(block: PIBlock) -> Literal["met", "not_met", "not_evaluated"]:
+    """The automated done check. With a case file it reads the questions; without one, the source classes.
+
+    ``met`` means every question on the board is answered or documented as out of reach on the free public
+    record. It is a statement about the work, never a clearance of the subject.
+    """
+    board = block.case_board
+    if board is not None and board.questions:
+        from bunnyhole.engine.pi_casefile import questions_settled
+
+        return "met" if questions_settled(board.questions) else "not_met"
     evaluator = DONE_EVALUATORS.get(block.engagement.case_type)
     if evaluator is None:
         return "not_evaluated"

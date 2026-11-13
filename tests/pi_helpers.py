@@ -277,7 +277,13 @@ AGENT_METHODS = {
 
 
 def fake_orchestrator(engagement: Optional[PIEngagement], **kw: Any) -> BunnyholeOrchestrator:
-    """A real orchestrator with every agent method, the synthesizer and the council replaced by ``AsyncMock``."""
+    """A real orchestrator with every agent method, the synthesizer and the council replaced by ``AsyncMock``.
+
+    The sweep is the loop under test unless a caller asks for casework: the runtime tests written against the
+    single pass keep testing it, and the casework tests pass ``pi_loop="casework"``.
+    """
+    if engagement is not None:
+        kw.setdefault("pi_loop", "sweep")
     orch = BunnyholeOrchestrator(
         "Acme Holdings Ltd", max_depth=1, profile=InvestigatorProfile(persona=Persona.PRIVATE_INVESTIGATOR),
         **({"engagement": engagement} if engagement is not None else {}), **kw,

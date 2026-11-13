@@ -367,3 +367,34 @@ def test_match_level_exact_strong_affiliate_none():
 
 def test_match_level_uses_other_names_the_node_carries():
     assert name_match_level("ROSNEFT", "Some Label", attributes={"legal_name": "Rosneft PJSC"}) == "exact"
+
+
+def test_the_ownership_chain_and_a_listing_on_it_are_related_to_the_subject() -> None:
+    """An owner of an owner is in the chain whatever it is called, and a list hit on it is not thrown away."""
+    from bunnyhole.engine.pi_runtime import _relevance_map
+
+    def node(node_id: str, label: str, tool: str, entity_type: str = "Organization") -> dict:
+        return {"id": node_id, "label": label, "entity_type": entity_type, "attributes": {}, "receipts": [{"tool": tool}]}
+
+    nodes = [
+        node("lei:subject", "Northgate Trading Ltd", "gleif_level1_level2_api"),
+        node("lei:parent", "Borealis Holdings B.V.", "gleif_level2_ultimate_parent"),
+        node("lei:top", "Kestrel Nominees Ltd", "gleif_level2_ultimate_parent"),
+        node("sanction:ofac:kestrel", "⛔ Kestrel Nominees Ltd", "ofac_sdn"),
+        node("sanction:ofac:other", "⛔ Unrelated Trading Co", "ofac_sdn"),
+        node("lei:namesake-parent", "Somewhere Else Holdings", "gleif_level2_ultimate_parent"),
+        node("lei:namesake", "Wholly Different Company", "gleif_level1_level2_api"),
+    ]
+    edges = [
+        {"source_id": "lei:parent", "target_id": "lei:subject", "relation": "ULTIMATE_PARENT_OF"},
+        {"source_id": "lei:top", "target_id": "lei:parent", "relation": "ULTIMATE_PARENT_OF"},
+        {"source_id": "lei:namesake-parent", "target_id": "lei:namesake", "relation": "ULTIMATE_PARENT_OF"},
+    ]
+    relevance = _relevance_map(nodes, edges, [], ["Northgate Trading Ltd"])
+    assert relevance["lei:subject"][0] == "subject"
+    assert relevance["lei:parent"][0] == "related"
+    assert relevance["lei:top"] == ("related", relevance["lei:top"][1]) and "ownership chain" in relevance["lei:top"][1]
+    assert relevance["sanction:ofac:kestrel"][0] == "related"
+    assert "Kestrel Nominees Ltd" in relevance["sanction:ofac:kestrel"][1]
+    assert relevance["sanction:ofac:other"][0] == "unrelated"
+    assert relevance["lei:namesake-parent"][0] == "unrelated"  # another company's chain is not the subject's

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import functools
 import os
+import re
 import stat
 import tempfile
 from enum import Enum
@@ -152,6 +154,7 @@ def resolve_pi_flags(
     extra_texts: Optional[Sequence[str]] = None,
     pi_loop: Optional[str] = None,
     pi_budget: Optional[int] = None,
+    chase: bool = False,
 ) -> Tuple[Optional[PIEngagement], Optional[str]]:
     """Validate the PI flags of ``trace``/``intake`` and return ``(engagement, effective_persona)``.
 
@@ -191,6 +194,8 @@ def resolve_pi_flags(
         given = [flag for flag, value in pi_only.items() if value is not None]
         if confirm_entity:
             given.append("--confirm-entity")
+        if chase:
+            given.append("--chase")
         if given:
             verb = "only applies" if len(given) == 1 else "only apply"
             raise _refuse(
@@ -201,6 +206,11 @@ def resolve_pi_flags(
         return None, persona
 
     _validate_casework_flags(pi_loop, pi_budget)
+    if chase and pi_loop == "sweep":
+        raise _refuse(
+            "--chase needs the casework loop: a sweep keeps no lead sheet to chase from. Drop --pi-loop sweep.",
+            title="PI chase refused",
+        )
 
     if cred:
         raise _refuse(
@@ -354,8 +364,113 @@ def _report_with_ai_analysis(report: str, result: Dict[str, Any]) -> Tuple[str, 
     return append_ai_analysis(report, analysis), message
 
 
+def _has_case_file(result: Dict[str, Any]) -> bool:
+    board = (result.get("pi") or {}).get("case_board") if isinstance(result.get("pi"), dict) else None
+    return isinstance(board, dict) and bool(board.get("questions"))
+
+
+def _takes_narrative(builder: Callable[..., str]) -> bool:
+    """True when ``builder`` accepts the written account as a second argument (the packaged report builder)."""
+    import inspect
+
+    try:
+        return len(inspect.signature(builder).parameters) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+def _write_case_report(
+    builder: Callable[..., str], result: Dict[str, Any], pi_report: Path, code_report: str, *, ai: bool
+) -> None:
+    """A casework report: the code-written account is already on disk; replace it with the AI-written one if it passes.
+
+    With ``ai`` and a provider key a model writes the Investigation report section from the case file. Its text is
+    checked before it is used; when it fails, or the call fails, the code-written account stays and the report says
+    why. ``--no-ai-analysis`` makes no model call.
+    """
+    from bunnyhole.engine.pi_case_report import generate_case_narrative
+
+    if not ai:
+        console.print(Text("AI-written account skipped: switched off with --no-ai-analysis.", style="dim"))
+        return
+    narrative = _run_sync(lambda: generate_case_narrative(result))
+    final = builder(result, narrative)
+    if narrative.source == "ai":
+        message = Text(
+            f"✔ Investigation report written by the AI case writer ({narrative.model}, {narrative.provider}); "
+            "checked against the case file.", style="green",
+        )
+    elif narrative.note == "no LLM provider key is configured":
+        message = Text(
+            "Investigation report written by code from the case file (no LLM provider key is configured).",
+            style="dim",
+        )
+    else:
+        message = Text(f"⚠ AI-written account not used: {narrative.note}. The code-written account stands.", style="yellow")
+    if final != code_report:
+        try:
+            _write_report_text(pi_report, final)
+        except OSError as exc:
+            message = Text(
+                f"⚠ The final report could not be written ({type(exc).__name__}); the code-built report is intact.",
+                style="yellow",
+            )
+    console.print(message)
+
+
+def chase_leads_interactively(orch: Any, result: Dict[str, Any], *, ask: Optional[Callable[[str], str]] = None) -> Dict[str, Any]:
+    """After the case stops, let the investigator pick leads from the sheet to chase. Returns the latest result.
+
+    Shows the leads that are still available (suggested, not worked, not reached), asks for lead ids, works them and
+    whatever they open, and asks again until the answer is empty. Leads set aside on scope grounds are never
+    offered, and a case that stopped for compliance counsel is not reopened.
+    """
+    from rich.prompt import Prompt
+
+    prompt = ask or (lambda text: Prompt.ask(text, default=""))
+    while True:
+        board = (result.get("pi") or {}).get("case_board") if isinstance(result.get("pi"), dict) else None
+        if not isinstance(board, dict) or not hasattr(orch, "pi_chaseable_leads"):
+            console.print("[yellow]No case file in this result, so there is no lead sheet to chase from.[/yellow]")
+            return result
+        if board.get("stop_reason") == "escalated":
+            console.print(
+                "[bold red]This case stopped for compliance counsel (sanctions listing or 50% rule). "
+                "It is not reopened.[/bold red]"
+            )
+            return result
+        leads = list(orch.pi_chaseable_leads())
+        if not leads:
+            console.print("[dim]No lead is left to chase.[/dim]")
+            return result
+        table = Table(title="Leads you can chase", show_lines=False)
+        table.add_column("Lead", style="bold white")
+        table.add_column("Target", style="cyan")
+        table.add_column("Sources")
+        table.add_column("Why")
+        table.add_column("Status", style="yellow")
+        for lead in leads:
+            table.add_row(
+                _esc(lead.lead_id), _esc(f"{lead.target} ({lead.target_type})"), _esc(", ".join(lead.sources)),
+                _esc(lead.why[:110]), _esc(lead.status.replace("_", " ")),
+            )
+        console.print(table)
+        answer = prompt("Chase which leads? Lead ids separated by commas, 'all', or Enter to finish").strip()
+        if not answer:
+            return result
+        wanted = [lead.lead_id for lead in leads] if answer.lower() == "all" else [
+            part for part in re.split(r"[\s,;]+", answer) if part
+        ]
+        try:
+            result = _run_sync(functools.partial(orch.chase_pi_leads, wanted))
+        except ValueError as exc:
+            console.print(f"[yellow]{_esc(str(exc))}[/yellow]")
+            continue
+        render_pi_summary(result)
+
+
 def write_pi_report(
-    builder: Optional[Callable[[Dict[str, Any]], str]],
+    builder: Optional[Callable[..., str]],
     result: Dict[str, Any],
     pi_report: Optional[Path],
     *,
@@ -373,6 +488,10 @@ def write_pi_report(
         return
     report = builder(result)
     _write_report_text(pi_report, report)  # the code-built report is on disk before any model call
+    if _has_case_file(result) and _takes_narrative(builder):
+        _write_case_report(builder, result, pi_report, report, ai=ai_analysis)
+        console.print(f"[bold green]✔ Saved PI Report to:[/bold green] {pi_report}")
+        return
     if ai_analysis:
         final, message = _report_with_ai_analysis(report, result)
         if final != report:
@@ -423,11 +542,38 @@ def render_pi_summary(result: Dict[str, Any]) -> None:
         reason = board.get("stop_reason") or "—"
         detail = str(board.get("stop_detail") or "")
         stop = f"{reason} ({detail})" if detail else str(reason)
+        officer = "AI case officer" if board.get("guide_name") == "llm" else "playbook order (no model key set)"
         lines.append(
             f"[bold cyan]Loop:[/bold cyan] casework · stop: {_esc(stop)} · "
-            f"calls {board.get('calls_used', 0)}/{board.get('budget', 0)}"
+            f"calls {board.get('calls_used', 0)}/{board.get('budget', 0)} · run by: {officer}"
         )
+        questions = [q for q in board.get("questions") or [] if isinstance(q, dict)]
+        leads = [lead for lead in board.get("leads") or [] if isinstance(lead, dict)]
+        if questions:
+            lines.append(f"[bold cyan]Questions:[/bold cyan] {_esc(_tally(questions, _QUESTION_WORDS))}")
+        if leads:
+            lines.append(f"[bold cyan]Leads:[/bold cyan] {_esc(_tally(leads, _LEAD_WORDS))}")
+            chase = [lead for lead in leads if lead.get("status") in ("suggested", "not_worked", "not_reached") and lead.get("sources")]
+            if chase and board.get("stop_reason") != "escalated":
+                lines.append(
+                    f"[bold cyan]Chase:[/bold cyan] {len(chase)} lead(s) can still be chased "
+                    f"({_esc(', '.join(str(lead.get('lead_id')) for lead in chase[:8]))}"
+                    f"{' …' if len(chase) > 8 else ''}); add --chase to pick from them."
+                )
     console.print(Panel("\n".join(lines), title="🕵️ [bold white]PI SUMMARY[/bold white]", border_style="bright_blue"))
+    if isinstance(board, dict) and board.get("questions"):
+        answers = Table(title="Case questions", show_lines=False)
+        answers.add_column("Question", style="bold white")
+        answers.add_column("Status", style="cyan")
+        answers.add_column("Where it stands")
+        for row in board.get("questions") or []:
+            if not isinstance(row, dict):
+                continue
+            answers.add_row(
+                _esc(row.get("text", "")), _esc(_QUESTION_WORDS.get(str(row.get("status")), str(row.get("status")))),
+                _esc(str(row.get("answer") or row.get("missing") or "")[:260]),
+            )
+        console.print(answers)
     if isinstance(board, dict) and board.get("hypotheses"):
         table = Table(title="Hypotheses", show_lines=False)
         table.add_column("Key", style="bold white")
@@ -438,6 +584,20 @@ def render_pi_summary(result: Dict[str, Any]) -> None:
                 continue
             table.add_row(_esc(row.get("key", "")), _esc(row.get("status", "")), _esc(row.get("score", "")))
         console.print(table)
+
+
+_QUESTION_WORDS = {"answered": "answered", "partial": "partly answered", "out_of_reach": "out of reach", "open": "open"}
+_LEAD_WORDS = {
+    "worked": "worked", "negative": "negative", "not_reached": "not reached", "set_aside": "set aside",
+    "not_worked": "not worked", "suggested": "suggested", "open": "open",
+}
+
+
+def _tally(rows: Sequence[Dict[str, Any]], words: Dict[str, str]) -> str:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[str(row.get("status"))] = counts.get(str(row.get("status")), 0) + 1
+    return ", ".join(f"{counts[key]} {label}" for key, label in words.items() if counts.get(key)) or "none"
 
 
 def _esc(value: Any) -> str:

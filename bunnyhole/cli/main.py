@@ -343,10 +343,11 @@ def intake_command(
     subject_type: Optional[SubjectType] = typer.Option(None, "--subject-type", help="PI: person or entity (default person). Needs --pi."),
     pi_jurisdiction: Optional[str] = typer.Option(None, "--pi-jurisdiction", help="PI: jurisdiction for custodians and legal notes, e.g. us, ca-on, uk. Needs --pi."),
     pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
-    no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: leave the AI-written analysis section out of --pi-report (no LLM call is made). The section is only added when a provider key is configured. Needs --pi-report."),
+    no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: no AI-written text in --pi-report (no LLM call is made for the report); the account is written by code from the case file instead. Needs --pi-report."),
     confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
-    pi_loop: Optional[str] = typer.Option(None, "--pi-loop", help="PI: casework works an entity due-diligence, asset-search, or fraud-screen playbook in order; sweep (the default) is the single pass. Needs --pi."),
+    pi_loop: Optional[str] = typer.Option(None, "--pi-loop", help="PI: casework (the default) works the case like an investigator: a lead sheet, pivots off what each lead returns, questions answered one by one, run by an AI case officer when a provider key is set. sweep is the old single pass. Needs --pi."),
     pi_budget: Optional[int] = typer.Option(None, "--pi-budget", help="PI: source-call cap for casework, an integer from 10 to 400 (default 120, not a measured percentile). Needs --pi."),
+    chase: bool = typer.Option(False, "--chase", help="PI: when the case stops, show the leads left on the sheet and ask which to chase (interactive; each round adds 40 source calls). Needs --pi."),
 ) -> None:
     """Run a Dual-Mode Case Intake investigation combining a Working Hypothesis with multiple known credentials/selectors."""
     def _on_event(evt: dict) -> None:
@@ -365,7 +366,7 @@ def intake_command(
             hypothesis or "", dump or "", *(username or []), *(phone or []), *(wallet or []),
             *(exclude or []), *(doc or []),
         ],
-        pi_loop=pi_loop, pi_budget=pi_budget,
+        pi_loop=pi_loop, pi_budget=pi_budget, chase=chase,
     )
     report_builder = pi_commands.load_report_builder(pi_report)
     prof, gear, depth, breadth, exclusions = _personalize(ctx, gear, depth, breadth, list(exclude or []), persona)
@@ -416,6 +417,8 @@ def intake_command(
     _render_investigation_results(result)
     if engagement is not None:
         pi_commands.render_pi_summary(result)
+        if chase:
+            result = pi_commands.chase_leads_interactively(orch, result)
         pi_commands.write_pi_report(report_builder, result, pi_report, ai_analysis=not no_ai_analysis)
 
     if out:
@@ -456,10 +459,11 @@ def trace_command(
     subject_type: Optional[SubjectType] = typer.Option(None, "--subject-type", help="PI: person or entity (default person). Needs --pi."),
     pi_jurisdiction: Optional[str] = typer.Option(None, "--pi-jurisdiction", help="PI: jurisdiction for custodians and legal notes, e.g. us, ca-on, uk. Needs --pi."),
     pi_report: Optional[Path] = typer.Option(None, "--pi-report", help="PI: write the bottom-line-up-front PI report (Markdown) to this path. Needs --pi."),
-    no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: leave the AI-written analysis section out of --pi-report (no LLM call is made). The section is only added when a provider key is configured. Needs --pi-report."),
+    no_ai_analysis: bool = typer.Option(False, "--no-ai-analysis", help="PI: no AI-written text in --pi-report (no LLM call is made for the report); the account is written by code from the case file instead. Needs --pi-report."),
     confirm_entity: bool = typer.Option(False, "--confirm-entity", help="PI: confirm a person-like seed really is an organisation when --subject-type entity. Needs --pi."),
-    pi_loop: Optional[str] = typer.Option(None, "--pi-loop", help="PI: casework works an entity due-diligence, asset-search, or fraud-screen playbook in order; sweep (the default) is the single pass. Needs --pi."),
+    pi_loop: Optional[str] = typer.Option(None, "--pi-loop", help="PI: casework (the default) works the case like an investigator: a lead sheet, pivots off what each lead returns, questions answered one by one, run by an AI case officer when a provider key is set. sweep is the old single pass. Needs --pi."),
     pi_budget: Optional[int] = typer.Option(None, "--pi-budget", help="PI: source-call cap for casework, an integer from 10 to 400 (default 120, not a measured percentile). Needs --pi."),
+    chase: bool = typer.Option(False, "--chase", help="PI: when the case stops, show the leads left on the sheet and ask which to chase (interactive; each round adds 40 source calls). Needs --pi."),
 ) -> None:
     """Run an autonomous multi-domain Bunnyhole investigation down the rabbit hole.
 
@@ -514,7 +518,7 @@ def trace_command(
         pi=pi, case_type=case_type, purpose=purpose, client=client, matter_ref=matter_ref,
         subject_type=subject_type, pi_jurisdiction=pi_jurisdiction, pi_report=pi_report, persona=persona,
         cred=cred, confirm_entity=confirm_entity, seed=seed, purpose_category=purpose_category,
-        pi_loop=pi_loop, pi_budget=pi_budget,
+        pi_loop=pi_loop, pi_budget=pi_budget, chase=chase,
     )
     report_builder = pi_commands.load_report_builder(pi_report)
     prof, gear, depth, breadth, _exclusions = _personalize(ctx, gear, depth, breadth, list(exclude or []), persona)
@@ -531,6 +535,8 @@ def trace_command(
     _render_investigation_results(result)
     if engagement is not None:
         pi_commands.render_pi_summary(result)
+        if chase:
+            result = pi_commands.chase_leads_interactively(orch, result)
         pi_commands.write_pi_report(report_builder, result, pi_report, ai_analysis=not no_ai_analysis)
 
     if out:
@@ -1161,7 +1167,7 @@ def menu_command(ctx: typer.Context) -> None:
                 anchor_mode=AnchorMode.CONVERGENCE, out=None, json_out=None,
                 pi=False, case_type=None, purpose=None, purpose_category=None, client=None, matter_ref=None,
                 subject_type=None, pi_jurisdiction=None, pi_report=None, no_ai_analysis=False, confirm_entity=False,
-                pi_loop=None, pi_budget=None,
+                pi_loop=None, pi_budget=None, chase=False,
             )
         elif choice == "2":
             ea = Prompt.ask("Enter Entity A", default="vitalik.eth")

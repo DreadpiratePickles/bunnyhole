@@ -468,6 +468,16 @@ def _case_bullet(block: PIBlock) -> str:
     reason = getattr(getattr(board, "stop_reason", None), "value", getattr(board, "stop_reason", None))
     if board is None or not reason:
         return ""
+    questions = list(getattr(board, "questions", []) or [])
+    if questions:
+        # A case file: lead with how far the client's questions are answered, then the ones still not settled.
+        from bunnyhole.engine.pi_casefile import question_tally
+
+        unsettled = [str(q.key).replace("_", " ") for q in questions if q.status not in ("answered", "out_of_reach")]
+        text = f"stop {reason}; {len(questions)} questions: {question_tally(questions)}"
+        if unsettled:
+            text += "; not settled: " + ", ".join(unsettled)
+        return _bullet("Case", text)
     hypotheses = list(getattr(board, "hypotheses", []) or [])
     supported = [
         item for item in hypotheses

@@ -253,7 +253,7 @@ leads to verify. Full details: **[docs/PERSONALIZATION.md](docs/PERSONALIZATION.
 `--pi` turns a `trace` or `intake` into a private-investigator style engagement on the **free, lawful,
 passive layer only**. It vets the purpose before anything is searched, labels each finding `confirmed` /
 `probable` / `lead` by independent corroboration, logs every negative in a coverage matrix (sources that
-ran vs. sources refused or failed), and writes a 16-section report that opens with a short labelled bottom
+ran vs. sources refused or failed), and writes a report that opens with a short labelled bottom
 line and names who holds the records public data cannot reach and which legal instrument gets them. It is
 a research tool, not a licence, and not legal advice. It is available on the CLI only.
 
@@ -266,11 +266,18 @@ someone avoiding the client is refused in every case type. Refusals exit with co
 The category is attested, not verified, and the phrase screens have incomplete recall; you remain
 responsible for lawful use.
 
-`--pi-loop casework` works an entity due-diligence, asset-search, or fraud-screen case in playbook order
-and records why it stopped; `--pi-loop sweep` (the default) keeps today's single pass. `--pi-budget N`
-caps source calls (10–400). Both flags need `--pi`. A configured model can choose among the checks the
-playbook already allows; it cannot open a new source or override a sanctions stop. Person cases stay on
-the sweep.
+**It works the case, it does not just search.** A `--pi` run turns the case type into the questions the
+client's decision depends on, opens a lead sheet from the playbook, and works one lead at a time, letting each
+result decide the next: the owner a registry names is walked to its own owner, every party in the chain is
+screened, a conflict between records is pulled again, and anything that serves no question is written down
+rather than chased. With a provider key (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `OPENAI_API_KEY`) an AI case
+officer runs that loop: it reads each result, opens leads of its own, and picks the next move, inside limits
+code enforces (only names already in the evidence, only the fixed list of lawful sources, no waiving a
+sanctions stop). The report leads with a detailed account in prose (AI-written and checked against the case
+file when a key is set, code-written otherwise), answers each question, and carries the full lead sheet and
+the investigator's log. Add `--chase` to pick leads off the sheet and keep going when the case stops.
+`--pi-budget N` caps source calls (10–400); `--pi-loop sweep` runs the earlier single pass instead. See
+[an example report](docs/examples/pi_case_report_example.md).
 
 Three examples that pass the gates (a run needs network; each prints a PI SUMMARY and writes the report):
 
