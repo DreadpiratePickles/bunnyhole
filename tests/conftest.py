@@ -36,6 +36,11 @@
 
 5. Marker ``slow``: the bounded-time tests on 300 KB adversarial inputs (seconds in total). They run by default;
    deselect them for a quick loop with ``-m "not slow"``.
+
+6. Plain ``--help`` output. Typer forces a colour terminal when ``GITHUB_ACTIONS``, ``FORCE_COLOR`` or
+   ``PY_COLORS`` is set, which splits option names with ANSI codes (``--port`` no longer appears as one
+   substring). It reads those variables when ``typer.rich_utils`` is first imported, so the override is set
+   here, at conftest import time. Help-text assertions then see the same plain text on CI and on a laptop.
 """
 
 from __future__ import annotations
@@ -68,6 +73,9 @@ os.makedirs(_TEST_USER_HOME, exist_ok=True)
 os.environ["HOME"] = _TEST_USER_HOME
 os.environ["USERPROFILE"] = _TEST_USER_HOME
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
+
+# Typer's own switch for "never force a terminal" (see point 6 in the module docstring).
+os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
 
 NETWORK_ENV_VAR = "BUNNYHOLE_TEST_NETWORK"
 
@@ -332,3 +340,12 @@ def _no_ambient_llm_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for name in _LLM_KEY_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_forced_colour(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``FORCE_COLOR`` makes Rich consoles emit ANSI codes into captured CLI output (point 6 above).
+
+    Removed per test, not at import time, so pytest's own coloured output still honours it.
+    """
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
