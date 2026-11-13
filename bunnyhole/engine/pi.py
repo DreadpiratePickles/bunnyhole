@@ -66,6 +66,9 @@ __all__ = [
     "PURSUIT_EVASION_FLAGS",
     "CaseBoard",
     "CaseHypothesis",
+    "CaseLead",
+    "CaseNote",
+    "CaseQuestion",
     "CaseStepRecord",
     "CaseTask",
     "CaseType",
@@ -79,6 +82,8 @@ __all__ = [
     "Finding",
     "FindingLabel",
     "HypothesisStatus",
+    "LeadKind",
+    "LeadStatus",
     "OwnershipBlock",
     "OwnershipEdge",
     "PIBlock",
@@ -301,13 +306,77 @@ class CaseHypothesis(BaseModel):
     evidence: List[EvidenceLink] = Field(default_factory=list)
 
 
+LeadKind = Literal["playbook", "selector", "ownership", "screen", "corroborate", "contradiction", "pivot"]
+#: ``worked``: it produced a record about the subject or moved a question. ``negative``: its sources ran clean and
+#: found nothing. ``not_reached``: every source was refused or failed. ``set_aside``: deliberately not followed.
+#: ``not_worked``: the case stopped before it. ``suggested``: a real lead the evidence produced that answers none
+#: of this engagement's questions, kept on the sheet for the investigator to chase if they choose.
+LeadStatus = Literal["open", "worked", "negative", "not_reached", "set_aside", "not_worked", "suggested"]
+
+
 class CaseTask(BaseModel):
+    """One source call on one target. ``origin`` is the kind of lead it belongs to."""
+
     task_id: str
-    origin: Literal["playbook", "corroborate_lead", "extend_ownership", "resolve_contradiction"]
+    origin: LeadKind
     step_order: Optional[int] = None
     source: str
     target: str
     why: str
+
+
+class CaseQuestion(BaseModel):
+    """One question the client's decision turns on, and how far the evidence answers it.
+
+    ``answered`` means the sources that can answer it ran and the answer is stated (a negative included, with its
+    caveat). ``partial`` means some of it is answered. ``out_of_reach`` means no free, lawful, passive source
+    reaches it: ``missing`` names who holds the record. ``open`` means the automated sources did not run or were
+    not reached (``missing`` says why). None of the four is a clearance.
+    """
+
+    key: str
+    text: str
+    status: Literal["open", "partial", "answered", "out_of_reach"] = "open"
+    answer: str = ""
+    basis: List[str] = Field(default_factory=list)  # sources and node ids the answer rests on
+    missing: str = ""
+
+
+class CaseLead(BaseModel):
+    """One line of the lead sheet: what to look at, why, where it came from, and how it ended.
+
+    ``opened_by`` is ``intake`` for a lead the client's own information opened, otherwise the id of the lead
+    whose result opened it. A ``mandatory`` lead is one the method requires (a playbook step, a client-supplied
+    selector, the screening of a chain node): a quiet streak or a model's stop request does not skip it.
+    """
+
+    lead_id: str
+    kind: LeadKind
+    target: str
+    target_type: str  # company | person | domain | email | username | phone | wallet | bitcoin | ip | aircraft
+    node_id: str = ""
+    why: str
+    opened_by: str = "intake"
+    questions: List[str] = Field(default_factory=list)
+    sources: List[str] = Field(default_factory=list)
+    priority: float = 50.0
+    depth: int = 0
+    step_order: Optional[int] = None
+    mandatory: bool = False
+    status: LeadStatus = "open"
+    outcome: str = ""
+
+
+class CaseNote(BaseModel):
+    """One entry of the investigator's running log, written by code from what the lead actually returned."""
+
+    seq: int
+    lead_id: str
+    did: str
+    found: str
+    read: str
+    next: str = ""
+    counsel: str = ""  # the AI case officer's own reading of the result, when a provider is configured
 
 
 class CaseStepRecord(BaseModel):
@@ -330,13 +399,19 @@ class StopReason(str, Enum):
 
 
 class CaseBoard(BaseModel):
+    """The case file: questions, lead sheet, hypotheses, the investigator's log and the stop decision."""
+
     hypotheses: List[CaseHypothesis]
+    questions: List[CaseQuestion] = Field(default_factory=list)
+    leads: List[CaseLead] = Field(default_factory=list)
+    notes: List[CaseNote] = Field(default_factory=list)
     log: List[CaseStepRecord] = Field(default_factory=list)
     stop_reason: Optional[StopReason] = None
     stop_detail: str = ""
     calls_used: int = 0
     budget: int
-    guide_name: str = "playbook"
+    guide_name: str = "playbook"  # "llm" when an AI case officer drove the case, "playbook" when code did
+    chase_rounds: int = 0  # times the investigator reopened leads after the case first stopped
 
 
 class PIBlock(BaseModel):

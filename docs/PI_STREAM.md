@@ -1,9 +1,13 @@
 # 🕵️ The PI stream: an elite-investigator method on the free, lawful, passive layer
 
-`--pi` turns a `trace` or `intake` run into a private-investigator style engagement. It vets the purpose
-before anything is searched, runs only free, lawful, passive sources, labels every finding by how many
-independent sources support it, logs what was and was not searched, and ends in a bottom-line-up-front
-report that names who holds the records public data cannot reach and which legal instrument gets them.
+`--pi` turns a `trace` or `intake` run into a private-investigator engagement. It vets the purpose before
+anything is searched, then works the case the way an investigator does: it turns the client's decision into
+questions, keeps a lead sheet, works one lead at a time, and lets each result decide the next step (the
+owner a registry names is walked to its own owner, every party in the chain is screened, a conflict between
+records is pulled again). With a provider key an AI case officer runs that loop. It ends in a report written
+in prose that answers each question, shows how the investigation went, and names who holds the records public
+data cannot reach and which legal instrument gets them. When the case stops you can pick leads off the sheet
+and chase them (`--chase`). Only free, lawful, passive sources are used.
 
 **Who it is for:** lawyers, paralegals, compliance and due-diligence staff, journalists and licensed
 investigators who want a sourced first pass. **What it is not:** a licence, a consumer reporting agency, or
@@ -12,6 +16,8 @@ legal advice. Read [`ACCEPTABLE_USE.md`](../ACCEPTABLE_USE.md) first; it has a P
 
 Design spec: [`superpowers/specs/2026-11-09-pi-stream-design.md`](superpowers/specs/2026-11-09-pi-stream-design.md).
 Casework loop (supersedes that spec's single-pass sentence): [`superpowers/specs/2026-11-12-pi-casework-design.md`](superpowers/specs/2026-11-12-pi-casework-design.md).
+The case file, the AI case officer, the prose report and lead chasing: [`superpowers/specs/2026-11-13-pi-casefile-design.md`](superpowers/specs/2026-11-13-pi-casefile-design.md).
+A full example report (scripted, invented companies, no network): [`examples/pi_case_report_example.md`](examples/pi_case_report_example.md).
 Research basis: [`research/12_pi_methodology_and_free_sources.md`](../research/12_pi_methodology_and_free_sources.md).
 
 ---
@@ -23,7 +29,7 @@ Research basis: [`research/12_pi_methodology_and_free_sources.md`](../research/1
 | 1 | Start from the decision, not the subject | `Objective` and `Purpose` in the report's *Engagement & scope*. The objective comes from the case-type playbook; `pi playbook` states the "done when". |
 | 2 | Vet the client and purpose | A required, attested `--purpose-category` plus the gates in section 4 refuse with exit code 2 before any source runs; the category is shown in *Engagement & scope*. |
 | 3 | Conflict check against prior cases | `Conflict check` line in *Engagement & scope*; the check is also a `conflict_check` row in the source log. |
-| 4 | Cheapest, highest-yield first; stop rules | `pi playbook <type>` lists the order, stop-ifs and escalation triggers. The live run does not execute a playbook (it dispatches the existing lead agents), but the report's *Playbook progress* section scores each step against what actually ran. |
+| 4 | Cheapest, highest-yield first; stop rules | The run works the playbook in order as the opening lead sheet, then follows what each lead returns (section 6). It stops when the questions are settled, on a sanctions hit, when the leads or the call budget run out, or when optional leads stop producing. `pi playbook <type>` lists the order, stop-ifs and escalation triggers. |
 | 5 | Identity before inference | Advisory identifier warnings (a person needs a full name plus one more anchor), common-name flags under *What is NOT a link*, and the *Identity resolution* section: notes such as "N records named X are NOT established as one person" and "probable same person on anchors [...]", scored by the same-person scorer in `pi_identity.py`. The notes never merge graph nodes and do not use graph edges. |
 | 6 | Know what is not a link | *What is NOT a link* table: registered-agent and virtual-office addresses, nominee officers, shared hosting and CDN IPs, very common names. |
 | 7 | Label by independent corroboration; decay stale data | *Findings* table: `confirmed` (3+ sources), `probable` (2), `lead` (1), plus freshness and a relevance rating (`subject`, `related`; unrelated records are set aside in the report and kept in the JSON). |
@@ -77,9 +83,24 @@ uv run bunnyhole intake --org "Jane Q. Smith" --email jane@example.com \
 ```
 
 `--pi` sets the persona to `pi` (deep gear, depth 3, breadth 4, sanctions screening emphasized) unless you
-pass `--persona` or explicit gear/depth/breadth flags. The terminal ends with a short **PI SUMMARY** panel
-(label counts, source classes not searched, custodians named); `--pi-report FILE` writes the full Markdown
-report. `--out` and `--json` still write the usual dossier and graph JSON; the JSON gains a `pi` key.
+pass `--persona` or explicit gear/depth/breadth flags; the casework loop is paced by `--pi-budget`, not by
+depth and breadth. While it runs, each lead worked prints one `PI_LEAD` line. The terminal ends with a **PI
+SUMMARY** panel (label counts, how many questions are answered, the lead tally, who ran the case, how many
+leads can still be chased) and a table of the questions and where each stands; `--pi-report FILE` writes the
+full Markdown report. `--out` and `--json` still write the usual dossier and graph JSON; the JSON gains a
+`pi` key.
+
+Add `--chase` to be asked, when the case stops, which of the leads left on the sheet to chase:
+
+```bash
+uv run bunnyhole trace "Acme Holdings Ltd" --pi --case-type due_diligence --subject-type entity \
+  --purpose "Vet a counterparty before signing a supply contract" --purpose-category counterparty_due_diligence \
+  --pi-report acme_pi_report.md --chase
+```
+
+Set `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `OPENAI_API_KEY` and the same command is run by the AI case
+officer and the report's account is AI-written. With no key the playbook order runs the case and code writes
+the account; the summary panel and the report say which.
 
 With `--subject-type entity`, give the legal form in the name (`Ltd`, `Inc`, `LLC`) or add `--confirm-entity`;
 a bare two- or three-word name such as "Maple Leaf Roofing" is refused as person-like (exit 2). `--cred` is refused.
@@ -136,7 +157,10 @@ CourtListener token were not set (both logged as skipped), not that nothing exis
 | `--confirm-entity` | off | Overrides the person-vs-entity check for a seed that reads like a person (for example "Maple Leaf Roofing", no legal form). Only meaningful with `--subject-type entity`; it overrides the check completely. |
 | `--pi-jurisdiction` | empty | e.g. `us`, `ca-on`, `uk`. Picks the legal instrument named for each custodian; unknown or empty falls back to a generic cross-border route (MLAT, letter of request). |
 | `--pi-report` | none | Path for the Markdown report. |
-| `--no-ai-analysis` | off | Leaves the AI-written analysis section out of `--pi-report` and makes no LLM call. Needs `--pi-report` (exit 2 otherwise). Only new flag of the AI analysis: there was no earlier LLM opt-out; the synthesizer is switched off only by having no provider key. |
+| `--no-ai-analysis` | off | No AI-written text in `--pi-report` and no LLM call for the report: the account of a casework run is written by code from the case file, and a sweep report gets no AI analysis section. Needs `--pi-report` (exit 2 otherwise). It does not switch the AI case officer off; that is switched off by having no provider key. |
+| `--pi-loop` | `casework` | `casework` works the case file (section 6). `sweep` is the earlier single pass: every source on the seed, then a report. |
+| `--pi-budget` | `120` | Source-call cap for casework, an integer from 10 to 400. Each `--chase` round adds 40. |
+| `--chase` | off | When the case stops, lists the leads left on the sheet and asks which to chase (lead ids, `all`, or Enter to finish). Interactive. Not available with `--pi-loop sweep`, and a case that stopped for compliance counsel is not reopened. |
 
 `--cred` is refused with `--pi` (exit 2). The usual `--gear`, `--depth`, `--breadth`, `--hypothesis`,
 other selector flags work as before. `--proxy` and `--tor` are global flags and go before the command
@@ -232,14 +256,84 @@ catalog: verify with the Ministry of the Solicitor General and counsel.
 
 ---
 
-## 6. Case-type playbooks
+## 6. How a case is worked
 
-Reference material from `bunnyhole pi playbook <type>`. For an entity `due_diligence`, `asset_search`, or
-`fraud_screen` run with `--pi-loop casework`, Bunnyhole opens a hypothesis board from the playbook, runs
-each playbook step's mapped sources, re-scores the board, and stops with one of five reasons (`done`,
-`escalated`, `dead_end`, `budget_spent`, `no_progress`). Person subjects and the other case types stay on
-the single sweep. `--pi-budget` caps source calls (an integer from 10 to 400). A configured model may
-narrow which offered checks to spend the budget on; sanctions stops and the source list stay in code.
+The table at the end of this section is the reference material from `bunnyhole pi playbook <type>`. This is
+what the run does with it, for every case type and for person and entity subjects alike.
+
+**Questions.** The case type is turned into the questions the client's decision depends on. For entity due
+diligence: is it a real registered entity and what is its status; who owns and controls it, up to a natural
+person; is it or anyone in its chain on a sanctions or PEP list; is there litigation, enforcement or a
+complaint pattern; what does published coverage say; does a secrecy jurisdiction or a nominee arrangement sit
+in the structure. A person locate asks whether the subject is identified on more than a name, what address
+the public record supports, whether court records name them, what footprint is tied to the selectors given,
+and whether there is any sign of death or custody. After every lead each question is re-read against the
+evidence and marked `answered`, `partial`, `out of reach` (no free, lawful, passive source reaches it, with
+who holds the record) or `open` (the sources did not run or were not reached, with the reason). A case is
+finished when the questions are settled, not when every source has been called. A settled question is not a
+clearance.
+
+**The lead sheet.** It opens with the playbook's order of work applied to what the client supplied: one lead
+per step per subject, plus a lead for every selector no step covers. A source only runs on the kind of target
+it is built for, so a person's name never goes to a company registry and a company name never goes to a
+domain tool. Every later lead is a pivot off something a lead returned, and the sheet records which lead
+opened it:
+
+| A lead returns | The sheet opens |
+|---|---|
+| An owner of the subject, or of an owner already in the chain | `ownership`: pull that company's registry record and find who owns it (to five levels), worked right after the subject's own ownership step. And `screen`: every node of the chain is screened on every list, after the subject is. |
+| A natural person who controls a company in the chain | `screen` only: sanctions, PEP and, where the case asks about coverage, the news search. Their accounts, handles and contact points are not touched: they are not the subject. |
+| A nominee flag on a party in the chain | The lead is written down as `set aside`: a nominee is not a beneficial owner. |
+| An owner named by one source only | `corroborate`: look for it in a second, independent registry. |
+| Two records that disagree | `contradiction`: pull the registry again. |
+| A wallet, a sister domain or a related company a record named | `pivot`, when it serves a question on the board. When it does not, it is kept as `suggested`: a real lead, outside what the client asked, that you can chase. |
+| A personal handle found on a company's website | `set aside` in an entity case: it belongs to a person. |
+
+**Lead statuses.** `worked` (it produced a record about the subject or moved a question), `negative` (its
+sources ran clean and found nothing), `not reached` (every source was refused or failed: a gap, not a
+negative), `set aside` (deliberately not followed, with the reason), `not worked` (the case stopped before
+it), `suggested` (outside the questions asked).
+
+**The log.** One entry per lead worked, in order: what was done and why, what each source returned, what that
+means for the questions and hypotheses, and what it opened.
+
+**The hypothesis board.** The playbook's competing hypotheses, re-scored from a fixed signal table after
+every lead (entity due diligence, asset search, fraud screen, and "the records belong to a different person
+with the same name" for locate and background). The model does not assign scores.
+
+**Who runs it.** With a provider key (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) an AI case
+officer runs the case. Before the first lead and after every lead it is shown the case file (questions,
+hypotheses, the lead sheet, what the last lead returned, the names in the evidence, the sources that may be
+named) and it decides what that result means, which leads to open, which to set aside, which lead to work
+next and when to stop. That is one model call per lead plus one, on the fast model. Code checks every
+decision before anything happens:
+
+- A new lead may only target a name that is already in the evidence. A name the model produces that the
+  evidence never gave is refused and logged (`PI_OFFICER_REFUSED`).
+- It may only name sources casework already runs (the list in `pi_dispatch.PI_DISPATCH`), and only on the
+  kind of target each takes. Breach, infostealer and active-probe sources are not on that list.
+- A person who is not the subject gets the role-relevant checks only, and a person subject's case never opens
+  a lead on another person.
+- It cannot waive a sanctions stop, raise the budget, set aside a mandatory lead, or stop the case while a
+  playbook step or the screening of a chain node is still open.
+- Its reading of each result is printed as AI-written and is not a finding. A reading that clears the subject
+  is withheld. At most three proposed leads per turn and twelve per case.
+
+With no key the playbook order runs the same loop: the sheet is worked by priority and no model is called.
+
+**Stops.** `done` (every question answered or documented as out of reach), `escalated` (a sanctions listing
+or a 50% rule block on the subject or on any party in its chain: the case goes to compliance counsel and the
+remaining leads are not worked), `dead_end` (every lead worked, questions still not settled: the free public
+record is exhausted), `budget_spent`, `no_progress` (three optional leads in a row added nothing, or the case
+officer recommended stopping). A crypto cash-out point ends the ledger trace, not the case.
+
+**Chasing leads.** `--chase` lists the leads that are `suggested`, `not worked` or `not reached` and asks
+which to work. Each round reopens those leads, adds 40 source calls, works them and whatever they open, and
+asks again. Leads that were set aside on scope grounds are not offered. From code:
+`orch.pi_chaseable_leads()` and `await orch.chase_pi_leads(["L7"])`. The lead sheet lives in the running
+process: a finished run cannot be reopened from its JSON.
+
+`--pi-loop sweep` skips all of this and runs the earlier single pass.
 
 | Case type | Done when | Order of work | Escalate when |
 |---|---|---|---|
@@ -257,9 +351,39 @@ nominee holdings, dissipation or transfer, genuinely judgment-proof).
 
 ## 7. Report anatomy
 
-`--pi-report` writes sixteen sections in this order on a sweep (the list below is the heading list the code emits). A casework result adds **Investigation log** after Playbook progress, and its bottom line leads with the stop reason. Sections
-with nothing to show say `None.`; where absence is worth stating it reads "None found in the evidence collected
-(this is not proof that none exist)."
+`--pi-report` writes sixteen sections in this order on a sweep (the list below is the heading list the code emits).
+A casework result adds four, and its bottom line leads with a **Case** bullet (the stop reason and how many
+questions are answered):
+
+- **Investigation report**, straight after the Bottom line: the account of the case in prose, under five
+  headings (Summary; How the investigation unfolded; What the record shows; What is not established; Open
+  leads and next steps). With a provider key a model writes it from the case file; with no key, with
+  `--no-ai-analysis`, or when the model's text fails the checks below, code writes it from the same case
+  file. The first line of the section says which.
+- **Case questions and answers**: each question, its status, the answer and what is still needed.
+- **Lead sheet**, after Playbook progress: every lead, why it was opened, what opened it, its sources, status
+  and outcome, and the leads you can still chase.
+- **Investigation log**: the entries described in section 6, with the AI case officer's reading of each step
+  marked as AI-written when one ran the case.
+
+Sections with nothing to show say `None.`; where absence is worth stating it reads "None found in the evidence
+collected (this is not proof that none exist)."
+
+**The AI-written account.** The model is shown the case file as the report prints it: questions and answers,
+hypotheses, the lead sheet, the log, the findings about the subject with their labels, ownership edges, the
+sanctions lines, what is not a link, contradictions, falsifiers, custodians and the handoff sheet. It is not
+shown the client, the purpose text, the matter reference, receipt extracts or raw snippets (a line that
+carries any of the first three is dropped). Before its text is used, code checks it: the five headings are
+present; it is at least 250 words; every token that carries a digit and every capitalised word that does not
+start a sentence occurs in the case file, so a name, a date, an amount or an identifier cannot be invented;
+there is no link, table, code or HTML; and no wording clears the subject ("is clean", "no risk", "safe to
+deal with"). A failed check gets one retry with the list of problems; after that the code-written account is
+used and its first line says why. That is at most two model calls per report. These checks stop invented
+names and numbers. They do not understand the text: a sentence built only from words in the case file can
+still misread it, a common word at the start of a sentence is not checked, and a paraphrase of a clearance
+can pass. The section is labelled AI-written and the code-built sections govern. The checks have only been
+run against scripted replies in the test suite, not against a live model, so expect some retries and
+fallbacks on first use.
 
 1. **Bottom line**: a short labelled list of at most six one-line bullets, each at most 220 characters, no model involved. Node ids are replaced by names, and a bullet that is too long is cut at a word boundary with an ellipsis. In order:
    - **Sanctions**: a hit leads and is always called a soft name match to verify on the primary list. Without a hit it gives the screening status (`not_run`, `partial` or `lists_run`), the lists screened, the lists NOT screened by name only (reasons are in the *Sanctions screening* section) and "no hit on a screened list is not clearance". It also carries `50%-rule: not evaluable (ownership percentages unknown)` next to a hit when the ownership edges have no percentages, and a note when other graph entities match a list entry. The EU Consolidated List is always named as not screened.
@@ -331,7 +455,8 @@ engagement jurisdiction (for example a subpoena or court order in the US, a Norw
 Ontario or the UK, MLAT or letter of request cross-border). The handoff sheet turns that into lines a
 licensed investigator or counsel can act on. For an entity subject the sheet gives action lines such as "Verify the sanctions hit on the primary list: <url>" (or the lists that were not screened) and "Confirm corporate status and beneficial ownership on the primary registry", rather than "Run through licensed database" for company addresses; person subjects and `locate` or `missing_person` cases still get the licensed-database and field-verification lines. Nothing is sent by Bunnyhole.
 
-**AI analysis (optional, AI-written, added after the sixteen sections).** With a provider key configured (`GEMINI_API_KEY`,
+**AI analysis (sweep reports only; optional, AI-written, added after the sixteen sections).** A casework report
+carries the AI-written account described above instead. With a provider key configured (`GEMINI_API_KEY`,
 `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, tried in that order, the synthesizer's own switch) and `--pi-report`, a model is asked
 how the findings connect. It is additive: the Bottom line, labels and sanctions text are code-built and unchanged, and the section
 sits under `## AI analysis (AI-written, not independently verified; not clearance)` with a citation key and a footer that names the
@@ -444,7 +569,7 @@ See `PISourcesAgent` in `bunnyhole/agents/pi_sources.py` and the list machinery 
 `bunnyhole/agents/sanctions_lists.py`.
 
 1. **Add the method** to `PISourcesAgent`, or to the agent that fits (a new sanctions list is a list spec in the list machinery, not a new download routine). Follow the conventions there: build the HTTP client with `netutil.new_async_client` (so `--tor` and `--proxy` apply), time out, never raise (log an agent event ending in `_SKIP` for a skip, `_INFO` for a clean negative), mark name matches `SelectorStrength.SOFT` with a `SOFT_NAME_MATCH_VERIFY` flag, give the receipt the source's Admiralty grade and the edge the weaker match grade.
-2. **Dispatch it** in `BunnyholeOrchestrator._execute_lead` through `pi(<source_name>, value, coro)` so the call is logged as hit, negative, skipped or error.
+2. **Dispatch it.** For casework (the default loop) add it to `PI_DISPATCH` in `bunnyhole/engine/pi_dispatch.py`, say which kinds of target it takes in `SOURCE_ACCEPTS` (a source with no entry there accepts nothing) and give it a prose name in `SOURCE_NAMES`; map it to a playbook source name in `PLAYBOOK_SOURCE_MAP`, or to a step in `pi_casefile.STEP_EXTRA_SOURCES`, so a lead runs it. For the sweep, dispatch it in `BunnyholeOrchestrator._execute_lead` through `pi(<source_name>, value, coro)`. Either way the call is logged as hit, negative, skipped or error. A breach, credential or active-probe source belongs in `BLOCKED_IN_CASEWORK`, never in `PI_DISPATCH`.
 3. **Map it to a source class** in `SOURCE_CLASS_MAP` in `bunnyhole/engine/pi_runtime.py` (`<source_name>` to one of the source classes in `pi_analysis`). Map only to the class it really searches. An unmapped source appears in the source log but never inflates coverage.
 4. **Catalog it** with an entry in `pi_reference.SOURCES` (`implemented=True`, an https URL, an honest `access` tier and `caveats`). Do not mark `verified=True` unless you called it.
 5. **Test it** with mocked HTTP (see `tests/test_pi_sources_registries.py` and `tests/test_pi_sources_sanctions.py`): no key gives a skip, HTTP 500 and timeout never raise, a hit adds a soft-flagged node.
@@ -468,10 +593,13 @@ See `PISourcesAgent` in `bunnyhole/agents/pi_sources.py` and the list machinery 
 - **Findings count tools, not truth.** A node's label reflects distinct sources, and two tools that read the same underlying record can still look independent if their URLs differ. The custody digest is of the recorded extract, not the page.
 - **Coverage gaps by construction.** No source is mapped to `missing_persons` or `vital_records`, so a `missing_person` run always reports them `NOT SEARCHED`; `property_assets` is covered only by aircraft tracking, not land or lien registries; `court_dockets` needs a CourtListener token.
 - **Attestations are not verified.** Lying in `--purpose-category` or passing `--confirm-entity` for a person passes the gates, `--matter-ref` is format-only, `--doc` contents are not screened, homoglyphs outside the built-in map pass, and the phrase blocklists have incomplete recall (section 4).
-- **Playbooks are not executed.** The run uses the playbook objective, then scores progress afterwards. A `DONE` step is rare by design and still does not mean the topic is complete.
+- **The case file works the free layer only.** Pivots come from what the automated sources return: GLEIF parents, Companies House PSCs (with a key), wallets and domains a record names. Officers and directors are not pivots because no automated source returns them; land, lien, vital-records and missing-persons sources are not automated, so those questions end as `out of reach` with who holds the record. A `DONE` playbook step still does not mean the topic is complete.
+- **The AI case officer and the AI-written account have not been run against a live model.** Every test uses a scripted officer or scripted replies in a scripted public record. The limits on the officer (targets, sources, mandatory leads, stops) are enforced by code and tested; the quality of its choices and of its prose is not measured. Evidence text from public sources is part of what the model reads, so a hostile page title could steer its choices among the leads code allows; it cannot widen them.
+- **Lead chasing is in-process.** The lead sheet is in the JSON result, but a finished run cannot be resumed from it; chase with `--chase` in the same run, or `chase_pi_leads` on the same orchestrator.
+- **A parent's listing counts for the subject.** A sanctions or PEP listing whose listed name matches a party in the subject's ownership chain is kept as a soft hit and stops the case. It is still a name match to verify on the primary list.
 - **Companies House.** Unit tests use mocked responses. Unless you have run it with a real key, treat the parser as untested against the live API.
 - **Ontario and Canada.** PSISA licensing, PIPEDA, Criminal Code s.184 and s.264 are marked unverified. Verify with the Ministry of the Solicitor General and counsel.
-- **Single pass.** One run, one human gate. There is no loop and no oracle; corroborate before relying.
+- **One run, one human gate.** The loop decides what to search next, not what is true; corroborate before relying.
 - **The AI analysis is checked by code, not understood by it.** See section 7 for what is model-written, what is code-built, the checks, and what remains unenforced. The code-built Bottom line governs, and the section is labelled not independently verified. Its validator and rules file were never run against a live model in the test suite (all tests use fakes), so the first live runs may see more retries and omitted sections than expected.
 
 ---

@@ -97,3 +97,39 @@ def test_trace_with_an_extra_selector_still_forwards_the_flags() -> None:
     assert kwargs["pi_loop"] == "casework"
     assert kwargs["pi_budget"] == 12
     assert kwargs.get("intake_packet") is not None
+
+
+def test_a_pi_engagement_works_the_case_file_unless_sweep_is_asked_for() -> None:
+    from bunnyhole.engine.orchestrator import BunnyholeOrchestrator
+    from bunnyhole.engine.pi import CaseType, PIEngagement
+
+    engagement = PIEngagement.model_construct(
+        engagement_id="pi_default", case_type=CaseType.LOCATE, purpose=PURPOSE,
+        purpose_category="service_of_process", subject_is_person=True, passive_only=True,
+        matter_ref="CV-24-00123456", created_at_utc="2026-01-01T00:00:00+00:00",
+    )
+    assert BunnyholeOrchestrator("Jane Q Example", engagement=engagement)._use_pi_casework() is True
+    assert BunnyholeOrchestrator("Jane Q Example", engagement=engagement, pi_loop="sweep")._use_pi_casework() is False
+    assert BunnyholeOrchestrator("acme.io")._use_pi_casework() is False  # a plain trace never opens a case file
+
+
+@pytest.mark.parametrize("command", ["trace", "intake"])
+def test_chase_without_pi_exits_2(command: str) -> None:
+    base = ["trace", "acme.io"] if command == "trace" else ["intake", "--org", "Acme Ltd"]
+    res = _run(*base, "--chase")
+    assert res.exit_code == 2
+    assert "--chase" in res.output
+    assert not FakeOrchestrator.instances
+
+
+def test_chase_with_the_sweep_exits_2() -> None:
+    res = _run(*ENTITY, "--pi-loop", "sweep", "--chase")
+    assert res.exit_code == 2
+    assert "lead sheet" in res.output
+    assert not FakeOrchestrator.instances
+
+
+def test_chase_on_a_result_without_a_case_file_says_so_and_carries_on() -> None:
+    res = _run(*ENTITY, "--chase")
+    assert res.exit_code == 0, res.output
+    assert "no lead sheet to chase from" in res.output
